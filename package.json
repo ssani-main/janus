@@ -1,5 +1,5 @@
 {
-  "name": "holesail-gateway",
+  "name": "janus",
   "version": "0.1.0",
   "description": "Reverse-proxy gateway that turns a Holesail P2P key into a public HTTPS website: subdomain-per-key, stateless, per-tenant origin isolation, LRU tunnel pool, rate limiting, and an operator kill-switch.",
   "private": true,

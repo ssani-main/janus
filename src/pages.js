@@ -57,19 +57,19 @@ function apexPage(config) {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Holesail Gateway</title>
+<title>Janus</title>
 <style>${STYLE}</style>
 </head>
 <body>
   <div class="card">
-    <h1>Holesail Gateway</h1>
+    <h1>Janus</h1>
     <p>Paste a Holesail public key below, or visit
       <code>https://0000&lt;your-key&gt;.${safeDomain}/</code> directly.</p>
     <form id="go">
       <input id="key" type="text" placeholder="hs://0000... or bare key" autofocus>
       <button type="submit">Go</button>
     </form>
-    <p class="code">Holesail Gateway</p>
+    <p class="code">Janus</p>
     ${footer(config)}
   </div>
   <script>
@@ -93,7 +93,7 @@ function impressumPage(config) {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Impressum / Legal Notice - Holesail Gateway</title>
+<title>Impressum / Legal Notice - Janus</title>
 <style>${STYLE}</style>
 </head>
 <body>
@@ -114,7 +114,7 @@ function termsPage(config) {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>Terms of Service - Holesail Gateway</title>
+<title>Terms of Service - Janus</title>
 <style>${STYLE}</style>
 </head>
 <body>
@@ -157,7 +157,7 @@ function rateLimitPage() {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>429 Too Many Requests - Holesail Gateway</title>
+<title>429 Too Many Requests - Janus</title>
 <style>${STYLE}</style>
 </head>
 <body>
@@ -165,7 +165,7 @@ function rateLimitPage() {
     <h1>Too Many Requests</h1>
     <p>You have exceeded the request rate limit for this gateway. Please
       wait a moment and try again.</p>
-    <p class="code">Holesail Gateway &middot; HTTP 429</p>
+    <p class="code">Janus &middot; HTTP 429</p>
   </div>
 </body>
 </html>`

@@ -6,9 +6,9 @@ substitute for reading `src/config.js` / `.env.example`.
 ## 1. systemd unit
 
 ```ini
-# /etc/systemd/system/holesail-gateway.service
+# /etc/systemd/system/janus.service
 [Unit]
-Description=Holesail Gateway
+Description=Janus
 After=network-online.target
 Wants=network-online.target
 
@@ -16,14 +16,14 @@ Wants=network-online.target
 Type=simple
 User=holesail
 Group=holesail
-WorkingDirectory=/opt/holesail-gateway
-EnvironmentFile=/opt/holesail-gateway/.env
+WorkingDirectory=/opt/janus
+EnvironmentFile=/opt/janus/.env
 ExecStart=/usr/bin/node src/server.js
 Restart=always
 RestartSec=2
 NoNewPrivileges=true
 ProtectSystem=strict
-ReadWritePaths=/opt/holesail-gateway
+ReadWritePaths=/opt/janus
 
 [Install]
 WantedBy=multi-user.target
@@ -35,8 +35,8 @@ only by that user (`chmod 600 .env`).
 
 ```sh
 sudo systemctl daemon-reload
-sudo systemctl enable --now holesail-gateway
-sudo journalctl -u holesail-gateway -f
+sudo systemctl enable --now janus
+sudo journalctl -u janus -f
 ```
 
 ## 2. Caddy in front
@@ -76,7 +76,7 @@ to stdout, which systemd/journald captures. There is no built-in
 fail2ban-ready log file out of the box -- if you want IP bans on top of the
 in-process rate limiter, the simplest realistic option is:
 
-- Point fail2ban at `journalctl -u holesail-gateway` output (via a small
+- Point fail2ban at `journalctl -u janus` output (via a small
   filter matching `RateLimiter` 429 lines or `unauthorized` 401 lines) and
   have it `ufw deny` repeat offenders. This is a defense-in-depth nice-to-have,
   not a requirement -- the per-IP `RateLimiter` in `src/rate-limit.js` already

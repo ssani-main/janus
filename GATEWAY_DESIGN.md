@@ -1,4 +1,4 @@
-# Holesail Gateway — Design Document
+# Janus — Design Document
 
 **Status:** ✅ **Built & verified v3** — all four phases implemented under `src/` and tested end-to-end against live Holesail tunnels (Phase 0: 10/10 · Phase 1: 13/13 · Phase 2: 9/9 · Phase 3: 19/19). Subdomain-per-key model; pinned to holesail v2 / holesail-client 2.3.x / holesail-server 2.4.x.
 **Scope:** General-purpose, reusable gateway. Transport- and tenant-agnostic — it never knows or cares what kind of app sits behind a key.

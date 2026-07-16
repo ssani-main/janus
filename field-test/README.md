@@ -18,7 +18,7 @@ host) never crosses a NAT boundary and never touches a real internet link,
 so it cannot validate either property -- it can only prove the scripts
 themselves work.
 
-This kit exercises the exact hop the Holesail Gateway relies on: a
+This kit exercises the exact hop Janus relies on: a
 `holesail-server` tunnel wrapping a backend, and a `holesail-client` tunnel
 on the other side. A healthy result here means the gateway will work
 between those two machines, because it uses the same underlying tunnel.

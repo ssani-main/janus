@@ -1,4 +1,4 @@
-# Holesail Gateway — Primitive Test Report
+# Janus — Primitive Test Report
 
 **Date:** 2026-07-16
 **Environment:** Windows 11 x64, Node v24.11.1, `holesail-server@2.4.0`, `holesail-client@2.3.0` (the exact versions the design targets)

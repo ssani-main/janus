@@ -50,7 +50,7 @@ function errorPage(code, title, msg) {
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>${code} ${safeTitle} - Holesail Gateway</title>
+<title>${code} ${safeTitle} - Janus</title>
 <style>
   body { font-family: system-ui, sans-serif; background: #0b0d12; color: #e6e6e6; display: flex; min-height: 100vh; align-items: center; justify-content: center; margin: 0; }
   .card { max-width: 32rem; padding: 2rem; border: 1px solid #2a2f3a; border-radius: 0.75rem; background: #12151c; }
@@ -63,7 +63,7 @@ function errorPage(code, title, msg) {
   <div class="card">
     <h1>${safeTitle}</h1>
     <p>${safeMsg}</p>
-    <p class="code">Holesail Gateway &middot; HTTP ${code}</p>
+    <p class="code">Janus &middot; HTTP ${code}</p>
   </div>
 </body>
 </html>`
@@ -252,7 +252,7 @@ process.on('SIGINT', () => shutdown('SIGINT'))
 process.on('SIGTERM', () => shutdown('SIGTERM'))
 
 server.listen(config.PORT, config.BIND_HOST, () => {
-  console.log(`Holesail Gateway (Phase 3) listening on http://${config.BIND_HOST}:${config.PORT} ` +
+  console.log(`Janus (Phase 3) listening on http://${config.BIND_HOST}:${config.PORT} ` +
     `(BASE_DOMAIN=${config.BASE_DOMAIN})`)
   console.log('This process expects Caddy (or another TLS terminator) in front of it -- ' +
     'it is HTTP-only and not meant to face the public internet directly.')
