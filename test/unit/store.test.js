@@ -41,8 +41,13 @@ test('load: a missing path returns an empty default store', () => {
   const p = tmpStorePath('missing')
   const store = load(p)
   assert.equal(store.data.version, 1)
-  assert.deepEqual(store.data.keys, {})
-  assert.deepEqual(store.data.aliases, {})
+  // keys/aliases are null-prototype maps (defense in depth against
+  // prototype pollution), so compare shape via Object.keys rather than
+  // deepEqual against a plain {} (which would fail on prototype mismatch).
+  assert.deepEqual(Object.keys(store.data.keys), [])
+  assert.deepEqual(Object.keys(store.data.aliases), [])
+  assert.equal(Object.getPrototypeOf(store.data.keys), null)
+  assert.equal(Object.getPrototypeOf(store.data.aliases), null)
 })
 
 test('write + reload round-trip: a blocked key persists across a fresh load()', () => {

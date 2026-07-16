@@ -83,6 +83,23 @@ const config = {
   // Milestone 1: path to the persistent JSON store (blocklist, aliases,
   // dashboard passwords). Relative paths are resolved against process.cwd().
   STORE_PATH: readString('STORE_PATH', './janus-data.json'),
+  // Milestone 1, Feature 3/4: secret used to sign/verify session cookies
+  // (per-key password gate, and later the admin dashboard). Empty by
+  // default -- config.js stays pure/synchronous, so a random fallback (and
+  // the accompanying warning that sessions won't survive a restart or work
+  // across processes) is generated in server.js at boot, not here.
+  SESSION_SECRET: readString('SESSION_SECRET', ''),
+  // How long a signed session cookie stays valid. Default 7 days.
+  SESSION_TTL_MS: readInt('SESSION_TTL_MS', 604800000),
+  // Whether session cookies get the Secure attribute. Only set this to
+  // false for local HTTP-only testing -- it must be true (the default) in
+  // any deployment served over TLS, which is the norm for this gateway.
+  COOKIE_SECURE: readBool('COOKIE_SECURE', true),
+  // Milestone 1, Feature 4: how long an admin dashboard login (cookie
+  // session) stays valid. Separate from SESSION_TTL_MS (per-key password
+  // sessions) since the admin session grants far more power and should be
+  // shorter-lived by default. Default 12 hours.
+  ADMIN_SESSION_TTL_MS: readInt('ADMIN_SESSION_TTL_MS', 43200000),
 }
 
 if (config.TUNNEL_PORT_MIN >= config.TUNNEL_PORT_MAX) {

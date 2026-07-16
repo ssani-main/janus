@@ -1,5 +1,6 @@
 'use strict'
 
+const crypto = require('node:crypto')
 const http = require('node:http')
 const httpProxy = require('http-proxy')
 const config = require('./config')
@@ -8,10 +9,35 @@ const { parseKey } = require('./key')
 const { load: loadStore } = require('./store')
 const { TunnelManager, CapacityError, ConnectError, KeyError, BlockedError } = require('./tunnel-manager')
 const { RateLimiter } = require('./rate-limit')
-const { escapeHtml, apexPage, impressumPage, termsPage, rateLimitPage } = require('./pages')
+const { escapeHtml, apexPage, impressumPage, termsPage, rateLimitPage, loginPage } = require('./pages')
 const { handleAdmin } = require('./admin')
+const { hashPassword, verifyPassword, signSession, verifySession, parseCookies } = require('./auth')
 
 const store = loadStore(config.STORE_PATH)
+
+// Milestone 1, Feature 3/4: session secret used to sign/verify the
+// password-gate and (later) admin dashboard cookies. config.js stays
+// pure/synchronous, so the random-fallback generation (and warning) happens
+// here at boot instead.
+let sessionSecret = config.SESSION_SECRET
+if (!sessionSecret) {
+  sessionSecret = crypto.randomBytes(32).toString('hex')
+  console.warn(
+    'SESSION_SECRET is not set -- generated a random secret for this process. ' +
+    'Password-protected keys and admin dashboard sessions will not survive a ' +
+    'restart, and will not work correctly if this gateway runs as multiple ' +
+    'processes/instances. Set SESSION_SECRET in your environment to avoid this.'
+  )
+} else if (sessionSecret.length < 32) {
+  console.warn(
+    'SESSION_SECRET is shorter than 32 characters -- for a secure session/CSRF ' +
+    'HMAC, SESSION_SECRET should be at least 32 characters (256 bits) long.'
+  )
+}
+
+const COOKIE_NAME = 'janus_auth'
+const LOGIN_PATH = '/__janus_login'
+const LOGIN_BODY_MAX_BYTES = 4096
 
 const manager = new TunnelManager(config, store)
 manager.startSweeper()
@@ -119,7 +145,138 @@ function resolveRoute(route, store) {
 
   const entry = store.getByAlias(route.rawKey)
   if (entry) return { rawKey: entry.rawKey }
-  return { invalid: true }
+  // No alias match: leave the route untouched so a malformed/unknown label
+  // flows to ensureTunnel -> KeyError -> 400, exactly as before aliases
+  // existed. Aliases are purely additive -- they only change routing when the
+  // alias is actually registered.
+  return route
+}
+
+/**
+ * Read a request body up to `maxBytes`, rejecting (destroying the request)
+ * if it's exceeded. Resolves to the collected string, or null if the
+ * request errored/aborted.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {number} maxBytes
+ * @returns {Promise<?string>}
+ */
+function readBodyCapped(req, maxBytes) {
+  return new Promise((resolve) => {
+    let total = 0
+    const chunks = []
+    let settled = false
+    const finish = (value) => {
+      if (settled) return
+      settled = true
+      resolve(value)
+    }
+    req.on('data', (chunk) => {
+      total += chunk.length
+      if (total > maxBytes) {
+        req.destroy()
+        finish(null)
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => finish(Buffer.concat(chunks).toString('utf8')))
+    req.on('error', () => finish(null))
+    req.on('aborted', () => finish(null))
+  })
+}
+
+/**
+ * Validate a post-login redirect target: must be a same-origin local path
+ * (starts with a single '/'), never a scheme-relative ("//host/...") or
+ * backslash-prefixed value, both of which browsers can treat as absolute.
+ *
+ * @param {?string} next
+ * @returns {string}
+ */
+function safeNextPath(next) {
+  if (
+    typeof next === 'string' &&
+    next.startsWith('/') &&
+    !next.startsWith('//') &&
+    !next.includes('\\')
+  ) {
+    return next
+  }
+  return '/'
+}
+
+/**
+ * Milestone 1, Feature 3: optional per-key password gate. A key with no
+ * password set is left completely untouched -- this must be checked and
+ * return 'proceed' before any tunnel/cold-start work happens, so an
+ * unauthenticated visitor can never trigger tunnel creation for a
+ * password-protected key.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {import('node:http').ServerResponse} res
+ * @param {string} rawKey
+ * @returns {Promise<'proceed' | 'handled'>}
+ */
+async function passwordGate(req, res, rawKey) {
+  let keyHash
+  try {
+    keyHash = parseKey(rawKey).keyHash
+  } catch {
+    // Not a parseable key -- let ensureTunnel produce the normal KeyError.
+    return 'proceed'
+  }
+
+  const pw = store.getPassword(keyHash)
+  if (!pw) return 'proceed'
+
+  const url = new URL(req.url, 'http://internal')
+
+  if (req.method === 'POST' && url.pathname === LOGIN_PATH) {
+    const contentType = String(req.headers['content-type'] || '')
+    if (!contentType.startsWith('application/x-www-form-urlencoded')) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(loginPage({ error: 'Incorrect password.', next: '/', config }))
+      return 'handled'
+    }
+
+    const body = await readBodyCapped(req, LOGIN_BODY_MAX_BYTES)
+    if (body === null) {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(loginPage({ error: 'Incorrect password.', next: '/', config }))
+      return 'handled'
+    }
+
+    const form = new URLSearchParams(body)
+    const password = form.get('password') || ''
+    const next = safeNextPath(form.get('next'))
+
+    if (verifyPassword(password, pw.salt, pw.hash)) {
+      const cookieVal = signSession(sessionSecret, { kh: keyHash, pv: pw.pwdVersion, iat: Date.now() })
+      const secureAttr = config.COOKIE_SECURE ? '; Secure' : ''
+      res.writeHead(302, {
+        'Set-Cookie': `${COOKIE_NAME}=${cookieVal}; HttpOnly; SameSite=Lax; Path=/; Max-Age=${Math.floor(config.SESSION_TTL_MS / 1000)}${secureAttr}`,
+        'Location': next,
+      })
+      res.end()
+      return 'handled'
+    }
+
+    res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+    res.end(loginPage({ error: 'Incorrect password.', next, config }))
+    return 'handled'
+  }
+
+  const cookies = parseCookies(req.headers.cookie)
+  const session = verifySession(sessionSecret, cookies[COOKIE_NAME], { maxAgeMs: config.SESSION_TTL_MS })
+  if (session && session.kh === keyHash && session.pv === pw.pwdVersion) {
+    return 'proceed'
+  }
+
+  const next = req.method === 'GET' ? req.url : '/'
+  res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+  res.end(loginPage({ error: null, next, config }))
+  return 'handled'
 }
 
 function titleForStatus(code) {
@@ -148,7 +305,7 @@ const server = http.createServer(async (req, res) => {
   if (route.apex) {
     const url = new URL(req.url, 'http://internal')
     if (url.pathname.startsWith('/_admin')) {
-      await handleAdmin(req, res, { manager, config })
+      await handleAdmin(req, res, { manager, config, store, sessionSecret })
       return
     }
     if (url.pathname === '/impressum') {
@@ -171,6 +328,9 @@ const server = http.createServer(async (req, res) => {
     return
   }
   const rawKey = route.rawKey
+
+  const gate = await passwordGate(req, res, rawKey)
+  if (gate === 'handled') return
 
   const cold = !manager.isCached(rawKey)
   if (cold) {
@@ -226,6 +386,24 @@ server.on('upgrade', async (req, socket, head) => {
     return
   }
   const rawKey = route.rawKey
+
+  let keyHash
+  try {
+    keyHash = parseKey(rawKey).keyHash
+  } catch {
+    // Not a parseable key -- let ensureTunnel produce the normal KeyError below.
+  }
+  if (keyHash) {
+    const pw = store.getPassword(keyHash)
+    if (pw) {
+      const cookies = parseCookies(req.headers.cookie)
+      const session = verifySession(sessionSecret, cookies[COOKIE_NAME], { maxAgeMs: config.SESSION_TTL_MS })
+      if (!session || session.kh !== keyHash || session.pv !== pw.pwdVersion) {
+        socket.destroy()
+        return
+      }
+    }
+  }
 
   const cold = !manager.isCached(rawKey)
   if (cold) {

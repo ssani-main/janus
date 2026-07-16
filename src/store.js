@@ -16,7 +16,10 @@ const ALIAS_RE = /^[a-z0-9-]{1,63}$/
  * @returns {{ version: number, keys: object, aliases: object }}
  */
 function emptyShape() {
-  return { version: VERSION, keys: {}, aliases: {} }
+  // Null-prototype maps: even if a caller ever skips keyHash/alias
+  // validation, a stray '__proto__'/'constructor' key can't touch
+  // Object.prototype through these maps.
+  return { version: VERSION, keys: Object.create(null), aliases: Object.create(null) }
 }
 
 /**
@@ -73,8 +76,11 @@ class Store {
     if (!data || typeof data !== 'object') {
       throw new Error(`Invalid store file at ${filePath}: expected a JSON object`)
     }
-    if (!data.keys || typeof data.keys !== 'object') data.keys = {}
-    if (!data.aliases || typeof data.aliases !== 'object') data.aliases = {}
+    // Normalize keys/aliases to null-prototype objects, defense in depth
+    // against prototype pollution via a '__proto__'/'constructor' entry
+    // even if it somehow ended up in the on-disk JSON.
+    data.keys = Object.assign(Object.create(null), data.keys && typeof data.keys === 'object' ? data.keys : {})
+    data.aliases = Object.assign(Object.create(null), data.aliases && typeof data.aliases === 'object' ? data.aliases : {})
     if (!data.version) data.version = VERSION
 
     return new Store(filePath, data)

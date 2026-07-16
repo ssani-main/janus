@@ -152,6 +152,37 @@ function termsPage(config) {
 </html>`
 }
 
+// Milestone 1, Feature 3: served in place of a passworded key's normal
+// response until the visitor authenticates. `next` is the path to redirect
+// to on success (escaped -- it's attacker-controllable via req.url).
+function loginPage({ error, next, config }) {
+  const safeNext = escapeHtml(next || '/')
+  const errorHtml = error
+    ? `<p class="warn">${escapeHtml(error)}</p>`
+    : ''
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Protected - Janus</title>
+<style>${STYLE}</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Protected</h1>
+    <p>This site is password-protected by the operator.</p>
+    ${errorHtml}
+    <form method="POST" action="/__janus_login">
+      <input type="password" name="password" placeholder="Password" required autofocus>
+      <input type="hidden" name="next" value="${safeNext}">
+      <button type="submit">Enter</button>
+    </form>
+    ${footer(config)}
+  </div>
+</body>
+</html>`
+}
+
 function rateLimitPage() {
   return `<!doctype html>
 <html lang="en">
@@ -171,4 +202,177 @@ function rateLimitPage() {
 </html>`
 }
 
-module.exports = { escapeHtml, apexPage, impressumPage, termsPage, rateLimitPage }
+// Milestone 1, Feature 4: admin dashboard login page. Distinct from the
+// per-key loginPage above -- this authenticates the operator (the admin
+// token), not a visitor. Rendered both for GET /_admin with no valid
+// session/bearer, and after a failed POST /_admin/login.
+function adminLoginPage({ error }) {
+  const errorHtml = error
+    ? `<p class="warn">${escapeHtml(error)}</p>`
+    : ''
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Admin - Janus</title>
+<style>${STYLE}</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Janus Admin</h1>
+    ${errorHtml}
+    <form method="POST" action="/_admin/login">
+      <input type="password" name="token" placeholder="Admin token" required autofocus>
+      <button type="submit">Log in</button>
+    </form>
+  </div>
+</body>
+</html>`
+}
+
+// Milestone 1, Feature 4: the admin dashboard itself. `rows` merges live
+// tunnel state (src/tunnel-manager.js#list) with persisted metadata
+// (src/store.js#listMetadata) by keyHash. `csrf` is a token bound to the
+// admin session (see src/auth.js#csrfToken) embedded in every mutating
+// form. All dynamic values are escaped -- keyHash/alias/etc. can originate
+// from operator input or attacker-controlled keys, never trust them raw.
+function adminDashboardPage({ rows, csrf, config, error }) {
+  const safeCsrf = escapeHtml(csrf)
+  const errorHtml = error
+    ? `<p class="warn">${escapeHtml(error)}</p>`
+    : ''
+
+  const tableRows = rows.map((row) => {
+    const shortHash = escapeHtml(String(row.keyHash).slice(0, 12))
+    const alias = row.alias ? escapeHtml(row.alias) : '&mdash;'
+    const statusBits = []
+    statusBits.push(row.live ? 'live' : 'idle')
+    if (row.blocked) statusBits.push('<span class="warn">blocked</span>')
+    const status = statusBits.join(' &middot; ')
+    const password = row.hasPassword ? '&#128274;' : '&mdash;'
+    const port = row.live ? escapeHtml(String(row.port)) : '&mdash;'
+    const inFlight = row.live ? escapeHtml(String(row.inFlight)) : '&mdash;'
+    const lastRequestAt = row.live && row.lastRequestAt
+      ? escapeHtml(new Date(row.lastRequestAt).toISOString())
+      : '&mdash;'
+    const safeKeyHash = escapeHtml(row.keyHash)
+
+    const blockForm = `<form method="POST" action="/_admin/block" style="display:inline-flex">
+      <input type="hidden" name="csrf" value="${safeCsrf}">
+      <input type="hidden" name="keyHash" value="${safeKeyHash}">
+      <input type="hidden" name="action" value="${row.blocked ? 'unblock' : 'block'}">
+      <button type="submit">${row.blocked ? 'Unblock' : 'Block'}</button>
+    </form>`
+
+    const clearAliasForm = row.alias
+      ? `<form method="POST" action="/_admin/alias" style="display:inline-flex">
+      <input type="hidden" name="csrf" value="${safeCsrf}">
+      <input type="hidden" name="alias" value="${alias === '&mdash;' ? '' : escapeHtml(row.alias)}">
+      <input type="hidden" name="action" value="clear">
+      <button type="submit">Clear alias</button>
+    </form>`
+      : ''
+
+    const clearPasswordForm = row.hasPassword
+      ? `<form method="POST" action="/_admin/password" style="display:inline-flex">
+      <input type="hidden" name="csrf" value="${safeCsrf}">
+      <input type="hidden" name="keyHash" value="${safeKeyHash}">
+      <input type="hidden" name="action" value="clear">
+      <button type="submit">Clear password</button>
+    </form>`
+      : ''
+
+    return `<tr>
+      <td><code>${shortHash}&hellip;</code></td>
+      <td>${alias}</td>
+      <td>${status}</td>
+      <td>${password}</td>
+      <td>${port}</td>
+      <td>${inFlight}</td>
+      <td>${lastRequestAt}</td>
+      <td style="display:flex; gap:0.5rem; flex-wrap:wrap">${blockForm}${clearAliasForm}${clearPasswordForm}</td>
+    </tr>`
+  }).join('\n')
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Admin - Janus</title>
+<style>${STYLE}
+  .wide { max-width: 60rem; width: 100%; }
+  table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
+  th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #2a2f3a; font-size: 0.9rem; }
+  th { color: #7dd3fc; font-weight: 600; }
+  .toprow { display: flex; justify-content: space-between; align-items: center; }
+  .forms-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 0.5rem; }
+  .forms-grid form { flex-direction: column; align-items: stretch; }
+  .forms-grid input { width: 100%; box-sizing: border-box; margin-bottom: 0.5rem; }
+</style>
+</head>
+<body>
+  <div class="card wide">
+    <div class="toprow">
+      <h1>Janus Admin</h1>
+      <form method="POST" action="/_admin/logout">
+        <input type="hidden" name="csrf" value="${safeCsrf}">
+        <button type="submit">Log out</button>
+      </form>
+    </div>
+
+    ${errorHtml}
+
+    <h2>Add / update</h2>
+    <div class="forms-grid">
+      <form method="POST" action="/_admin/alias">
+        <input type="hidden" name="csrf" value="${safeCsrf}">
+        <input type="hidden" name="action" value="set">
+        <input type="text" name="rawKey" placeholder="Raw key (hs://0000...)" required>
+        <input type="text" name="alias" placeholder="Alias (e.g. my-app)" required>
+        <button type="submit">Set alias</button>
+      </form>
+      <form method="POST" action="/_admin/password">
+        <input type="hidden" name="csrf" value="${safeCsrf}">
+        <input type="hidden" name="action" value="set">
+        <input type="text" name="rawKey" placeholder="Raw key or leave blank if keyHash given">
+        <input type="text" name="keyHash" placeholder="keyHash (optional if rawKey given)">
+        <input type="password" name="password" placeholder="Password" required>
+        <button type="submit">Set password</button>
+      </form>
+    </div>
+
+    <h2>Tunnels &amp; keys</h2>
+    <table>
+      <thead>
+        <tr>
+          <th>keyHash</th>
+          <th>alias</th>
+          <th>status</th>
+          <th>password</th>
+          <th>port</th>
+          <th>inFlight</th>
+          <th>lastRequestAt</th>
+          <th>actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${tableRows || '<tr><td colspan="8">No tunnels or stored keys yet.</td></tr>'}
+      </tbody>
+    </table>
+
+    ${footer(config)}
+  </div>
+</body>
+</html>`
+}
+
+module.exports = {
+  escapeHtml,
+  apexPage,
+  impressumPage,
+  termsPage,
+  rateLimitPage,
+  loginPage,
+  adminLoginPage,
+  adminDashboardPage,
+}

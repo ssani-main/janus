@@ -98,12 +98,19 @@ All via environment variables (see [`.env.example`](./.env.example)).
 | `RATE_WINDOW_MS` | `60000` | rate-limit window |
 | `RATE_MAX_REQUESTS` | `120` | max requests per IP per window |
 | `RATE_MAX_NEW_TUNNELS` | `10` | max new (cold) tunnels per IP per window |
+| `STORE_PATH` | `./janus-data.json` | JSON file for persistent store: named aliases, per-key passwords, blocklist; survives restarts. Raw keys for aliased entries are stored on disk. |
+| `SESSION_SECRET` | *(unset → random per-process)* | secret for signing passworded-key session cookies and admin dashboard cookies. **Strongly recommended:** set explicitly for production (≥32 chars). If unset, sessions won't survive restarts or work across multiple processes. |
+| `SESSION_TTL_MS` | `604800000` | how long a visitor's passworded-key session (after login) stays valid, in milliseconds (default 7 days) |
+| `COOKIE_SECURE` | `true` | whether session cookies get the Secure attribute (HTTPS-only). Must be `true` in production — only set `false` for local HTTP-only development. |
+| `ADMIN_SESSION_TTL_MS` | `43200000` | how long an admin dashboard login session stays valid, in milliseconds (default 12 hours). Rotating `ADMIN_TOKEN` immediately invalidates all outstanding admin sessions. |
 
 ---
 
-## Operator admin API
+## Operator admin API & dashboard
 
-Enabled only when `ADMIN_TOKEN` is set. Reachable on the **apex host** under `/_admin`, bearer-authenticated. Lets you respond to an abuse report by killing one session without touching any other.
+Enabled only when `ADMIN_TOKEN` is set. Reachable on the **apex host** under `/_admin`. Two interfaces:
+
+**JSON API** — bearer-authenticated, for command-line automation. Respond to abuse reports by killing/blocking keys:
 
 ```bash
 # list live tunnels (sanitized — no raw keys)
@@ -117,6 +124,13 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
   "https://gw.yourdomain.com/_admin/unblock?keyHash=<hash>"
 ```
+
+**HTML dashboard** — log in with `ADMIN_TOKEN` in your browser. View live tunnels and manage:
+- **Named aliases** — map friendly subdomains (e.g., `myblog.gw.yourdomain.com`) to keys. Raw key links always work; aliases are additive.
+- **Per-key passwords** — set optional password protection on any key. Visitors enter the password once and receive a signed HttpOnly session cookie (TTL: `SESSION_TTL_MS`, default 7 days). Keys without passwords stay fully open. Changing/clearing a password revokes all existing sessions for that key.
+- **Blocklist** — manage which keys are blocked.
+
+Dashboard sessions use CSRF protection and SameSite=Strict cookies (TTL: `ADMIN_SESSION_TTL_MS`, default 12 hours). Rotating `ADMIN_TOKEN` immediately invalidates all outstanding admin sessions.
 
 ---
 

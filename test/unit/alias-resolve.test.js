@@ -69,7 +69,11 @@ test('resolveRoute: an unparseable label resolves through a known alias', () => 
   assert.deepEqual(resolveRoute({ rawKey: 'myblog' }, store), { rawKey: VALID_KEY })
 })
 
-test('resolveRoute: an unparseable label with no matching alias is invalid', () => {
+test('resolveRoute: an unparseable label with no matching alias is left unchanged (400 downstream)', () => {
   const store = fakeStore({})
-  assert.deepEqual(resolveRoute({ rawKey: 'nope' }, store), { invalid: true })
+  // Aliases are additive: with no alias registered, the route passes through
+  // untouched so ensureTunnel rejects the malformed key with a 400, matching
+  // pre-alias behaviour (rather than a 404).
+  const route = { rawKey: 'nope' }
+  assert.equal(resolveRoute(route, store), route)
 })
