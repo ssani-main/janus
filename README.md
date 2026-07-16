@@ -6,7 +6,7 @@
 
 One small always-on VPS with a single wildcard domain becomes the public front door for an arbitrary number of backend projects. Each backend runs anywhere (home PC, laptop, Pi, VPS) with **no domain, no port forwarding, no public IP**, reachable only over Holesail's [HyperDHT](https://github.com/holepunchto/hyperdht) tunnel. The gateway runs the Holesail *client* on the visitor's behalf and reverse-proxies plain HTTPS to it, so visitors just open a link.
 
-> **Status:** ✅ Built and verified end-to-end against live Holesail tunnels — Phase 0 (10/10) · Phase 1 (13/13) · Phase 2 (9/9) · Phase 3 (19/19). See [`GATEWAY_DESIGN.md`](./GATEWAY_DESIGN.md) for the full design and [`TEST_REPORT.md`](./TEST_REPORT.md) for the verification report.
+> **Status:** ✅ Built and verified end-to-end against live Holesail tunnels — Phase 0 (10/10) · Phase 1 (13/13) · Phase 2 (9/9) · Phase 3 (19/19). **Milestone 1** adds a persistent store, named aliases, optional per-key passwords, and an HTML admin dashboard. See [`GATEWAY_DESIGN.md`](./GATEWAY_DESIGN.md) for the full design, [`ROADMAP.md`](./ROADMAP.md) for what's next, and [`TEST_REPORT.md`](./TEST_REPORT.md) for the verification report.
 
 ---
 
@@ -25,7 +25,7 @@ One small always-on VPS with a single wildcard domain becomes the public front d
 
 The Holesail key is **encoded into the subdomain**, so:
 
-- **routing is stateless** — the gateway reads the key from the `Host` header; nothing is persisted, links survive restarts;
+- **routing is stateless by default** — the gateway reads the key straight from the `Host` header, so raw-key links need no stored state and survive restarts (the only persisted state is optional operator metadata — aliases, passwords, blocks — in `STORE_PATH`);
 - **every project gets its own browser origin** — cookies/localStorage/CORS are isolated per tenant automatically;
 - **the backend has a stable public hostname** — its app builds correct absolute URLs;
 - **sharing is just a link** — recipients install nothing.
@@ -150,7 +150,7 @@ See [`DEPLOY.md`](./DEPLOY.md) for the full runbook. In short:
 
 - **Public-mode keys only.** The key lives in the hostname (address bar, TLS SNI, `Referer`), so only *connect-only* public keys (`0000…`) are accepted. Secure-mode `s000…` keys (which are the serving seed) are rejected. Every response also sets `Referrer-Policy: no-referrer`.
 - **The gateway sees plaintext.** It terminates TLS and re-serves over a raw TCP tunnel — a real trust boundary. Don't route anything through it you wouldn't want passing a proxy you operate.
-- **Shared key = bearer secret.** Anyone with a project's key can reach it until the key is rotated on the backend. Per-user access control must live inside the app.
+- **Shared key = bearer secret (by default).** Anyone with a project's key can reach it until the key is rotated on the backend — unless the operator sets an optional per-key password (via the admin dashboard). For per-*user* access control, put it inside the app.
 - **Single front door.** If the gateway is down, every project behind it is unreachable — monitor it like real infra.
 
 ---
@@ -163,16 +163,19 @@ See [`DEPLOY.md`](./DEPLOY.md) for the full runbook. In short:
 │   ├── config.js         env-driven config + validation
 │   ├── key.js            parse/validate hs keys, reject secure-mode
 │   ├── routing.js        Host → tenant key classifier
+│   ├── store.js          persistent JSON store: aliases, passwords, blocklist
+│   ├── auth.js           scrypt password hashing + signed session/CSRF tokens
 │   ├── port-pool.js      local port allocator
 │   ├── rate-limit.js     per-IP request + new-tunnel limiter
-│   ├── tunnel-manager.js tunnel pool: LRU eviction, refcount, dedup, blocklist
-│   ├── pages.js          apex / Impressum / ToS / 429 pages
-│   ├── admin.js          token-auth kill/block API
-│   └── server.js         HTTP + WebSocket entrypoint
+│   ├── tunnel-manager.js tunnel pool: LRU eviction, refcount, dedup
+│   ├── pages.js          apex / Impressum / ToS / 429 / login / admin pages
+│   ├── admin.js          admin JSON API + HTML dashboard (aliases, passwords, blocks)
+│   └── server.js         HTTP + WebSocket entrypoint, alias + password gate
 ├── Caddyfile             wildcard TLS (DNS-01)
 ├── .env.example          all config knobs
 ├── DEPLOY.md             operator runbook
 ├── GATEWAY_DESIGN.md     full design document
+├── ROADMAP.md            feature roadmap & handoff notes
 └── TEST_REPORT.md        end-to-end verification report
 ```
 
