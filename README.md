@@ -1,8 +1,8 @@
-# Holesail Gateway
+# Janus
 
 [![CI](https://github.com/ssani-main/janus/actions/workflows/ci.yml/badge.svg)](https://github.com/ssani-main/janus/actions/workflows/ci.yml)
 
-Turn any Holesail P2P key into a normal, clickable HTTPS website — no domain, no open ports, and no software for your visitors.
+**Janus** is a gateway that turns any Holesail P2P key into a normal, clickable HTTPS website — no domain, no open ports, and no software for your visitors. *(Named for the Roman god of gates and doorways.)*
 
 One small always-on VPS with a single wildcard domain becomes the public front door for an arbitrary number of backend projects. Each backend runs anywhere (home PC, laptop, Pi, VPS) with **no domain, no port forwarding, no public IP**, reachable only over Holesail's [HyperDHT](https://github.com/holepunchto/hyperdht) tunnel. The gateway runs the Holesail *client* on the visitor's behalf and reverse-proxies plain HTTPS to it, so visitors just open a link.
 
