@@ -162,8 +162,33 @@ See [`DEPLOY.md`](./DEPLOY.md) for the full runbook. In short:
 
 ---
 
+## Development & testing
+
+```bash
+npm run check      # syntax-check every src module
+npm test           # fast unit tests (no network) — key parsing, routing, port pool, rate limiter, tunnel-pool logic
+npm run test:e2e   # live end-to-end: spawns the real gateway + real Holesail tunnels
+npm run test:all   # both
+```
+
+Unit tests run in CI (GitHub Actions, Node 20 & 22); the e2e job runs live-DHT tests non-blocking (holepunch can be flaky on hosted runners). See [`.github/workflows/ci.yml`](./.github/workflows/ci.yml).
+
+**Field test** (`field-test/`) — the two things a single host can't prove (cross-NAT holepunch reliability + real-link throughput):
+
+```bash
+# on the remote backend machine:
+node field-test/backend.js --size 16      # prints a key
+# on the gateway/VPS (different network):
+node field-test/probe.js <key>            # reports holepunch OK/FAIL + MB/s
+```
+
+See [`field-test/README.md`](./field-test/README.md).
+
+## License
+
+[GPL-3.0-or-later](./LICENSE). The gateway embeds the GPL-3.0 Holesail libraries, so the combined work is GPL-3.0. Operating it as a network service triggers no source-provision obligation (that would be AGPL); *distributing* the gateway code does.
+
 ## Notes
 
 - **Legal pages are templates.** The Impressum is config-driven; the ToS in `src/pages.js` is a generic starting point, **not legal advice** — review it for your jurisdiction before going public.
-- **Field test before production.** A single-host lab can't exercise cross-NAT holepunching or real-link throughput. Run `holesail --live` on a genuinely remote backend and connect from the VPS to confirm both.
-- **License.** The upstream Holesail libraries are GPL-3.0. Operating a network service triggers no source-provision obligation (that would be AGPL); only *distributing* the gateway code invokes GPL.
+- **Field test before production.** A single-host lab can't exercise cross-NAT holepunching or real-link throughput. Use the `field-test/` kit (above) on two machines on different networks to confirm both.

@@ -1,13 +1,17 @@
 {
   "name": "holesail-gateway",
   "version": "0.1.0",
-  "description": "Reverse-proxy gateway that turns a Holesail P2P key into a public HTTPS website. Phase 0: single hardcoded key, end-to-end proof (TLS -> Node -> tunnel -> backend), including websockets.",
+  "description": "Reverse-proxy gateway that turns a Holesail P2P key into a public HTTPS website: subdomain-per-key, stateless, per-tenant origin isolation, LRU tunnel pool, rate limiting, and an operator kill-switch.",
   "private": true,
   "type": "commonjs",
   "main": "src/server.js",
   "scripts": {
     "start": "node src/server.js",
-    "dev": "node --watch src/server.js"
+    "dev": "node --watch src/server.js",
+    "check": "node --check src/server.js && node --check src/tunnel-manager.js && node --check src/rate-limit.js && node --check src/admin.js && node --check src/pages.js && node --check src/routing.js && node --check src/key.js && node --check src/port-pool.js && node --check src/config.js",
+    "test": "node --test \"test/unit/**/*.test.js\"",
+    "test:e2e": "node --test \"test/e2e/**/*.test.js\"",
+    "test:all": "node --test \"test/**/*.test.js\""
   },
   "engines": {
     "node": ">=20"
@@ -16,5 +20,9 @@
     "holesail-client": "^2.3.0",
     "http-proxy": "^1.18.1"
   },
-  "license": "UNLICENSED"
+  "license": "GPL-3.0-or-later",
+  "devDependencies": {
+    "holesail-server": "^2.4.0",
+    "ws": "^8.21.1"
+  }
 }
