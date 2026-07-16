@@ -1,0 +1,20 @@
+{
+  "name": "holesail-gateway",
+  "version": "0.1.0",
+  "description": "Reverse-proxy gateway that turns a Holesail P2P key into a public HTTPS website. Phase 0: single hardcoded key, end-to-end proof (TLS -> Node -> tunnel -> backend), including websockets.",
+  "private": true,
+  "type": "commonjs",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "holesail-client": "^2.3.0",
+    "http-proxy": "^1.18.1"
+  },
+  "license": "UNLICENSED"
+}

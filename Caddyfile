@@ -1,0 +1,47 @@
+# Holesail Gateway - Caddy front door
+#
+# This terminates TLS ONLY. All routing / tunnel logic lives in the Node
+# process at 127.0.0.1:3000 (see src/server.js).
+#
+# Prerequisites:
+#   1. A wildcard cert for *.gateway.example.com needs DNS-01 issuance
+#      (HTTP-01 cannot prove ownership of a wildcard name). That means you
+#      need a Caddy build with your DNS provider's plugin baked in, e.g.
+#      via xcaddy:
+#        xcaddy build --with github.com/caddy-dns/<provider>
+#      See https://github.com/caddy-dns for the full list of provider
+#      plugins (cloudflare, route53, digitalocean, desec, ...).
+#   2. Wildcard DNS records pointed at this VPS:
+#        gateway.example.com     A/AAAA  <vps-ip>
+#        *.gateway.example.com   A/AAAA  <vps-ip>
+#   3. An API token for your DNS provider with permission to create the
+#      DNS-01 TXT challenge record, exported as an env var Caddy can read
+#      (name depends on the plugin, e.g. CF_API_TOKEN for Cloudflare).
+#
+# Replace "gateway.example.com" below with your real domain, and swap the
+# `dns <provider>` line for the plugin/token config matching whichever
+# provider you built Caddy with.
+
+# These two domains must match BASE_DOMAIN in .env (gateway.example.com) and
+# its "www." + wildcard subdomain forms -- src/routing.js treats
+# BASE_DOMAIN and www.<BASE_DOMAIN> as the apex, and everything else under
+# *.gateway.example.com as a tenant key subdomain.
+gateway.example.com, *.gateway.example.com {
+	tls {
+		# configure DNS-01 provider + API token env, e.g.:
+		#   dns cloudflare {env.CF_API_TOKEN}
+		# or:
+		#   dns route53
+		# See the provider plugin's README for its exact directive/env vars.
+		dns <PROVIDER>
+	}
+
+	# header_up Host {host} is required: Node's Phase 1 routing
+	# (src/routing.js) derives the tenant key from this Host header, so it
+	# must reach 127.0.0.1:3000 unmodified (the real public subdomain, not
+	# an internal name).
+	reverse_proxy 127.0.0.1:3000 {
+		header_up Host {host}
+		header_up X-Forwarded-Proto {scheme}
+	}
+}
