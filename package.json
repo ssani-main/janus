@@ -9,9 +9,9 @@
     "start": "node src/server.js",
     "dev": "node --watch src/server.js",
     "check": "node --check src/server.js && node --check src/tunnel-manager.js && node --check src/rate-limit.js && node --check src/admin.js && node --check src/pages.js && node --check src/routing.js && node --check src/key.js && node --check src/port-pool.js && node --check src/config.js",
-    "test": "node --test \"test/unit/**/*.test.js\"",
-    "test:e2e": "node --test \"test/e2e/**/*.test.js\"",
-    "test:all": "node --test \"test/**/*.test.js\""
+    "test": "cd test/unit && node --test",
+    "test:e2e": "cd test/e2e && node --test",
+    "test:all": "npm test && npm run test:e2e"
   },
   "engines": {
     "node": ">=20"
