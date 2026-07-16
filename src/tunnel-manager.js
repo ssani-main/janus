@@ -43,6 +43,26 @@ class BlockedError extends Error {
 }
 
 /**
+ * Minimal in-memory fallback used when TunnelManager is constructed without
+ * a store (e.g. existing tests calling `new TunnelManager(config)`
+ * directly). Implements just enough of the Store surface that
+ * TunnelManager needs.
+ * @returns {{ isBlocked(keyHash: string): boolean, setBlocked(keyHash: string, blocked: boolean): void }}
+ */
+function _inMemoryStoreShim() {
+  const blocklist = new Set()
+  return {
+    isBlocked(keyHash) {
+      return blocklist.has(keyHash)
+    },
+    setBlocked(keyHash, blocked) {
+      if (blocked) blocklist.add(keyHash)
+      else blocklist.delete(keyHash)
+    },
+  }
+}
+
+/**
  * Quick liveness probe: open a TCP connection to 127.0.0.1:port and confirm
  * something is actually listening before we cache/use the tunnel. Prevents
  * pinning traffic to a tunnel that "connected" but isn't really serving.
@@ -78,7 +98,7 @@ function probePort(port, host, timeoutMs) {
  * many concurrent tenants) is a drop-in -- no reshaping needed here.
  */
 class TunnelManager {
-  constructor(config) {
+  constructor(config, store) {
     this.config = config
     this.portPool = new PortPool(config.TUNNEL_PORT_MIN, config.TUNNEL_PORT_MAX)
     /** @type {Map<string, { client: any, port: number, keyHash: string, lastRequestAt: number, inFlight: number }>} */
@@ -86,10 +106,11 @@ class TunnelManager {
     /** @type {Map<string, Promise<{ client: any, port: number, keyHash: string, lastRequestAt: number, inFlight: number }>>} */
     this.pending = new Map()
     this._sweeperHandle = null
-    // Phase 3: key hashes killed via the admin API, refused before any new
-    // tunnel is created (existing cached tunnels for a blocked key are also
-    // destroyed by the admin handler itself).
-    this.blocklist = new Set()
+    // Milestone 1: blocklist state now lives in the persistent store so it
+    // survives restarts. If no store is supplied (e.g. existing tests that
+    // construct `new TunnelManager(config)` directly), fall back to an
+    // in-memory-only shim with the same isBlocked/setBlocked surface.
+    this.store = store || _inMemoryStoreShim()
   }
 
   /**
@@ -112,7 +133,7 @@ class TunnelManager {
 
     const keyHash = parsed.keyHash
 
-    if (this.blocklist.has(keyHash)) {
+    if (this.store.isBlocked(keyHash)) {
       throw new BlockedError('this key has been blocked by the operator')
     }
 
@@ -292,7 +313,7 @@ class TunnelManager {
    * @param {string} keyHash
    */
   block(keyHash) {
-    this.blocklist.add(keyHash)
+    this.store.setBlocked(keyHash, true)
   }
 
   /**
@@ -300,7 +321,7 @@ class TunnelManager {
    * @param {string} keyHash
    */
   unblock(keyHash) {
-    this.blocklist.delete(keyHash)
+    this.store.setBlocked(keyHash, false)
   }
 
   /**

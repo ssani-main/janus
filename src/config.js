@@ -4,6 +4,12 @@
 // Fails fast (throws) if a required value is missing, so a bad deploy
 // never silently boots into a broken state.
 
+function readString(name, def) {
+  const raw = process.env[name]
+  if (raw === undefined || raw === '') return def
+  return raw
+}
+
 function readInt(name, def) {
   const raw = process.env[name]
   if (raw === undefined || raw === '') return def
@@ -74,6 +80,9 @@ const config = {
   RATE_WINDOW_MS: readInt('RATE_WINDOW_MS', 60000),
   RATE_MAX_REQUESTS: readInt('RATE_MAX_REQUESTS', 120),
   RATE_MAX_NEW_TUNNELS: readInt('RATE_MAX_NEW_TUNNELS', 10),
+  // Milestone 1: path to the persistent JSON store (blocklist, aliases,
+  // dashboard passwords). Relative paths are resolved against process.cwd().
+  STORE_PATH: readString('STORE_PATH', './janus-data.json'),
 }
 
 if (config.TUNNEL_PORT_MIN >= config.TUNNEL_PORT_MAX) {

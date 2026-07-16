@@ -21,6 +21,22 @@ function makeManager() {
   return new TunnelManager(FAKE_CONFIG)
 }
 
+// Minimal fake store matching the isBlocked/setBlocked surface TunnelManager
+// needs -- lets the block/unblock tests assert against `manager.store`
+// directly instead of the removed in-memory `manager.blocklist` Set.
+function fakeStore() {
+  const blocked = new Set()
+  return {
+    isBlocked(keyHash) {
+      return blocked.has(keyHash)
+    },
+    setBlocked(keyHash, isBlocked) {
+      if (isBlocked) blocked.add(keyHash)
+      else blocked.delete(keyHash)
+    },
+  }
+}
+
 function fakeRecord(overrides) {
   return Object.assign(
     {
@@ -72,20 +88,30 @@ test('release: no-op when inFlight is already 0', () => {
 })
 
 test('block + ensureTunnel: a blocked key rejects with BlockedError before any network connect', async () => {
-  const manager = makeManager()
+  const manager = new TunnelManager(FAKE_CONFIG, fakeStore())
   const { keyHash } = parseKey(KEY_A)
   manager.block(keyHash)
 
   await assert.rejects(() => manager.ensureTunnel(KEY_A), BlockedError)
 })
 
-test('unblock: reverses block (no longer in blocklist)', () => {
-  const manager = makeManager()
+test('unblock: reverses block (store.isBlocked reports false again)', () => {
+  const manager = new TunnelManager(FAKE_CONFIG, fakeStore())
   const { keyHash } = parseKey(KEY_A)
   manager.block(keyHash)
-  assert.equal(manager.blocklist.has(keyHash), true)
+  assert.equal(manager.store.isBlocked(keyHash), true)
   manager.unblock(keyHash)
-  assert.equal(manager.blocklist.has(keyHash), false)
+  assert.equal(manager.store.isBlocked(keyHash), false)
+})
+
+test('block/unblock also work against the default in-memory store shim (no store supplied)', () => {
+  const manager = makeManager()
+  const { keyHash } = parseKey(KEY_A)
+  assert.equal(manager.store.isBlocked(keyHash), false)
+  manager.block(keyHash)
+  assert.equal(manager.store.isBlocked(keyHash), true)
+  manager.unblock(keyHash)
+  assert.equal(manager.store.isBlocked(keyHash), false)
 })
 
 test('isCached: false for a key with no cached tunnel', () => {

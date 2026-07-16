@@ -4,12 +4,16 @@ const http = require('node:http')
 const httpProxy = require('http-proxy')
 const config = require('./config')
 const { hostToKey } = require('./routing')
+const { parseKey } = require('./key')
+const { load: loadStore } = require('./store')
 const { TunnelManager, CapacityError, ConnectError, KeyError, BlockedError } = require('./tunnel-manager')
 const { RateLimiter } = require('./rate-limit')
 const { escapeHtml, apexPage, impressumPage, termsPage, rateLimitPage } = require('./pages')
 const { handleAdmin } = require('./admin')
 
-const manager = new TunnelManager(config)
+const store = loadStore(config.STORE_PATH)
+
+const manager = new TunnelManager(config, store)
 manager.startSweeper()
 
 const limiter = new RateLimiter({
@@ -91,6 +95,33 @@ function statusForError(err) {
   return 500
 }
 
+/**
+ * Milestone 1, Feature 2: resolve a routing decision's `rawKey` label
+ * against named aliases. Raw keys always win -- if the label already
+ * parses as a valid Holesail key it is returned unchanged without ever
+ * consulting the store. Only when it does NOT parse do we treat it as an
+ * alias lookup. src/routing.js stays pure (host classification only); this
+ * lives in server.js because it needs the store.
+ *
+ * @param {{ apex: true } | { rawKey: string } | { invalid: true }} route
+ * @param {import('./store').Store} store
+ * @returns {{ apex: true } | { rawKey: string } | { invalid: true }}
+ */
+function resolveRoute(route, store) {
+  if (route.apex || route.invalid) return route
+
+  try {
+    parseKey(route.rawKey)
+    return route
+  } catch {
+    // Not a parseable key -- fall through to alias resolution.
+  }
+
+  const entry = store.getByAlias(route.rawKey)
+  if (entry) return { rawKey: entry.rawKey }
+  return { invalid: true }
+}
+
 function titleForStatus(code) {
   switch (code) {
     case 503: return 'Service Unavailable'
@@ -113,7 +144,7 @@ const server = http.createServer(async (req, res) => {
     return
   }
 
-  const route = hostToKey(req.headers.host, config.BASE_DOMAIN)
+  const route = resolveRoute(hostToKey(req.headers.host, config.BASE_DOMAIN), store)
   if (route.apex) {
     const url = new URL(req.url, 'http://internal')
     if (url.pathname.startsWith('/_admin')) {
@@ -189,7 +220,7 @@ server.on('upgrade', async (req, socket, head) => {
     return
   }
 
-  const route = hostToKey(req.headers.host, config.BASE_DOMAIN)
+  const route = resolveRoute(hostToKey(req.headers.host, config.BASE_DOMAIN), store)
   if (route.apex || route.invalid) {
     socket.destroy()
     return
@@ -258,4 +289,4 @@ server.listen(config.PORT, config.BIND_HOST, () => {
     'it is HTTP-only and not meant to face the public internet directly.')
 })
 
-module.exports = { server, manager, proxy, limiter }
+module.exports = { server, manager, proxy, limiter, store, resolveRoute }
