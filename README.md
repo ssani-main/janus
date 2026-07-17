@@ -6,7 +6,7 @@
 
 One small always-on VPS with a single wildcard domain becomes the public front door for an arbitrary number of backend projects. Each backend runs anywhere (home PC, laptop, Pi, VPS) with **no domain, no port forwarding, no public IP**, reachable only over Holesail's [HyperDHT](https://github.com/holepunchto/hyperdht) tunnel. The gateway runs the Holesail *client* on the visitor's behalf and reverse-proxies plain HTTPS to it, so visitors just open a link.
 
-> **Status:** ✅ Built and verified end-to-end against live Holesail tunnels — Phase 0 (10/10) · Phase 1 (13/13) · Phase 2 (9/9) · Phase 3 (19/19). **Milestone 1** adds a persistent store, named aliases, optional per-key passwords, and an HTML admin dashboard. See [`GATEWAY_DESIGN.md`](./GATEWAY_DESIGN.md) for the full design, [`ROADMAP.md`](./ROADMAP.md) for what's next, and [`TEST_REPORT.md`](./TEST_REPORT.md) for the verification report.
+> **Status:** ✅ Built and verified end-to-end against live Holesail tunnels — Phase 0 (10/10) · Phase 1 (13/13) · Phase 2 (9/9) · Phase 3 (19/19). **Milestone 1** adds a persistent store, named aliases, optional per-key passwords, and an HTML admin dashboard. **Milestone 2** adds observability (`/healthz`, `/metrics`, structured request logging) and resilience (exponential-backoff reconnect, circuit breaker, periodic health probes, friendly offline page). See [`GATEWAY_DESIGN.md`](./GATEWAY_DESIGN.md) for the full design, [`ROADMAP.md`](./ROADMAP.md) for what's next, and [`TEST_REPORT.md`](./TEST_REPORT.md) for the verification report.
 
 ---
 
@@ -103,6 +103,16 @@ All via environment variables (see [`.env.example`](./.env.example)).
 | `SESSION_TTL_MS` | `604800000` | how long a visitor's passworded-key session (after login) stays valid, in milliseconds (default 7 days) |
 | `COOKIE_SECURE` | `true` | whether session cookies get the Secure attribute (HTTPS-only). Must be `true` in production — only set `false` for local HTTP-only development. |
 | `ADMIN_SESSION_TTL_MS` | `43200000` | how long an admin dashboard login session stays valid, in milliseconds (default 12 hours). Rotating `ADMIN_TOKEN` immediately invalidates all outstanding admin sessions. |
+| `LOG_REQUESTS` | `false` | whether to emit a JSON line per request to stdout (Milestone 2a). High volume; opt in explicitly. Set to `true` or `"1"` to enable. |
+| `CIRCUIT_FAILURE_THRESHOLD` | `5` | consecutive cold-create failures before a keyHash's circuit opens (Milestone 2c). Once open, further cold creates fast-fail with 503 instead of attempting a DHT round trip. |
+| `CIRCUIT_COOLDOWN_MS` | `30000` | how long a circuit stays open once it trips, in milliseconds (Milestone 2c). |
+| `RECONNECT_MAX_ATTEMPTS` | `3` | extra reconnect-with-backoff attempts after the first cold-create fails, before giving up and returning 502 (Milestone 2c). Default 3 = up to 4 total attempts. |
+| `RECONNECT_BASE_DELAY_MS` | `250` | base delay for reconnect backoff, in milliseconds; actual delay is exponential with jitter (Milestone 2c). |
+| `RECONNECT_MAX_DELAY_MS` | `5000` | cap on reconnect backoff delay, in milliseconds (Milestone 2c). |
+| `HEALTH_PROBE_INTERVAL_MS` | `30000` | how often the periodic health probe checks each cached tunnel's liveness, in milliseconds (Milestone 2d). Independent of the 60s idle sweeper. |
+| `HEALTH_PROBE_TIMEOUT_MS` | `2000` | per-probe connect timeout, in milliseconds (Milestone 2d). Must be well under `HEALTH_PROBE_INTERVAL_MS` so probes never stack up. |
+| `PROXY_TIMEOUT_MS` | `30000` | http-proxy idle-socket timeout for tunneled requests, in milliseconds (Milestone 2d). Detects hung backends; does NOT apply to WebSocket upgrades. |
+| `ENSURE_TUNNEL_TIMEOUT_MS` | `45000` | overall wall-clock deadline on a single `ensureTunnel` cold create, in milliseconds. Bounds the reconnect loop, port-collision retry loop, and all associated timeouts and sleeps; must exceed `CONNECT_TIMEOUT_MS`. |
 
 ---
 
@@ -167,11 +177,13 @@ See [`DEPLOY.md`](./DEPLOY.md) for the full runbook. In short:
 │   ├── auth.js           scrypt password hashing + signed session/CSRF tokens
 │   ├── port-pool.js      local port allocator
 │   ├── rate-limit.js     per-IP request + new-tunnel limiter
-│   ├── tunnel-manager.js tunnel pool: LRU eviction, refcount, dedup
+│   ├── tunnel-manager.js tunnel pool: LRU eviction, refcount, dedup, circuit breaker, health probes
+│   ├── logger.js         JSON-lines request logger (Milestone 2a)
+│   ├── metrics.js        Prometheus text-format metrics renderer (Milestone 2a)
 │   ├── fonts.js          self-hosted OFL typefaces as base64 data URIs
-│   ├── pages.js          apex / Impressum / ToS / 429 / login / admin pages
-│   ├── admin.js          admin JSON API + HTML dashboard (aliases, passwords, blocks)
-│   └── server.js         HTTP + WebSocket entrypoint, alias + password gate
+│   ├── pages.js          apex / Impressum / ToS / 429 / login / admin pages / offline page
+│   ├── admin.js          admin JSON API + HTML dashboard (aliases, passwords, blocks, health status)
+│   └── server.js         HTTP + WebSocket entrypoint, alias + password gate, /healthz + /metrics
 ├── Caddyfile             wildcard TLS (DNS-01)
 ├── .env.example          all config knobs
 ├── DEPLOY.md             operator runbook

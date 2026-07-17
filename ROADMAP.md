@@ -46,42 +46,80 @@ built-ins only.
 
 ---
 
-## Milestone 2 — NOT STARTED (eyes & reliability)
+## Milestone 2 — DONE ✅
 
-Goal: make Janus observable and resilient in production.
+Shipped in commits:
+- `feat(metrics,logger): observability (2a+2b): /healthz + /metrics + structured request logging`
+- `feat(circuit-breaker,health-probe): reliability (2c+2d): exponential-backoff reconnect, circuit breaker, periodic health probes, offline page`
+
+88/88 unit tests pass (inclusive of M2's circuit/reconnect tests). Zero new npm
+dependencies (Node built-ins only).
 
 ### 2a. `/healthz` + `/metrics`
-- `/healthz` on the apex host: return 200 `{status:"ok", tunnels:<n>, uptime}`.
-  Cheap liveness for monitoring/uptime checks.
-- `/metrics` in Prometheus text format: active tunnels, total tunnels created,
-  evictions, idle sweeps, connect failures, per-IP rate-limit hits, bytes
-  proxied. `TunnelManager` already tracks most of this state — add counters.
-- Wire both in `src/server.js` apex routing (next to the `/_admin`, `/impressum`,
-  `/terms` branches). Keep `/metrics` operator-only (reuse `ADMIN_TOKEN` bearer or
-  a bind-address guard) — don't leak tenant counts publicly.
-- Add counter fields to `src/tunnel-manager.js` (increment on create/evict/sweep/
-  connect-fail) and to `src/rate-limit.js` (limit-hit counter).
+
+| Feature | Summary | Key files |
+|---|---|---|
+| `/healthz` endpoint | GET on apex host returns 200 `{status:"ok", tunnels:<n>, uptime}` for monitoring/uptime checks. Dispatched *before* rate limiting — always reachable. | `src/server.js` (line 407–414), `src/tunnel-manager.js` `stats()` |
+| `/metrics` Prometheus format | Gauges: active, pending, max tunnels, circuits open, tunnels unhealthy, uptime, rate-limit buckets. Counters: created, evicted, swept, connect failures, port retries, circuit opens, reconnect attempts/successes, health probes/failures, rate-limit hits (request + new-tunnel). Bearer-gated with `ADMIN_TOKEN`. | `src/metrics.js`, `src/server.js` (line 449–475), `src/tunnel-manager.js` `stats()`, `src/rate-limit.js` `stats()` |
+| Cumulative counters | Every `TunnelManager` + `RateLimiter` event increments monotonic counters so operators can see process-lifetime totals (not just current state). | `src/tunnel-manager.js` `this.counters`, `src/rate-limit.js` `this.hits` |
+
+**New env vars** (see `.env.example`): `LOG_REQUESTS`.
 
 ### 2b. Structured request logging
-- Emit one JSON line per request: timestamp, keyHash (NEVER the raw key), method,
-  path, status, latency ms, bytes, client IP. Toggle via a `LOG_REQUESTS` env var.
-- Add in `src/server.js` request handler around the proxy call (measure on
-  `res.on('finish')`). Reuse the existing `clientIp()` helper.
+
+| Feature | Summary | Key files |
+|---|---|---|
+| JSON-lines logging | Per-request: timestamp, keyHash (never raw key), method, path, status, durMs, bytes, client IP. Opt-in via `LOG_REQUESTS` env var. | `src/logger.js`, `src/server.js` (line 394–400) |
+
+**New env vars** (see `.env.example`): `LOG_REQUESTS`.
 
 ### 2c. Tunnel auto-reconnect + circuit breaker
-- In `src/tunnel-manager.js`: on a tunnel's `holesail-client` dropping/erroring,
-  attempt reconnect with exponential backoff instead of failing cold on the next
-  request. Track consecutive failures per keyHash; after N failures open a
-  circuit (fast-fail with a friendly 502 for a cooldown window) so a dead backend
-  doesn't hammer the DHT.
-- Add `ConnectError` handling path + a per-record `failures`/`circuitOpenUntil`
-  field. Sweeper (`startSweeper`) is a good place to also probe/reset circuits.
 
-### 2d. Backend health checks
-- Periodic liveness probe of cached tunnels (reuse the existing `probePort` TCP
-  probe in `tunnel-manager.js`). Mark unhealthy tunnels; serve a friendly
-  "backend offline" page (extend `errorPage` in `src/server.js`) instead of a
-  raw proxy error. Surface health in the admin dashboard rows.
+| Feature | Summary | Design note | Key files |
+|---|---|---|---|
+| Exponential backoff reconnect | On cold-create failure, retry with backoff (base delay, exponential cap, jitter) instead of failing immediately. Shared across concurrent requests to the same key. | Jitter prevents lockstep DHT hammering when N clients target one dead backend. | `src/tunnel-manager.js` `reconnectDelayMs()`, `_createTunnel()`, `config.RECONNECT_*` |
+| Circuit breaker | Manager-level (not per-tunnel-record) state keyed by keyHash. After N consecutive failures opens a circuit: fast-fails cold-create with 503 + `Retry-After` for a cooldown window. | Circuit check is deliberately AFTER the cached-tunnel return (line 433–454): a stale circuit never kills a currently-healthy tunnel; it only gates the expensive cold-create path. Cached tunnels proving the backend is alive now always bypass the circuit. | `src/tunnel-manager.js` `this.circuits` Map, `ensureTunnel()`, `recordFailure()`, `recordSuccess()`, `CircuitOpenError` |
+| Port-collision guard | Wraps `client.connect()` with process-wide uncaughtException listener to catch EADDRINUSE before it crashes the gateway. Retries onto the next pool port (bounded by `MAX_PORT_ATTEMPTS`). | HolesailClient's internal net.Server has no error listener; bind failures escalate to uncaughtException unless guarded. | `src/tunnel-manager.js` `connectWithPortGuard()`, `onUncaughtPortGuard`, `pendingPorts` registry |
+
+**New env vars** (see `.env.example`): `CIRCUIT_FAILURE_THRESHOLD`, `CIRCUIT_COOLDOWN_MS`, `RECONNECT_MAX_ATTEMPTS`, `RECONNECT_BASE_DELAY_MS`, `RECONNECT_MAX_DELAY_MS`.
+
+### 2d. Backend health checks + offline page
+
+| Feature | Summary | Design note | Key files |
+|---|---|---|---|
+| Periodic health probing | Separate interval (not folded into the 60s idle sweeper) probes each cached tunnel's loopback TCP port. Recycles failed probes as unwilling to close circuits (too weak a signal). | A loopback TCP connect only proves our proxy port is up, not that the real backend works. Health probes mark a tunnel unhealthy only after `HEALTH_PROBE_UNHEALTHY_STREAK` consecutive failures, then destroy it (not pin it). Recovery is automatic: the next request cold-creates, feeding strong signals (actual ConnectError) to the circuit breaker. | `src/tunnel-manager.js` `startHealthProbing()`, `_probeTunnels()`, `_probeOne()`, `HEALTH_PROBE_UNHEALTHY_STREAK` |
+| Proxy timeout | http-proxy's idle-socket timeout; detects hung backends that accept the connection but never respond. Essential: without it, a backend hanging forever never errors, so `inFlight` never drains, probes never run (skipped if inFlight > 0), and the tunnel pins with `healthy === true`. | This is NOT a hard response-time cap — a slow backend that keeps sending/receiving data is never cut off. WebSocket upgrades are exempt (long-lived sockets). | `src/server.js` line 76, `config.PROXY_TIMEOUT_MS` |
+| Friendly offline page | When proxy errors and the tunnel context exists, serve `offlinePage()` (honest: backend is offline/unreachable, visitor did nothing wrong) instead of generic `errorPage(502)`. | Unlike the previous probe-driven logic (checking `tunnel.healthy === false`), this now fires on ANY proxy error with tunnel context: probes have already destroyed the tunnel by the time an error reaches this handler, so `healthy` would almost never still be false. The offline page is the strong, immediate signal. | `src/pages.js` `offlinePage()`, `src/server.js` `proxy.on('error')` (line 104–131) |
+| Admin dashboard health column | Tunnels list shows `healthy` status (live gauge, updated by probes). | Transient: a destroyed unhealthy tunnel's record vanishes; health state does not outlive the tunnel it describes. | `src/pages.js` `adminDashboardPage()`, `src/tunnel-manager.js` `list()` |
+
+**New env vars** (see `.env.example`): `HEALTH_PROBE_INTERVAL_MS`, `HEALTH_PROBE_TIMEOUT_MS`, `PROXY_TIMEOUT_MS`.
+
+---
+
+## Milestone 2 — Known gaps & follow-ups
+
+Improvements deferred intentionally (low impact, addressed if reported in production):
+
+### Port-recycling probe race (low probability, narrow window)
+When `_probeTunnels()` snapshots records then probes them asynchronously,
+`destroyTunnel()` can release a port mid-probe and `PortPool.acquire()` can
+immediately reissue that exact port to a different key. A stale probe's result
+could be attributed to the wrong tunnel. No port generation/version tag exists
+to detect reuse. **Mitigation:** probe failure streaks destroy tunnels
+immediately, so most stale results are irrelevant; risk is only if a port is
+recycled *and* a stale probe succeeds wrongly. Not observed in testing.
+
+### Dual keyHash for `0000<X>` and `s000<X>` keys (operator awareness only)
+`parseKey()` hashes only the 52-char key suffix, stripping the 4-char mode
+prefix. Two keys with identical material — one public (`0000…`), one secure
+(`s000…`) — collide to the same keyHash. An operator setting a password on a
+public key also gates the same-material secure-mode key (if someone tries to
+share it). **Not a bypass:** secure-mode keys are rejected at the parse stage
+(line 78–87, `assertPublic()`), so the collision is observable only if an
+operator explicitly tries. **Directly relevant to M3's secure-mode-key work:**
+if M3 removes `assertPublic()`, these collisions become a real aliasing bug —
+the path forward is including the mode prefix in the keyHash when secure-mode
+support lands.
 
 ---
 
@@ -95,6 +133,11 @@ Goal: make Janus observable and resilient in production.
   encrypted at rest ideally), and pass `secure: true` + the secret to the client.
 - This complements per-visitor passwords (3-layer: owner locks the tunnel, gateway
   adds a visitor password). Update `assertPublic` usage and the store schema.
+- **M2 handoff note:** `parseKey()` currently hashes only the 52-char key suffix,
+  so `0000<X>` and `s000<X>` collide to the same keyHash. Not a current issue
+  (secure-mode is rejected), but when removing `assertPublic()` in this task,
+  include the 4-char mode prefix in the hash so aliases/passwords don't
+  accidentally gate the wrong key material. See **Known gaps** above.
 
 ### 3b. Per-key usage accounting & quotas
 - Meter bytes + request counts per keyHash (hook the proxy stream, persist
