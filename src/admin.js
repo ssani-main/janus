@@ -30,6 +30,7 @@ const {
   csrfToken,
   verifyCsrf,
   hashPassword,
+  timingSafeEqualStr,
 } = require('./auth')
 const { parseKey } = require('./key')
 const { adminLoginPage, adminDashboardPage } = require('./pages')
@@ -61,20 +62,6 @@ function sendJson(res, code, body) {
 function sendHtml(res, code, html) {
   res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8' })
   res.end(html)
-}
-
-/**
- * Timing-safe string compare -- used for the bearer token and admin login
- * token checks, which must not leak length/prefix information via timing.
- * @param {string} a
- * @param {string} b
- * @returns {boolean}
- */
-function timingSafeEqualStr(a, b) {
-  const aBuf = Buffer.from(String(a))
-  const bBuf = Buffer.from(String(b))
-  if (aBuf.length !== bBuf.length) return false
-  return crypto.timingSafeEqual(aBuf, bBuf)
 }
 
 /**

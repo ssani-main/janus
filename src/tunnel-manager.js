@@ -262,6 +262,17 @@ class TunnelManager {
     // in-memory-only shim with the same isBlocked/setBlocked surface.
     this.store = store || _inMemoryStoreShim()
     this.clientFactory = clientFactory || ((opts) => new HolesailClient(opts))
+    // Milestone 2a: cumulative, monotonically-increasing counters for the
+    // /metrics endpoint -- unlike `this.tunnels`, these never shrink, so an
+    // operator can see totals across the process lifetime, not just current
+    // state.
+    this.counters = {
+      created: 0,
+      evicted: 0,
+      swept: 0,
+      connectFailures: 0,
+      portRetries: 0,
+    }
   }
 
   /**
@@ -337,6 +348,7 @@ class TunnelManager {
         )
       }
       await this.destroyTunnel(victim.keyHash)
+      this.counters.evicted++
     }
 
     // A port handed out by PortPool is only reserved *in this process* --
@@ -380,8 +392,10 @@ class TunnelManager {
         if (isPortCollisionError(err) && attempt < MAX_PORT_ATTEMPTS - 1) {
           // Try the next port from the pool. Do NOT evict another tunnel to
           // free one up -- that causes eviction thrash; just move on.
+          this.counters.portRetries++
           continue
         }
+        this.counters.connectFailures++
         throw new ConnectError(`failed to connect tunnel for key: ${err.message}`, err)
       }
 
@@ -394,6 +408,7 @@ class TunnelManager {
         inFlight: 0,
       }
       this.tunnels.set(parsed.keyHash, record)
+      this.counters.created++
       return record
     }
 
@@ -479,6 +494,21 @@ class TunnelManager {
   }
 
   /**
+   * Snapshot of current + cumulative tunnel stats for the /metrics endpoint.
+   * Returns a copy (not the live counters object) so callers can't mutate
+   * our internal state.
+   * @returns {{ active: number, pending: number, maxTunnels: number, created: number, evicted: number, swept: number, connectFailures: number, portRetries: number }}
+   */
+  stats() {
+    return {
+      active: this.tunnels.size,
+      pending: this.pending.size,
+      maxTunnels: this.config.MAX_TUNNELS,
+      ...this.counters,
+    }
+  }
+
+  /**
    * Operator kill-switch: block a key hash from ever getting a new tunnel
    * again (existing cached tunnel, if any, is destroyed separately by the
    * caller -- see src/admin.js).
@@ -523,7 +553,11 @@ class TunnelManager {
       const now = Date.now()
       for (const [keyHash, record] of this.tunnels) {
         if (record.inFlight === 0 && now - record.lastRequestAt > this.config.IDLE_TTL_MS) {
-          this.destroyTunnel(keyHash).catch(() => {})
+          this.destroyTunnel(keyHash)
+            .then(() => {
+              this.counters.swept++
+            })
+            .catch(() => {})
         }
       }
     }, 60000)

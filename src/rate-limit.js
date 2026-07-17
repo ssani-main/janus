@@ -13,6 +13,11 @@ class RateLimiter {
     /** @type {Map<string, { windowStart: number, requests: number, newTunnels: number }>} */
     this.buckets = new Map()
     this._sweepHandle = null
+    // Milestone 2a: cumulative deny counts for the /metrics endpoint, one
+    // per limiter dimension. Only incremented on the DENY path -- a hit
+    // here means a real client was actually throttled, not just that the
+    // bucket was touched.
+    this.hits = { request: 0, newTunnel: 0 }
   }
 
   _getBucket(ip) {
@@ -33,6 +38,7 @@ class RateLimiter {
     const bucket = this._getBucket(ip)
     bucket.requests++
     const ok = bucket.requests <= this.maxRequests
+    if (!ok) this.hits.request++
     const retryAfterMs = ok ? 0 : bucket.windowStart + this.windowMs - Date.now()
     return { ok, retryAfterMs: Math.max(0, retryAfterMs) }
   }
@@ -45,8 +51,22 @@ class RateLimiter {
     const bucket = this._getBucket(ip)
     bucket.newTunnels++
     const ok = bucket.newTunnels <= this.maxNewTunnels
+    if (!ok) this.hits.newTunnel++
     const retryAfterMs = ok ? 0 : bucket.windowStart + this.windowMs - Date.now()
     return { ok, retryAfterMs: Math.max(0, retryAfterMs) }
+  }
+
+  /**
+   * Snapshot of cumulative deny counts + current bucket count for the
+   * /metrics endpoint. Returns a copy, not the live counters object.
+   * @returns {{ request: number, newTunnel: number, buckets: number }}
+   */
+  stats() {
+    return {
+      request: this.hits.request,
+      newTunnel: this.hits.newTunnel,
+      buckets: this.buckets.size,
+    }
   }
 
   /**

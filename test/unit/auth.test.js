@@ -10,6 +10,7 @@ const {
   parseCookies,
   csrfToken,
   verifyCsrf,
+  timingSafeEqualStr,
 } = require('../../src/auth')
 
 const HEX_RE = /^[0-9a-f]+$/
@@ -158,4 +159,32 @@ test('verifyCsrf: does not throw on garbage token input', () => {
   assert.doesNotThrow(() => {
     assert.equal(verifyCsrf(secret, 'session-123', ''), false)
   })
+})
+
+// --- timingSafeEqualStr (Milestone 2a: guards /metrics' bearer check) ------
+
+test('timingSafeEqualStr: identical strings -> true', () => {
+  assert.equal(timingSafeEqualStr('Bearer secret-token', 'Bearer secret-token'), true)
+})
+
+test('timingSafeEqualStr: different strings of the same length -> false', () => {
+  assert.equal(timingSafeEqualStr('Bearer aaaaaaaaaaaa', 'Bearer bbbbbbbbbbbb'), false)
+})
+
+test('timingSafeEqualStr: different lengths -> false, does not throw', () => {
+  assert.doesNotThrow(() => {
+    assert.equal(timingSafeEqualStr('short', 'a-much-longer-string'), false)
+  })
+})
+
+test('timingSafeEqualStr: empty vs non-empty -> false', () => {
+  assert.equal(timingSafeEqualStr('', 'nonempty'), false)
+})
+
+test('timingSafeEqualStr: empty vs empty -> true', () => {
+  assert.equal(timingSafeEqualStr('', ''), true)
+})
+
+test('timingSafeEqualStr: is case-sensitive', () => {
+  assert.equal(timingSafeEqualStr('Bearer TOKEN', 'Bearer token'), false)
 })

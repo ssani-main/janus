@@ -109,6 +109,21 @@ function parseCookies(cookieHeader) {
 }
 
 /**
+ * Timing-safe string compare -- used for the bearer token and admin login
+ * token checks (and, Milestone 2a, /metrics' bearer check), which must not
+ * leak length/prefix information via timing.
+ * @param {string} a
+ * @param {string} b
+ * @returns {boolean}
+ */
+function timingSafeEqualStr(a, b) {
+  const aBuf = Buffer.from(String(a))
+  const bBuf = Buffer.from(String(b))
+  if (aBuf.length !== bBuf.length) return false
+  return crypto.timingSafeEqual(aBuf, bBuf)
+}
+
+/**
  * Feature 4 (dashboard) helper: a CSRF token bound to a session id.
  *
  * @param {string} secret
@@ -142,4 +157,5 @@ module.exports = {
   parseCookies,
   csrfToken,
   verifyCsrf,
+  timingSafeEqualStr,
 }

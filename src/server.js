@@ -11,9 +11,13 @@ const { TunnelManager, CapacityError, ConnectError, KeyError, BlockedError } = r
 const { RateLimiter } = require('./rate-limit')
 const { escapeHtml, apexPage, impressumPage, termsPage, rateLimitPage, loginPage } = require('./pages')
 const { handleAdmin } = require('./admin')
-const { hashPassword, verifyPassword, signSession, verifySession, parseCookies } = require('./auth')
+const { hashPassword, verifyPassword, signSession, verifySession, parseCookies, timingSafeEqualStr } = require('./auth')
+const { renderMetrics } = require('./metrics')
+const { createLogger } = require('./logger')
 
 const store = loadStore(config.STORE_PATH)
+const startedAt = Date.now()
+const logger = createLogger({ enabled: config.LOG_REQUESTS })
 
 // Milestone 1, Feature 3/4: session secret used to sign/verify the
 // password-gate and (later) admin dashboard cookies. config.js stays
@@ -111,6 +115,51 @@ function clientIp(req) {
     }
   }
   return req.socket.remoteAddress
+}
+
+/**
+ * Milestone 2a: wrap res.write/res.end to accurately count bytes written to
+ * the response. `res.socket.bytesWritten` is WRONG for this -- it's
+ * cumulative across a keep-alive socket's whole lifetime, not per-request.
+ * Wrapping here is also the only way to capture bytes on non-proxied
+ * branches (error pages, login page, apex landing, /healthz, /metrics)
+ * since those never touch the proxy's own byte counters.
+ *
+ * @param {import('node:http').ServerResponse} res
+ * @returns {{ bytes(): number }}
+ */
+function instrumentResponseBytes(res) {
+  let total = 0
+  function chunkBytes(chunk, encoding) {
+    if (chunk === undefined || chunk === null) return 0
+    if (Buffer.isBuffer(chunk)) return chunk.length
+    return Buffer.byteLength(chunk, typeof encoding === 'string' ? encoding : 'utf8')
+  }
+
+  const origWrite = res.write.bind(res)
+  res.write = (chunk, encoding, cb) => {
+    if (typeof encoding === 'function') {
+      total += chunkBytes(chunk)
+      return origWrite(chunk, encoding)
+    }
+    total += chunkBytes(chunk, encoding)
+    return origWrite(chunk, encoding, cb)
+  }
+
+  const origEnd = res.end.bind(res)
+  res.end = (chunk, encoding, cb) => {
+    if (typeof chunk === 'function') {
+      return origEnd(chunk)
+    }
+    if (typeof encoding === 'function') {
+      total += chunkBytes(chunk)
+      return origEnd(chunk, encoding)
+    }
+    total += chunkBytes(chunk, encoding)
+    return origEnd(chunk, encoding, cb)
+  }
+
+  return { bytes: () => total }
 }
 
 function statusForError(err) {
@@ -216,16 +265,14 @@ function safeNextPath(next) {
  * @param {import('node:http').IncomingMessage} req
  * @param {import('node:http').ServerResponse} res
  * @param {string} rawKey
+ * @param {?string} keyHash precomputed by the caller (server.js now hashes
+ *   the key once per request right after routing) -- null when rawKey did
+ *   not parse as a valid key, in which case we let ensureTunnel produce the
+ *   normal KeyError downstream.
  * @returns {Promise<'proceed' | 'handled'>}
  */
-async function passwordGate(req, res, rawKey) {
-  let keyHash
-  try {
-    keyHash = parseKey(rawKey).keyHash
-  } catch {
-    // Not a parseable key -- let ensureTunnel produce the normal KeyError.
-    return 'proceed'
-  }
+async function passwordGate(req, res, rawKey, keyHash) {
+  if (!keyHash) return 'proceed'
 
   const pw = store.getPassword(keyHash)
   if (!pw) return 'proceed'
@@ -290,7 +337,51 @@ function titleForStatus(code) {
 }
 
 const server = http.createServer(async (req, res) => {
+  // Milestone 2a: capture start time + instrument byte counting up front,
+  // and attach the finish/close log hook immediately -- this way every
+  // early-return branch below (429, 404, apex, login page, error pages) is
+  // covered by one hook, with no per-branch instrumentation needed. Both
+  // 'finish' and 'close' can fire for the same request; `logged` guards
+  // against emitting the line twice.
+  const reqStart = process.hrtime.bigint()
   const ip = clientIp(req)
+  const url = new URL(req.url, 'http://internal')
+  const byteCounter = instrumentResponseBytes(res)
+  const logCtx = { keyHash: null }
+  let logged = false
+  const emitRequestLog = () => {
+    if (logged) return
+    logged = true
+    const durMs = Number(process.hrtime.bigint() - reqStart) / 1e6
+    logger.logRequest({
+      keyHash: logCtx.keyHash,
+      method: req.method,
+      path: url.pathname,
+      status: res.statusCode,
+      durMs,
+      bytes: byteCounter.bytes(),
+      ip,
+    })
+  }
+  res.on('finish', emitRequestLog)
+  res.on('close', emitRequestLog)
+
+  // Milestone 2a: /healthz is dispatched BEFORE the rate limiter -- it must
+  // be a true "is the process alive" check, independent of limiter state,
+  // and a monitor polling it must not burn the per-IP request budget.
+  // Apex-only (routing.js treats an empty/missing Host as apex too, and
+  // BIND_HOST defaults to 127.0.0.1 behind Caddy, so a local monitor hitting
+  // http://127.0.0.1:PORT/healthz works with zero extra config).
+  if (url.pathname === '/healthz' && hostToKey(req.headers.host, config.BASE_DOMAIN).apex) {
+    res.writeHead(200, { 'Content-Type': 'application/json' })
+    res.end(JSON.stringify({
+      status: 'ok',
+      tunnels: manager.stats().active,
+      uptime: process.uptime(),
+    }))
+    return
+  }
+
   const rl = limiter.allowRequest(ip)
   if (!rl.ok) {
     res.writeHead(429, {
@@ -303,7 +394,6 @@ const server = http.createServer(async (req, res) => {
 
   const route = resolveRoute(hostToKey(req.headers.host, config.BASE_DOMAIN), store)
   if (route.apex) {
-    const url = new URL(req.url, 'http://internal')
     if (url.pathname.startsWith('/_admin')) {
       await handleAdmin(req, res, { manager, config, store, sessionSecret })
       return
@@ -318,6 +408,35 @@ const server = http.createServer(async (req, res) => {
       res.end(termsPage(config))
       return
     }
+    if (url.pathname === '/metrics') {
+      // Milestone 2a: reuses ADMIN_TOKEN as the /metrics bearer (operator's
+      // choice over a bind-address guard). Unset ADMIN_TOKEN -> 404, mirrors
+      // admin.js:169-172 exactly -- the endpoint must be invisible, not
+      // "unauthorized", when the whole admin feature is off. Below the rate
+      // limiter (unlike /healthz) is fine and intentional: this is a
+      // low-frequency operator scrape, not a liveness probe.
+      if (!config.ADMIN_TOKEN) {
+        res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' })
+        res.end(JSON.stringify({ error: 'not found' }))
+        return
+      }
+      const authHeader = req.headers['authorization'] || ''
+      const expectedBearer = `Bearer ${config.ADMIN_TOKEN}`
+      if (!timingSafeEqualStr(authHeader, expectedBearer)) {
+        res.writeHead(401, {
+          'Content-Type': 'text/plain; charset=utf-8',
+          'WWW-Authenticate': 'Bearer',
+        })
+        res.end('unauthorized')
+        return
+      }
+      res.writeHead(200, {
+        'Content-Type': 'text/plain; version=0.0.4',
+        'Cache-Control': 'no-store',
+      })
+      res.end(renderMetrics({ manager, limiter, startedAt }))
+      return
+    }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
     res.end(apexPage(config))
     return
@@ -329,7 +448,19 @@ const server = http.createServer(async (req, res) => {
   }
   const rawKey = route.rawKey
 
-  const gate = await passwordGate(req, res, rawKey)
+  // Milestone 2a: hash the key once here (used for both the password gate
+  // and the request log) instead of the three disconnected re-parses that
+  // used to happen in passwordGate, the upgrade handler, and ensureTunnel.
+  let keyHash = null
+  try {
+    keyHash = parseKey(rawKey).keyHash
+  } catch {
+    // Not a parseable key -- let ensureTunnel produce the normal KeyError,
+    // and leave keyHash null (no key to log).
+  }
+  logCtx.keyHash = keyHash
+
+  const gate = await passwordGate(req, res, rawKey, keyHash)
   if (gate === 'handled') return
 
   const cold = !manager.isCached(rawKey)

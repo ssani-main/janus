@@ -100,6 +100,10 @@ const config = {
   // sessions) since the admin session grants far more power and should be
   // shorter-lived by default. Default 12 hours.
   ADMIN_SESSION_TTL_MS: readInt('ADMIN_SESSION_TTL_MS', 43200000),
+  // Milestone 2a: whether to emit a JSON line per request to stdout. Off by
+  // default -- per-request logging is high volume and an operator should opt
+  // in explicitly, same rationale as ADMIN_TOKEN being unset by default.
+  LOG_REQUESTS: readBool('LOG_REQUESTS', false),
 }
 
 if (config.TUNNEL_PORT_MIN >= config.TUNNEL_PORT_MAX) {
