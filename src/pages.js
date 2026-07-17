@@ -78,7 +78,7 @@ function apexPage(config) {
       var raw = document.getElementById('key').value.trim()
       if (raw.toLowerCase().indexOf('hs://') === 0) raw = raw.slice(5)
       if (!raw) return
-      window.location = 'https://' + raw + '.${safeDomain}/'
+      window.location = location.protocol + '//' + raw + '.${safeDomain}' + (location.port ? ':' + location.port : '') + '/'
     })
   </script>
 </body>
