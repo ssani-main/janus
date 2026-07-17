@@ -107,6 +107,12 @@ const DEFAULT_RECONNECT_MAX_DELAY_MS = 5000
 // it against a minimal config object).
 const DEFAULT_HEALTH_PROBE_INTERVAL_MS = 30000
 const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 2000
+// Security review (FIX 2): same fallback rationale as the defaults above --
+// several existing hand-rolled test configs predate this knob entirely.
+// Falling back to src/config.js's own default (45000) keeps those tests'
+// behavior effectively unchanged (a deadline this generous never fires
+// during a normal, fast-mocked test's cold-create path).
+const DEFAULT_ENSURE_TUNNEL_TIMEOUT_MS = 45000
 
 // Milestone 2d: "open by default" -- a single flaky/failed liveness probe
 // must never be enough to gate traffic away from an otherwise-working
@@ -460,7 +466,16 @@ class TunnelManager {
       return record
     }
 
-    const p = this._createTunnel(parsed)
+    // Security review (FIX 2): a single wall-clock deadline for the ENTIRE
+    // cold-create chain below (reconnect loop x port-collision loop x
+    // per-attempt connect timeout x backoff sleeps) -- see
+    // ENSURE_TUNNEL_TIMEOUT_MS's doc comment in src/config.js for the "each
+    // loop is bounded, their product isn't" problem this closes. Computed
+    // ONCE here and threaded through `_createTunnel`/`_attemptPortConnect` so
+    // every nested loop can shrink its own remaining budget consistently,
+    // rather than each layer re-deriving "now" independently.
+    const deadlineAt = Date.now() + (this.config.ENSURE_TUNNEL_TIMEOUT_MS ?? DEFAULT_ENSURE_TUNNEL_TIMEOUT_MS)
+    const p = this._createTunnel(parsed, deadlineAt)
     this.pending.set(keyHash, p)
     let record
     try {
@@ -485,8 +500,11 @@ class TunnelManager {
    * This is acceptable and documented, not a bug.
    *
    * @param {{ key: string, keyHash: string }} parsed
+   * @param {number} deadlineAt epoch ms -- see FIX 2's doc comment at the
+   *   `ensureTunnel` call site above. Bounds this entire method, including
+   *   the nested `_attemptPortConnect` port-collision loop.
    */
-  async _createTunnel(parsed) {
+  async _createTunnel(parsed, deadlineAt) {
     if (this.tunnels.size >= this.config.MAX_TUNNELS) {
       const victim = this._pickEvictable()
       if (!victim) {
@@ -514,8 +532,18 @@ class TunnelManager {
     // kicking off their own.
     let lastErr
     for (let attempt = 0; ; attempt++) {
+      // FIX 2: check the overall deadline before every attempt, including
+      // the very first -- a deadline that already expired while this
+      // request was queued behind `this.pending` (dedupe) must fail fast,
+      // not pay for one more full connect attempt.
+      if (Date.now() >= deadlineAt) {
+        throw new ConnectError(
+          `failed to connect tunnel for key: ensureTunnel exceeded its ${this.config.ENSURE_TUNNEL_TIMEOUT_MS ?? DEFAULT_ENSURE_TUNNEL_TIMEOUT_MS}ms deadline`,
+          lastErr
+        )
+      }
       try {
-        const record = await this._attemptPortConnect(parsed)
+        const record = await this._attemptPortConnect(parsed, deadlineAt)
         if (attempt > 0) this.counters.reconnectSuccesses++
         this.recordSuccess(parsed.keyHash)
         return record
@@ -526,13 +554,21 @@ class TunnelManager {
         if (attempt >= maxAttempts) {
           throw lastErr
         }
+        // FIX 2: don't bother backing off (or retrying at all) once the
+        // deadline is already gone -- surface the real underlying error
+        // instead of a fresh "deadline exceeded" ConnectError, since the
+        // caller already has a concrete failure reason from this attempt.
+        const remainingMs = deadlineAt - Date.now()
+        if (remainingMs <= 0) {
+          throw lastErr
+        }
         this.counters.reconnectAttempts++
         const delayMs = reconnectDelayMs(
           attempt,
           this.config.RECONNECT_BASE_DELAY_MS ?? DEFAULT_RECONNECT_BASE_DELAY_MS,
           this.config.RECONNECT_MAX_DELAY_MS ?? DEFAULT_RECONNECT_MAX_DELAY_MS
         )
-        await sleep(delayMs)
+        await sleep(Math.min(delayMs, remainingMs))
       }
     }
   }
@@ -552,10 +588,25 @@ class TunnelManager {
    * bounded number of times instead of propagating a raw crash.
    *
    * @param {{ key: string, keyHash: string }} parsed
+   * @param {number} deadlineAt epoch ms -- see FIX 2's doc comment at
+   *   `ensureTunnel`'s call site in this file. Each attempt's connect/probe
+   *   timeout is shrunk to never itself extend past this deadline.
    */
-  async _attemptPortConnect(parsed) {
+  async _attemptPortConnect(parsed, deadlineAt) {
     let lastErr
     for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS; attempt++) {
+      // FIX 2: the reconnect loop above already checks the deadline before
+      // calling us, but the port-collision loop here can burn its own time
+      // across multiple ports within a single `_createTunnel` attempt --
+      // check again per port attempt so a long collision streak can't run
+      // past the deadline before the outer loop gets another chance to.
+      if (Date.now() >= deadlineAt) {
+        throw new ConnectError(
+          `failed to connect tunnel for key: ensureTunnel exceeded its deadline while retrying ports`,
+          lastErr
+        )
+      }
+
       let port
       try {
         port = this.portPool.acquire()
@@ -571,8 +622,15 @@ class TunnelManager {
         await probeFree(port, '127.0.0.1')
 
         client = this.clientFactory({ key: parsed.key, secure: false })
-        await connectWithPortGuard(client, { port, host: '127.0.0.1' }, this.config.CONNECT_TIMEOUT_MS)
-        await probePort(port, '127.0.0.1', this.config.CONNECT_TIMEOUT_MS)
+        // FIX 2: never let a single connect/probe pair run longer than the
+        // time actually remaining until the overall ensureTunnel deadline --
+        // recomputed between the two calls (not just once up front) so the
+        // probe can't itself push past the deadline just because connect
+        // used up most of the remaining budget.
+        const connectTimeoutMs = Math.max(1, Math.min(this.config.CONNECT_TIMEOUT_MS, deadlineAt - Date.now()))
+        await connectWithPortGuard(client, { port, host: '127.0.0.1' }, connectTimeoutMs)
+        const probeTimeoutMs = Math.max(1, Math.min(this.config.CONNECT_TIMEOUT_MS, deadlineAt - Date.now()))
+        await probePort(port, '127.0.0.1', probeTimeoutMs)
       } catch (err) {
         // Clean up whatever partially succeeded before deciding whether to
         // retry or surface the error.
@@ -756,6 +814,20 @@ class TunnelManager {
       healthy: record.healthy,
       lastProbeAt: record.lastProbeAt,
     }))
+  }
+
+  /**
+   * Security review (FIX 3): cheap O(1) live tunnel count for /healthz --
+   * the ONE endpoint fully exempt from rate limiting (see src/server.js),
+   * so it's the one place an attacker can hit at unlimited rate from a
+   * single IP. `stats()` below is O(circuits + tunnels) (it also computes
+   * `circuitsOpen`/`unhealthy` gauges by iterating both Maps), which is
+   * unnecessary work to answer "how many tunnels are active right now" --
+   * `this.tunnels` is already the live source of truth, `.size` is O(1).
+   * @returns {number}
+   */
+  activeCount() {
+    return this.tunnels.size
   }
 
   /**

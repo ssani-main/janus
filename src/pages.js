@@ -267,12 +267,18 @@ function errorPage(code, title, msg, config) {
 </html>`
 }
 
-// Milestone 2d: served in place of the generic errorPage(502, ...) when the
-// proxy errors out AND the periodic health probe has already confirmed
-// (via `req._janusTunnel.healthy === false`) that this isn't just a one-off
-// blip -- see server.js's proxy.on('error', ...) handler. Friendly and
-// honest: the backend is offline/unreachable, this is not the visitor's
-// fault, and there is nothing for them to log into or retry differently.
+// Milestone 2d (revised): served in place of the generic errorPage(502, ...)
+// whenever the proxy errors out against a KNOWN tenant tunnel (i.e.
+// `req._janusTunnel` is present) -- see server.js's proxy.on('error', ...)
+// handler. The earlier `healthy === false` gate was deliberately removed: a
+// health-probe failure streak now destroys the tunnel outright
+// (tunnel-manager.js's _probeOne/destroyTunnel), so `healthy` would almost
+// never still be observed false by the time a real request reaches this
+// handler -- gating on it would have made this page effectively dead code.
+// A proxy error against a known tunnel IS the backend being unreachable,
+// which is exactly what this page exists to say. Friendly and honest: the
+// backend is offline/unreachable, this is not the visitor's fault, and
+// there is nothing for them to log into or retry differently.
 // Deliberately leaks NOTHING operational -- no keyHash, port, or failure
 // counts -- a visitor hitting this page is not an operator and has no use
 // for (and no right to) that information.

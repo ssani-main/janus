@@ -149,6 +149,19 @@ const config = {
   // slow-but-working backend, short enough that a genuinely hung backend
   // recovers automatically well within an operator's patience.
   PROXY_TIMEOUT_MS: readInt('PROXY_TIMEOUT_MS', 30000),
+  // Security review (FIX 2, post-Milestone-2): overall wall-clock deadline
+  // for TunnelManager.ensureTunnel()'s ENTIRE cold-create path (reconnect
+  // loop x port-collision loop x per-attempt connect timeout x backoff
+  // sleeps), enforced from inside TunnelManager itself -- see
+  // src/tunnel-manager.js's `deadlineAt` threading through `_createTunnel`/
+  // `_attemptPortConnect`. Each individual loop/timeout is already bounded,
+  // but their product is not (worst case ~175s with CONNECT_TIMEOUT_MS=8000,
+  // RECONNECT_MAX_ATTEMPTS=3, MAX_PORT_ATTEMPTS=5, RECONNECT_MAX_DELAY_MS=
+  // 5000), and nothing previously capped that product while a visitor's HTTP
+  // request sat there waiting. Default 45s: comfortably above a normal
+  // successful cold create (one DHT round trip well under
+  // CONNECT_TIMEOUT_MS=8000), far below the ~175s worst case.
+  ENSURE_TUNNEL_TIMEOUT_MS: readInt('ENSURE_TUNNEL_TIMEOUT_MS', 45000),
 }
 
 if (config.TUNNEL_PORT_MIN >= config.TUNNEL_PORT_MAX) {
@@ -221,6 +234,23 @@ if (config.HEALTH_PROBE_TIMEOUT_MS >= config.HEALTH_PROBE_INTERVAL_MS) {
 if (config.PROXY_TIMEOUT_MS <= 0) {
   throw new Error(
     `Invalid config: PROXY_TIMEOUT_MS (${config.PROXY_TIMEOUT_MS}) must be a positive integer`
+  )
+}
+
+// Security review (FIX 2): fail fast on a nonsensical ensureTunnel deadline.
+// It must strictly exceed CONNECT_TIMEOUT_MS -- otherwise a single connect
+// attempt alone could already exceed the "overall" deadline meant to bound
+// the whole reconnect x port-retry x backoff chain.
+if (config.ENSURE_TUNNEL_TIMEOUT_MS <= 0) {
+  throw new Error(
+    `Invalid config: ENSURE_TUNNEL_TIMEOUT_MS (${config.ENSURE_TUNNEL_TIMEOUT_MS}) must be a positive integer`
+  )
+}
+if (config.ENSURE_TUNNEL_TIMEOUT_MS <= config.CONNECT_TIMEOUT_MS) {
+  throw new Error(
+    `Invalid config: ENSURE_TUNNEL_TIMEOUT_MS (${config.ENSURE_TUNNEL_TIMEOUT_MS}) must exceed ` +
+    `CONNECT_TIMEOUT_MS (${config.CONNECT_TIMEOUT_MS}) -- it bounds the whole cold-create chain, ` +
+    `which includes at least one full connect attempt`
   )
 }
 

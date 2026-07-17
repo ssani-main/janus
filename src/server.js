@@ -194,6 +194,27 @@ function instrumentResponseBytes(res) {
   return { bytes: () => total }
 }
 
+// Security review (FIX 1, post-Milestone-2): fixed, generic visitor-facing
+// message per error class. err.message MUST NEVER be reflected into a
+// visitor-facing page -- it can carry operator-only detail (an internal
+// 127.0.0.1:<port>, the configured MAX_TUNNELS capacity, etc., see
+// tunnel-manager.js's ConnectError/CapacityError construction sites). HTML
+// escaping alone is not enough: the leak is the *content* reaching the
+// visitor at all, not markup injection. console.error (below, at the
+// ensureTunnel catch site) is the only place err.message is allowed to
+// appear -- operators need the detail, visitors don't. Do not regress this
+// by ever passing err.message (or anything derived from it) into errorPage.
+const VISITOR_MESSAGE_BY_ERROR_NAME = {
+  ConnectError: 'Could not connect to the backend for this key. Please try again shortly.',
+  CapacityError: 'This gateway is at capacity right now. Please try again shortly.',
+  KeyError: 'The key in this address is malformed or not allowed.',
+  BlockedError: 'This key has been blocked by the operator.',
+  CircuitOpenError: 'This key is temporarily unavailable after repeated connection failures. Please try again shortly.',
+}
+function visitorMessageForError(err) {
+  return VISITOR_MESSAGE_BY_ERROR_NAME[err && err.name] || 'An unexpected error occurred.'
+}
+
 function statusForError(err) {
   if (err instanceof CapacityError) return 503
   // Milestone 2c: a CircuitOpenError is deliberately 503, not 502 -- the
@@ -414,7 +435,10 @@ const server = http.createServer(async (req, res) => {
     res.writeHead(200, { 'Content-Type': 'application/json' })
     res.end(JSON.stringify({
       status: 'ok',
-      tunnels: manager.stats().active,
+      // FIX 3: manager.stats() also iterates this.circuits + this.tunnels
+      // to compute circuitsOpen/unhealthy gauges -- unnecessary work for the
+      // ONE endpoint fully exempt from rate limiting. activeCount() is O(1).
+      tunnels: manager.activeCount(),
       uptime: process.uptime(),
     }))
     return
@@ -519,13 +543,16 @@ const server = http.createServer(async (req, res) => {
     tunnel = await manager.ensureTunnel(rawKey)
   } catch (err) {
     const code = statusForError(err)
+    // Operator-only: full detail, including err.message (may contain an
+    // internal port, MAX_TUNNELS, etc.) -- see FIX 1's doc comment above.
     console.error(`${err.name || 'Error'} handling ${req.method} ${req.url}: ${err.message}`)
     const headers = { 'Content-Type': 'text/html; charset=utf-8' }
     if (err instanceof CircuitOpenError) {
       headers['Retry-After'] = String(Math.max(1, Math.ceil((err.circuitOpenUntil - Date.now()) / 1000)))
     }
     res.writeHead(code, headers)
-    res.end(errorPage(code, titleForStatus(code), err.message, config))
+    // Visitor-facing: fixed generic text per error class, NEVER err.message.
+    res.end(errorPage(code, titleForStatus(code), visitorMessageForError(err), config))
     return
   }
 
