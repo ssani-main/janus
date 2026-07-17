@@ -168,6 +168,7 @@ See [`DEPLOY.md`](./DEPLOY.md) for the full runbook. In short:
 │   ├── port-pool.js      local port allocator
 │   ├── rate-limit.js     per-IP request + new-tunnel limiter
 │   ├── tunnel-manager.js tunnel pool: LRU eviction, refcount, dedup
+│   ├── fonts.js          self-hosted OFL typefaces as base64 data URIs
 │   ├── pages.js          apex / Impressum / ToS / 429 / login / admin pages
 │   ├── admin.js          admin JSON API + HTML dashboard (aliases, passwords, blocks)
 │   └── server.js         HTTP + WebSocket entrypoint, alias + password gate

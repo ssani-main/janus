@@ -1,5 +1,7 @@
 'use strict'
 
+const { INSTRUMENT_SERIF_WOFF2, GEIST_MONO_WOFF2 } = require('./fonts')
+
 // Phase 3: legal pages (Impressum, ToS) + the apex landing page, all
 // sharing a small dark-theme style consistent with server.js's errorPage.
 // All dynamic values are escaped before being interpolated into HTML.
@@ -23,21 +25,77 @@ function configuredOrPlaceholder(value, fieldName) {
 }
 
 const STYLE = `
-  body { font-family: system-ui, sans-serif; background: #0b0d12; color: #e6e6e6; display: flex; min-height: 100vh; align-items: center; justify-content: center; margin: 0; padding: 2rem 1rem; box-sizing: border-box; }
-  .card { max-width: 40rem; padding: 2rem; border: 1px solid #2a2f3a; border-radius: 0.75rem; background: #12151c; }
-  h1 { font-size: 1.25rem; margin: 0 0 1rem; color: #7dd3fc; }
-  h2 { font-size: 1rem; margin: 1.5rem 0 0.5rem; color: #7dd3fc; }
-  p, li { margin: 0 0 0.75rem; color: #b8bec9; line-height: 1.5; }
+  @font-face {
+    font-family: 'Instrument Serif';
+    font-style: normal;
+    font-weight: 400;
+    font-display: swap;
+    src: url('${INSTRUMENT_SERIF_WOFF2}') format('woff2');
+  }
+  @font-face {
+    font-family: 'Geist Mono';
+    font-style: normal;
+    font-weight: 100 900;
+    font-display: swap;
+    src: url('${GEIST_MONO_WOFF2}') format('woff2');
+  }
+
+  :root {
+    color-scheme: light dark;
+    --bg: light-dark(#f6f1e7, #14120f);
+    --text: light-dark(#191612, #efe9dd);
+    --muted: light-dark(#6c6558, #8b8375);
+    --accent: light-dark(#8a3b1e, #e0885c);
+    --rule: light-dark(#e2dacb, #2b2722);
+    --surface: light-dark(#f1ebdf, #1c1915);
+    --warn: light-dark(#8a5a1e, #e0b070);
+    --font-display: 'Instrument Serif', ui-serif, Georgia, serif;
+    --font-mono: 'Geist Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+
+  @supports not (color: light-dark(#000, #fff)) {
+    :root {
+      --bg: #f6f1e7;
+      --text: #191612;
+      --muted: #6c6558;
+      --accent: #8a3b1e;
+      --rule: #e2dacb;
+      --surface: #f1ebdf;
+      --warn: #8a5a1e;
+    }
+    @media (prefers-color-scheme: dark) {
+      :root {
+        --bg: #14120f;
+        --text: #efe9dd;
+        --muted: #8b8375;
+        --accent: #e0885c;
+        --rule: #2b2722;
+        --surface: #1c1915;
+        --warn: #e0b070;
+      }
+    }
+  }
+
+  body { font-family: var(--font-mono); font-weight: 400; line-height: 1.6; background: var(--bg); color: var(--text); display: flex; min-height: 100vh; align-items: flex-start; justify-content: center; margin: 0; padding: 2rem 1rem; box-sizing: border-box; }
+  .card { max-width: min(680px, 100%); width: 100%; min-width: 0; margin: 0 auto; padding: 3rem 1.5rem; box-sizing: border-box; }
+  h1 { font-family: var(--font-display); font-weight: 400; font-size: 2.5rem; letter-spacing: -0.01em; margin: 0 0 1rem; color: var(--text); }
+  h2 { font-family: var(--font-display); font-weight: 400; font-size: 1.4rem; margin: 1.5rem 0 0.5rem; color: var(--text); }
+  p, li { font-family: var(--font-mono); font-weight: 400; line-height: 1.6; margin: 0 0 0.75rem; color: var(--muted); overflow-wrap: anywhere; }
   ul { padding-left: 1.25rem; }
-  code { color: #7dd3fc; }
-  a { color: #7dd3fc; }
-  form { display: flex; gap: 0.5rem; }
-  input { flex: 1; padding: 0.5rem 0.75rem; border-radius: 0.5rem; border: 1px solid #2a2f3a; background: #0b0d12; color: #e6e6e6; }
-  button { padding: 0.5rem 1rem; border-radius: 0.5rem; border: none; background: #7dd3fc; color: #0b0d12; font-weight: 600; cursor: pointer; }
-  .code { color: #64748b; font-size: 0.85rem; margin-top: 1rem; }
-  .warn { color: #fbbf24; }
-  footer { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid #2a2f3a; font-size: 0.85rem; color: #64748b; }
-  footer a { color: #64748b; text-decoration: underline; }
+  code { color: var(--accent); font-family: var(--font-mono); overflow-wrap: anywhere; }
+  a { color: var(--accent); text-decoration: underline; text-underline-offset: 0.2em; }
+  a:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  form { display: flex; gap: 0.5rem; flex-wrap: wrap; }
+  input, button { font-family: var(--font-mono); }
+  input { flex: 1 1 12rem; min-width: 0; padding: 0.5rem 0.75rem; border-radius: 4px; border: 1px solid var(--rule); background: var(--surface); color: var(--text); }
+  input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  button { padding: 0.5rem 1rem; border-radius: 4px; border: 1px solid var(--rule); background: var(--accent); color: var(--bg); font-weight: 500; cursor: pointer; }
+  button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  .code { color: var(--muted); font-size: 0.85rem; margin-top: 1rem; font-variant-numeric: tabular-nums; }
+  .warn { color: var(--warn); }
+  .tagline { font-family: var(--font-mono); color: var(--muted); font-size: 0.85rem; letter-spacing: 0.02em; margin-top: -0.5rem; margin-bottom: 2rem; }
+  footer { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--rule); font-size: 0.8rem; color: var(--muted); font-family: var(--font-mono); }
+  footer a { color: var(--muted); text-decoration: underline; text-underline-offset: 0.2em; }
 `
 
 function footer(config) {
@@ -63,13 +121,13 @@ function apexPage(config) {
 <body>
   <div class="card">
     <h1>Janus</h1>
+    <p class="tagline">a p2p key, made public</p>
     <p>Paste a Holesail public key below, or visit
       <code>https://0000&lt;your-key&gt;.${safeDomain}/</code> directly.</p>
     <form id="go">
       <input id="key" type="text" placeholder="hs://0000... or bare key" autofocus>
       <button type="submit">Go</button>
     </form>
-    <p class="code">Janus</p>
     ${footer(config)}
   </div>
   <script>
@@ -300,14 +358,14 @@ function adminDashboardPage({ rows, csrf, config, error }) {
 <meta charset="utf-8">
 <title>Admin - Janus</title>
 <style>${STYLE}
-  .wide { max-width: 60rem; width: 100%; }
-  table { width: 100%; border-collapse: collapse; margin-top: 0.5rem; }
-  th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid #2a2f3a; font-size: 0.9rem; }
-  th { color: #7dd3fc; font-weight: 600; }
+  .wide { max-width: 60rem; }
+  table { display: block; overflow-x: auto; max-width: 100%; width: 100%; border-collapse: collapse; margin-top: 0.5rem; font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 0.4rem 0.5rem; border-bottom: 1px solid var(--rule); font-size: 0.9rem; color: var(--text); }
+  th { color: var(--muted); font-weight: 500; background: var(--surface); }
   .toprow { display: flex; justify-content: space-between; align-items: center; }
   .forms-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; margin-top: 0.5rem; }
   .forms-grid form { flex-direction: column; align-items: stretch; }
-  .forms-grid input { width: 100%; box-sizing: border-box; margin-bottom: 0.5rem; }
+  .forms-grid input { flex: initial; width: 100%; box-sizing: border-box; margin-bottom: 0.5rem; }
 </style>
 </head>
 <body>
