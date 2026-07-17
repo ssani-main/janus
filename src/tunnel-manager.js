@@ -62,6 +62,148 @@ function _inMemoryStoreShim() {
   }
 }
 
+// Max number of distinct ports we'll try for a single ensureTunnel() cold
+// create before giving up and surfacing a ConnectError. Bounds the retry
+// loop below so a badly-fragmented pool can't turn one request into an
+// unbounded scan.
+const MAX_PORT_ATTEMPTS = 5
+
+/**
+ * Cheap pre-flight check: bind a throwaway net.Server on host:port and
+ * immediately close it. If something else already holds the port this
+ * rejects with the OS's EADDRINUSE (caught normally, since *we* attach the
+ * 'error' listener on our own server -- no crash risk here). This shrinks,
+ * but cannot eliminate, the TOCTOU window between "port looked free" and
+ * "holesail-client actually binds it" -- see connectWithPortGuard() below
+ * for how we cover the residual race.
+ */
+function probeFree(port, host) {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer()
+    srv.once('error', (err) => {
+      reject(err)
+    })
+    srv.listen(port, host, () => {
+      srv.close(() => resolve())
+    })
+  })
+}
+
+function isPortCollisionError(err) {
+  return !!err && err.code === 'EADDRINUSE'
+}
+
+/**
+ * Process-wide registry of in-flight connect attempts that are guarding
+ * against an EADDRINUSE crash, keyed by the port each attempt is trying to
+ * bind. There is exactly ONE 'uncaughtException' listener for the whole
+ * process (installed once, below), not one per attempt -- see the bug this
+ * replaced: `process.on('uncaughtException', ...)` fires *every* registered
+ * listener for *every* uncaught error, so N concurrent per-attempt listeners
+ * each saw every other attempt's error too. Attempt A (port 20000) would
+ * receive attempt B's EADDRINUSE(20001), fail the `err.port === port` check,
+ * remove itself, and re-throw -- permanently hanging A's promise (leaking
+ * its port) while still crashing the process once zero listeners remained.
+ *
+ * With a single shared registry, an EADDRINUSE for port X can only ever
+ * settle the one attempt that registered X, so an error on port Y can never
+ * affect an in-flight attempt on port X.
+ * @type {Map<number, (err: Error) => void>}
+ */
+const pendingPorts = new Map()
+
+/**
+ * The one and only 'uncaughtException' listener installed for the lifetime
+ * of this process (added once at module load, never removed while a real,
+ * unhandled bug is in flight -- see below). Installing it once here, rather
+ * than lazily on first pending port and removing it when the registry
+ * drains, avoids a re-entrant add/remove race with concurrent attempts and
+ * costs nothing when the registry is empty (the handler is a no-op fast
+ * path in that case, immediately re-throwing).
+ */
+function onUncaughtPortGuard(err) {
+  if (isPortCollisionError(err) && pendingPorts.has(err.port)) {
+    const reject = pendingPorts.get(err.port)
+    pendingPorts.delete(err.port)
+    reject(err)
+    return
+  }
+  // Not a failure mode any pending attempt is guarding against -- this is a
+  // real, unhandled bug. Remove ourselves first so the re-thrown error has
+  // zero listeners left and Node performs its normal fatal-crash behavior,
+  // exactly as if this guard didn't exist. Do NOT swallow it.
+  process.removeListener('uncaughtException', onUncaughtPortGuard)
+  queueMicrotask(() => {
+    throw err
+  })
+}
+process.on('uncaughtException', onUncaughtPortGuard)
+
+/**
+ * Wrap client.connect() so a port collision can never crash the process.
+ *
+ * Why this is needed (see node_modules/holesail-client/index.js:45-58 and
+ * node_modules/@holesail/hyper-cmd-lib-net/index.js:246-252): HolesailClient
+ * is a plain class, NOT an EventEmitter -- it never emits 'error' and never
+ * forwards errors from the internal net.Server it creates in handleTCP().
+ * That internal server is created via libNet.createTcpProxy(), which calls
+ * `net.createServer().listen(port, host, onListen)` with *no* 'error'
+ * listener attached anywhere in the chain. When listen() fails
+ * asynchronously (e.g. EADDRINUSE), Node emits 'error' on that server with
+ * zero listeners, which escalates straight to uncaughtException and kills
+ * the whole gateway process -- this is exactly the crash in the bug report.
+ *
+ * There is no public API on HolesailClient to observe or intercept that
+ * server's errors (no getter for the proxy is exposed before `connect()`'s
+ * callback/rejection path, and the internal server reference is only set
+ * *after* an internal DHT round-trip inside connect() -- by which point
+ * listen() has often already been called). So the only way to prevent the
+ * crash for this specific, well-understood failure mode is to register this
+ * attempt's port + reject function in the shared `pendingPorts` registry
+ * for the duration of the attempt; the single process-wide
+ * `onUncaughtPortGuard` listener (see above) routes an EADDRINUSE for that
+ * exact port to this attempt's rejection, and anything else is re-thrown
+ * asynchronously so it still crashes the process as before -- real bugs are
+ * not masked. The registry entry is always removed when this attempt
+ * settles (success, timeout, sync throw, or EADDRINUSE match), so no entry
+ * can leak and a port-X failure can never affect an in-flight attempt on
+ * port Y.
+ */
+function connectWithPortGuard(client, options, timeoutMs) {
+  const port = options.port
+  return new Promise((resolve, reject) => {
+    let settled = false
+
+    function cleanupAndSettle(fn, arg) {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      if (pendingPorts.get(port) === onPortError) {
+        pendingPorts.delete(port)
+      }
+      fn(arg)
+    }
+
+    function onPortError(err) {
+      cleanupAndSettle(reject, err)
+    }
+
+    const timer = setTimeout(() => {
+      cleanupAndSettle(reject, new Error(`connect timed out after ${timeoutMs}ms`))
+    }, timeoutMs)
+
+    pendingPorts.set(port, onPortError)
+
+    try {
+      client.connect(options, () => {
+        cleanupAndSettle(resolve, undefined)
+      })
+    } catch (err) {
+      cleanupAndSettle(reject, err)
+    }
+  })
+}
+
 /**
  * Quick liveness probe: open a TCP connection to 127.0.0.1:port and confirm
  * something is actually listening before we cache/use the tunnel. Prevents
@@ -98,7 +240,15 @@ function probePort(port, host, timeoutMs) {
  * many concurrent tenants) is a drop-in -- no reshaping needed here.
  */
 class TunnelManager {
-  constructor(config, store) {
+  /**
+   * @param {object} config
+   * @param {{ isBlocked(keyHash: string): boolean, setBlocked(keyHash: string, blocked: boolean): void }} [store]
+   * @param {(opts: { key: string, secure: boolean }) => any} [clientFactory] Constructs a
+   *   HolesailClient-compatible instance. Defaults to `new HolesailClient(opts)`. Overridable
+   *   purely so unit tests can exercise the port-collision retry logic without a real DHT
+   *   backend -- see test/unit/tunnel-manager-port-retry.test.js.
+   */
+  constructor(config, store, clientFactory) {
     this.config = config
     this.portPool = new PortPool(config.TUNNEL_PORT_MIN, config.TUNNEL_PORT_MAX)
     /** @type {Map<string, { client: any, port: number, keyHash: string, lastRequestAt: number, inFlight: number }>} */
@@ -111,6 +261,7 @@ class TunnelManager {
     // construct `new TunnelManager(config)` directly), fall back to an
     // in-memory-only shim with the same isBlocked/setBlocked surface.
     this.store = store || _inMemoryStoreShim()
+    this.clientFactory = clientFactory || ((opts) => new HolesailClient(opts))
   }
 
   /**
@@ -188,49 +339,70 @@ class TunnelManager {
       await this.destroyTunnel(victim.keyHash)
     }
 
-    const port = this.portPool.acquire()
-    let client
-    try {
-      client = new HolesailClient({ key: parsed.key, secure: false })
-
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-          reject(new Error(`connect timed out after ${this.config.CONNECT_TIMEOUT_MS}ms`))
-        }, this.config.CONNECT_TIMEOUT_MS)
-
-        try {
-          client.connect({ port, host: '127.0.0.1' }, () => {
-            clearTimeout(timer)
-            resolve()
-          })
-        } catch (err) {
-          clearTimeout(timer)
-          reject(err)
-        }
-      })
-
-      await probePort(port, '127.0.0.1', this.config.CONNECT_TIMEOUT_MS)
-    } catch (err) {
-      // Clean up whatever partially succeeded before surfacing the error.
+    // A port handed out by PortPool is only reserved *in this process* --
+    // see src/port-pool.js. It never checks whether the OS actually has the
+    // port free, so anything else already bound to it (another process,
+    // an old orphaned tunnel, etc.) makes the real listen() fail. That
+    // failure must never be allowed to escalate to uncaughtException and
+    // take down every other tenant's tunnel with it, so we retry onto the
+    // next pool port a bounded number of times instead of propagating a
+    // raw crash.
+    let lastErr
+    for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS; attempt++) {
+      let port
       try {
-        if (client) await client.destroy()
-      } catch {
-        // best-effort cleanup; ignore secondary errors
+        port = this.portPool.acquire()
+      } catch (err) {
+        // Pool exhausted -- no point retrying further.
+        throw new ConnectError(`failed to connect tunnel for key: ${err.message}`, err)
       }
-      this.portPool.release(port)
-      throw new ConnectError(`failed to connect tunnel for key: ${err.message}`, err)
+
+      let client
+      try {
+        // Shrinks (does not eliminate) the TOCTOU window before we ask
+        // holesail-client to bind this exact port itself.
+        await probeFree(port, '127.0.0.1')
+
+        client = this.clientFactory({ key: parsed.key, secure: false })
+        await connectWithPortGuard(client, { port, host: '127.0.0.1' }, this.config.CONNECT_TIMEOUT_MS)
+        await probePort(port, '127.0.0.1', this.config.CONNECT_TIMEOUT_MS)
+      } catch (err) {
+        // Clean up whatever partially succeeded before deciding whether to
+        // retry or surface the error.
+        try {
+          if (client) await client.destroy()
+        } catch {
+          // best-effort cleanup; ignore secondary errors
+        }
+        this.portPool.release(port)
+        lastErr = err
+
+        if (isPortCollisionError(err) && attempt < MAX_PORT_ATTEMPTS - 1) {
+          // Try the next port from the pool. Do NOT evict another tunnel to
+          // free one up -- that causes eviction thrash; just move on.
+          continue
+        }
+        throw new ConnectError(`failed to connect tunnel for key: ${err.message}`, err)
+      }
+
+      const record = {
+        client,
+        port,
+        keyHash: parsed.keyHash,
+        firstSeenAt: Date.now(),
+        lastRequestAt: Date.now(),
+        inFlight: 0,
+      }
+      this.tunnels.set(parsed.keyHash, record)
+      return record
     }
 
-    const record = {
-      client,
-      port,
-      keyHash: parsed.keyHash,
-      firstSeenAt: Date.now(),
-      lastRequestAt: Date.now(),
-      inFlight: 0,
-    }
-    this.tunnels.set(parsed.keyHash, record)
-    return record
+    // Unreachable in practice (the loop above always either returns or
+    // throws), but keeps the function's return type honest for tooling.
+    throw new ConnectError(
+      `failed to connect tunnel for key: exhausted ${MAX_PORT_ATTEMPTS} port attempts`,
+      lastErr
+    )
   }
 
   /**
