@@ -123,6 +123,423 @@ support lands.
 
 ---
 
+## Security backlog (audit 2026-07-17)
+
+These findings came from a multi-dimension audit of the code as of commit
+c503e04; **nothing here is fixed**, and all severities assume the Linux deploy
+target documented in [DEPLOY.md](./DEPLOY.md).
+
+### CRITICAL
+
+#### S1. Cross-tenant cookie injection (no `cookieDomainRewrite`)
+
+**Where:** `src/server.js` — the `proxy.web()` and `proxy.ws()` call sites;
+`httpProxy.createProxyServer` options.
+
+**Issue:** Tenant backends are UNTRUSTED (anyone can run one and share a key).
+http-proxy's `web-outgoing.js` copies every backend response header verbatim,
+including `Set-Cookie`, unless `cookieDomainRewrite` is set. It is not set on
+either call. A malicious tenant backend responds `Set-Cookie: pwned=1;
+Domain=<BASE_DOMAIN>; Path=/`. Per RFC 6265 that cookie is then valid for the
+apex AND every sibling tenant subdomain. **Cross-tenant session fixation:**
+attacker plants a chosen cookie value via their own tenant page; the victim
+later visits tenant B's app, which reads that cookie name as its own session.
+
+Sub-case: a backend can also emit `janus_admin`/`janus_auth` cookies scoped to
+the apex. It cannot forge a VALID signed value (the HMAC secret is unknown to
+backends), so that specific sub-case is nuisance-level — forces spurious
+re-auth — not an auth bypass. The general cross-tenant app-cookie leak is the
+real issue.
+
+**Reproduced:** a local http-proxy instance configured exactly as Janus
+configures it (`{xfwd: true, proxyTimeout: 30000}`) passed `Set-Cookie:
+pwned=1; Domain=gw.example.com; Path=/` through to the visitor unmodified.
+
+**Fix:** pass `cookieDomainRewrite: ''` on BOTH `proxy.web()` and `proxy.ws()`
+— http-proxy supports this natively and it strips `Domain=`, forcing
+host-only cookies. Consider `cookiePathRewrite` as defence-in-depth against
+`/_admin` path collisions.
+
+#### S2. Rate limiter buckets on an attacker-controlled value (X-Forwarded-For spoofing)
+
+**Where:** `src/server.js` `clientIp()` (~:142-150); `src/config.js`
+`TRUST_PROXY` (~:62, defaults **true**); `Caddyfile` (~:43-45).
+
+**Issue:** `clientIp()` returns `String(xff).split(',')[0].trim()` — the
+LEFTMOST XFF entry — whenever TRUST_PROXY is true. Caddy's `reverse_proxy`
+APPENDS to an existing X-Forwarded-For rather than replacing it, and the
+shipped Caddyfile sets no `trusted_proxies` and no `header_up
+X-Forwarded-For` override. So a client-supplied XFF stays leftmost all the way
+to Node.
+
+**Reproduced against the real server:** sent `X-Forwarded-For: 6.6.6.6` from
+127.0.0.1; the gateway's own JSON request log recorded `"ip":"6.6.6.6"` and
+bucketed the request under it. Every per-IP limit (`RATE_MAX_REQUESTS`,
+`RATE_MAX_NEW_TUNNELS`) is bypassable by rotating a fake header per request.
+
+The code comment at config.js:55 states the safety assumption — "a proxy we
+control ... that overwrites/sets X-Forwarded-For itself" — which the shipped
+Caddyfile does not implement.
+
+**This is a force multiplier: it is what escalates S4 from IMPORTANT to
+CRITICAL.** Fix this one first.
+
+**Fix:** either set `header_up X-Forwarded-For {remote_host}` in the Caddyfile
+so Caddy overwrites rather than appends, or configure `trusted_proxies`, or
+change `clientIp()` to index from the RIGHT by a configured trusted-hop count.
+The Caddyfile fix is smallest; the `clientIp()` fix is the one that's robust
+to a misconfigured deployment.
+
+#### S3. Websockets pin tunnels permanently — gateway-wide DoS
+
+**Where:** `src/tunnel-manager.js` — `inFlight` increments at ~:435 (cached
+reuse), ~:465 (pending reuse), ~:487 (cold-create); `manager.release()`
+~:764-769; `_pickEvictable` ~:750; sweeper ~:906-922. `src/server.js` — ws
+upgrade handler ~:626, release wiring ~:638-645.
+
+**Issue:** `inFlight` is decremented ONLY by `socket.on('close')`. For a
+websocket the attacker holds open, that never fires — there is no timer, no
+periodic re-check, no idle kill. `PROXY_TIMEOUT_MS` deliberately does not apply
+to ws (http-proxy's ws pass never reads `proxyTimeout`; this was intentional,
+so long-lived connections survive), and there is no `socket.setTimeout()` on
+the upgrade path.
+
+`inFlight > 0` blocks BOTH reclamation paths: `_pickEvictable` skips it under
+capacity pressure, and the idle sweeper requires `inFlight === 0`. Nothing in
+the codebase reclaims a tunnel with `inFlight > 0` except the operator's
+`/_admin/kill`.
+
+Attacker cost, precisely: `MAX_TUNNELS` default 50. Each ws occupies one tunnel
+record, keyed by keyHash, so 50 slots needs 50 DISTINCT keys that each
+genuinely cold-create — i.e. 50 real, self-run holesail-client backends
+(trivially scriptable, no victim infrastructure, but real). Fake keys do NOT
+work here (they fail the cold create and never produce a record).
+`RATE_MAX_NEW_TUNNELS` (10/60s/IP) gates the RATE but not the outcome: a single
+un-spoofed IP fills all 50 slots in ~5 minutes. With S2, instantly.
+
+**Decided fix (both, per operator decision):** (a) cap the tunnel slots
+websockets may occupy, per key and/or per IP, so ws can never starve HTTP
+traffic; AND (b) add an idle timeout driven by ws frame activity, closing
+genuinely-idle connections. The cap bounds blast radius without touching
+existing connection lifetimes; the idle timeout actually reclaims a pinned
+tunnel. The idle window must be generous or heartbeat-aware — a legitimate
+notifications socket can be silent for hours, and severing it would be a real
+regression.
+
+#### S4. Port-pool exhaustion via fake-key cold-creates — severity derived from S2
+
+**Where:** `src/tunnel-manager.js` `_createTunnel` ~:507-574,
+`_attemptPortConnect` ~:595-685 (`portPool.acquire()` ~:612, `release()` ~:642);
+`src/key.js` `parseKey` ~:27-68.
+
+**Issue:** `parseKey` validates only length (52) and z-base-32 alphabet —
+never the DHT. So a random 52-char subdomain "parses", yields a fresh
+never-seen keyHash, and drives a full cold create. `portPool.acquire()`
+reserves a real port BEFORE any network I/O.
+
+Precise mechanics: one port is held per attempt for up to `CONNECT_TIMEOUT_MS`
+(8s default), then released; the port-collision retry loop does NOT engage
+(the failure isn't EADDRINUSE), so never multiple ports at once per request. Up
+to 4 attempts with backoff gaps where no port is held. `ENSURE_TUNNEL_TIMEOUT_MS`
+(45s) bounds total request duration — NOT continuous port occupancy.
+
+Pool = `TUNNEL_PORT_MIN` 20000..`TUNNEL_PORT_MAX` 20999 = 1000 ports.
+Exhaustion therefore needs ~1000 CONCURRENT in-flight attempts each inside its
+~8s window — not 1000 total over time.
+
+`pending` dedupe gives zero mitigation (it's per-keyHash; the attack uses a
+distinct key per request). The circuit breaker gives zero mitigation: one
+`ensureTunnel` calls `recordFailure` at most 4 times (attempts 0..3) but
+`CIRCUIT_FAILURE_THRESHOLD` is 5 — **4 < 5, so a single-use fake key's circuit
+never opens**, and its stale entry is swept after the cooldown.
+
+Victim experience: a legitimate tenant's cold create hits
+`portPool.acquire()` throwing "port pool exhausted", wrapped into
+`ConnectError` → HTTP 502 with the generic message — indistinguishable from a
+genuinely dead backend.
+
+**Severity is contingent, state this plainly:** with an honest per-IP limiter
+this needs ~100 real source IPs (IMPORTANT). **With S2 present — the
+codebase's current actual state — it collapses to a single-source attack
+(CRITICAL).** Fixing S2 demotes this to IMPORTANT without touching
+tunnel-manager.js or port-pool.js at all.
+
+**Fix directions:** cap concurrent in-flight cold-creates globally (not just
+per-IP), and/or require some proof-of-liveness before reserving a pool port.
+
+### HIGH
+
+#### S5. Store file is world-readable and holds plaintext raw keys
+
+**Where:** `src/store.js` `_persist` (~:94-108, `fs.writeFileSync(tmpPath,
+json, 'utf8')` ~:98 — no `mode`); [DEPLOY.md](./DEPLOY.md) (~:8-34).
+
+**Issue:** Node's `'w'` opens O_CREAT at 0o666 & ~umask; the systemd unit sets
+no `UMask=`, so systemd's default 0022 applies → **0644, world-readable**.
+`renameSync` preserves the inode's mode, so the final file is 0644 too.
+DEPLOY.md says `chmod 600 .env` and says nothing about `janus-data.json` —
+which holds strictly more dangerous material.
+
+Contents: `record.rawKey`, the plaintext public-mode Holesail key, plus scrypt
+password hash+salt. Any local unprivileged user, sidecar, backup agent, or
+container sharing the volume reads it and reaches every aliased tenant's
+backend DIRECTLY via `holesail --connect <key>` — bypassing the blocklist, the
+password gate, rate limiting, logging, and the admin kill switch (all of which
+are gateway-side; the DHT knows nothing about them). The password-hash exposure
+is dominated by this — no point cracking scrypt when the key beside it grants
+direct access.
+
+Storing rawKey IS required (`getByAlias` must return a dialable key; a hash
+can't be reversed). Encrypting at rest just moves the secret and is defeated by
+the same local reader. **File permissions are the correct and sufficient
+control — this is a fix, not a mitigation.**
+
+Two subtleties that MUST survive into the writeup:
+
+1. **`chmod`-after-write does not close the window.** Unix checks permissions at
+   `open(2)`, not per `read(2)`. An attacker who wins the race by a microsecond
+   holds a valid fd on that inode forever and re-reads at leisure, after your
+   chmod and after the rename. The race is "once won, permanently won", not
+   "narrow".
+
+2. **A random tmp suffix is mandatory, not cosmetic.** Node applies `mode` only
+   when O_CREAT actually creates the file. A leftover `.tmp.<pid>` from a crash
+   — routine under `Restart=always`, and pids get reused — means `writeFileSync`
+   truncates and writes but silently keeps the old 0644. A fixed `.tmp.<pid>`
+   name PLUS a `mode:` argument therefore still ships a world-readable store,
+   intermittently, which is the worst possible failure mode for a permissions
+   bug.
+
+**Fix:** create the tmp file with `mode: 0o600` AND a random suffix
+(`.tmp.<pid>.<random>`); add `UMask=0077` to the systemd unit as
+defence-in-depth; add a `chmod 600 janus-data.json` line to DEPLOY.md for
+already-deployed boxes (the code fix only governs newly created files).
+
+#### S6. Orphaned tmp files survive crashes with full plaintext
+
+**Where:** `src/store.js` ~:94-108; the `unlinkSync` cleanup at ~:102 runs
+ONLY in the catch — i.e. only if the write throws and the process survives.
+
+**Issue:** SIGKILL/OOM/power-loss between `writeFileSync` and `renameSync`
+leaves `janus-data.json.tmp.<pid>` at 0644 with a complete copy of every
+rawKey. Nothing ever removes it: no startup sweep in `Store.load`, no reaper.
+`Restart=always` makes crash cycles routine.
+
+Amplifies S5 past operator remediation: an operator who runs `chmod 600
+janus-data.json` believes they're fixed; the orphan beside it is still 0644 and
+still holds every key. `.gitignore` does carry `*.json.tmp.*`, so these don't
+reach the repo — the repo lifetime was considered; the on-disk lifetime wasn't.
+
+**Fix:** S5's `mode: 0o600` makes orphans inert at creation. Add a
+best-effort sweep in `Store.load` for `<basename>.tmp.`-prefixed siblings —
+with random tmp names a sweep becomes the only way orphans are ever reclaimed.
+
+#### S7. `clearAlias` never clears `rawKey` — the plaintext secret cannot be deleted through any interface
+
+**Where:** `src/store.js` `clearAlias` ~:203-214. Sets `record.alias = null`
+but leaves `record.rawKey` untouched. `rawKey` is set at ~:192-193 (`setAlias`)
+and ~:224 (`setPassword`) and **nothing in the codebase ever sets it back to
+null. There is no `deleteKey`/`removeRecord` method at all** — records are
+append-only for life.
+
+**Issue:** Clearing alias/blocked/password but not rawKey looks deliberate
+(keep record identity), but rawKey is the one field that is a LIVE CREDENTIAL
+and it gets the same treatment as inert metadata.
+
+Scenario: tenant offboards, operator clicks "Clear alias", reasonably reports
+the data is gone. It isn't — rawKey remains verbatim, forever, at 0644 (S5). A
+local attacker harvests keys for tenants who left months ago, whose backends
+are still reachable (a Holesail public key stays valid until rotated, and an
+offboarded tenant has no reason to rotate). No operator action short of
+hand-editing the JSON removes it. Also a data-retention/GDPR problem for an
+operator running an Impressum page.
+
+**Fix:** in `clearAlias`, when the record retains no other reason to hold the
+key, drop it — `if (!record.password) record.rawKey = null`. The
+`!record.password` guard is REQUIRED: `setPassword` legitimately stores rawKey
+independently of aliasing, so an unconditional null-out breaks a passworded
+non-aliased key. Fuller fix: add `deleteKey(keyHash)` dropping the record and
+its alias entry, exposed as a dashboard button — also the only real bound on
+record growth.
+
+### IMPORTANT
+
+#### S8. No login rate limiting; failed login returns 200; no ADMIN_TOKEN entropy check
+
+**Where:** `src/admin.js` ~:179-194.
+
+**Issue:** `/_admin/login` shares the generic per-IP budget (120/min) with
+every route — no per-endpoint lockout, no backoff, no failed-attempt logging
+anywhere in `handleAdmin`. Failure returns `sendHtml(res, 200, ...)`, not 401,
+so log-based brute-force detection can't distinguish a failed login from a page
+render. No minimum-length/entropy check on ADMIN_TOKEN in config.js. With S2,
+the per-IP budget isn't even a real bound.
+
+**Fix:** dedicated failed-login counter with exponential lockout, log failures
+(IP + timestamp, never the token), return 401, and fail-fast in config.js if
+ADMIN_TOKEN is short.
+
+#### S9. CSRF token is static per ADMIN_TOKEN, not per session
+
+**Where:** `src/auth.js` `csrfToken` ~:133-135; call sites `src/admin.js`
+~:213, ~:288, ~:326, ~:346 all pass `tokenHash` (sha256 of ADMIN_TOKEN) —
+never a per-login nonce or timestamp. Every operator session, past and
+present, gets the identical CSRF value until ADMIN_TOKEN is rotated. A single
+leak (referrer, browser history sync, a screenshot, log scraping) is valid
+forever, and it can't be invalidated without rotating the admin token itself.
+
+**Not exploitable today without a leak vector** — SameSite=Strict is doing
+the real work — but it's a static shared secret shaped like a nonce.
+
+**Fix:** bind to `iat` plus a random per-login value stored in the session
+payload, generated fresh at login.
+
+#### S10. No fsync — an acknowledged admin action can silently vanish, failing OPEN
+
+**Where:** `src/store.js` ~:98-99.
+
+**Issue:** `writeFileSync` returns at the page cache; no fsync on the fd, none
+on the parent dir. `renameSync` is atomic w.r.t. concurrent readers but is not
+durable. The module comment at ~:3-7 claims a crash mid-write "never corrupts
+the store" — true for CORRUPTION, false for DURABILITY, and the gap isn't
+acknowledged.
+
+Scenario: operator blocks an abusive tenant, gets a 302 back (a UI
+acknowledgement), box loses power seconds later, store reverts, tunnel is
+serving again unblocked, silently. Same for `clearPassword` — a revocation
+that silently un-revokes. Fails open, with no signal.
+
+**Fix:** `openSync` with mode (folds in S5), `fsyncSync` the fd, then rename,
+then fsync the parent dir — guard the dir fsync for Windows dev. Admin
+actions are rare; the cost is nil.
+
+#### S11. `listMetadata()` returns rawKey and password material
+
+**Where:** `src/store.js` ~:262-267 spreads the whole record — `rawKey`,
+`password.hash`, `password.salt`.
+
+**No leak today**, and say so explicitly: the only consumer, `buildRows`
+(`src/admin.js` ~:126-151), projects onto a strict allowlist and passes
+`hasPassword` as a boolean. The finding is that the boundary is one careless
+line from collapsing and the method name gives no warning — `sendJson(res, 200,
+store.listMetadata())` is the most natural thing a future contributor writes
+when asked for a JSON dashboard, and it would dump every tenant's raw key over
+the network.
+
+**Fix:** project inside `listMetadata` so the allowlist is enforced by the API
+rather than by convention at one call site (note `admin.js:140` needs
+`hasPassword` passed through explicitly, since `!!undefined` would silently
+become false).
+
+#### S12. No `Cache-Control: no-store` on admin responses
+
+**Where:** `src/admin.js` — every `sendHtml`/`sendJson` omits it (the only
+`no-store` in the tree is `/metrics` in server.js). The dashboard renders
+keyHashes, aliases, ports, and the live CSRF token. Back/forward cache on a
+shared machine, or a misconfigured intermediate cache, exposes it.
+
+**Fix:** add to `sendHtml`/`sendJson`.
+
+#### S13. `/_admin/logout` does not verify CSRF
+
+**Where:** `src/admin.js` ~:196-203, though the form in pages.js does send one.
+
+**Issue:** Inert today (SameSite=Strict blocks the cross-site POST), but the
+header comment at `admin.js` ~:11-16 claims all cookie-reachable endpoints are
+CSRF-protected, which is false for this one.
+
+**Fix:** add the same `verifyCsrf` gate the other form endpoints use.
+
+### Cleared by the audit — do NOT re-litigate
+
+The following were traced and found SOUND. This records what stopped the next
+reader wasting effort or breaking something:
+
+- **Client aborts cannot open a circuit against a healthy backend.** Verified
+  with real loopback repro scripts across four scenarios (abort pre-response,
+  abort mid-stream, abort mid-chunked-upload, malformed chunked body).
+  http-proxy's own guard in `web-incoming.js` (`if (req.socket.destroyed &&
+  err.code === 'ECONNRESET') return`) absorbs them, so `proxy.on('error')`
+  → `recordFailure` is never reached. This was the top design concern for
+  Milestone 2's breaker; it's a real mitigation, not luck.
+
+- **Session forgery:** `verifySession` recomputes the HMAC over the literal
+  received string before touching JSON, length-guards before `timingSafeEqual`,
+  try/catches decode/parse, and requires a finite `iat`. No crash path, no
+  bypass.
+
+- **Token binding:** rotating ADMIN_TOKEN changes `tokenHash` and invalidates
+  every outstanding session. `session.th` uses plain string equality, but `th`
+  is a public hash — no usable timing channel.
+
+- **`pwdVersion` monotonicity is airtight:** the counter lives on the record
+  and is bumped BEFORE `password` is nulled, so it outlives the object it
+  describes; set→1, clear→2, set→3. A cookie at pv=1 can never revalidate.
+  Residual (LOW): pwdVersion lives only in the store while SESSION_SECRET is
+  stable across restarts, so restoring a store from backup within the 7-day
+  SESSION_TTL_MS resurrects revoked sessions — worth a DEPLOY.md line saying
+  rotate SESSION_SECRET after a store restore.
+
+- **Websockets cannot bypass a per-key password gate** — the ws path
+  independently verifies the session before `ensureTunnel`; no divergence from
+  HTTP.
+
+- **Cookie scoping:** `janus_admin` has no `Domain` attribute, so it's
+  host-only to the apex; a tenant subdomain cannot read or set it. (Note this
+  is exactly what S1 threatens from the other direction.)
+
+- **Concurrent admin writes have no lost-update race** — every store mutator
+  is fully synchronous with no `await` inside, so Node's event loop can't
+  interleave two. **This is a correctness property, not a perf shortcut: do not
+  "optimize" `_persist` into `fs.promises`** — that would introduce the race
+  that doesn't exist today.
+
+- **Load fail-fast is correct** and temp+rename genuinely prevents torn reads:
+  `this.path` is only mutated by `renameSync`, so a reader sees the complete
+  old inode or the complete new one.
+
+- **Prototype pollution is not exploitable — but not for the reason the
+  comments claim, and this is a live refactor hazard.** `ALIAS_RE =
+  /^[a-z0-9-]{1,63}$/` **accepts `constructor`**, `prototype`, `toString`,
+  `valueOf`. It rejects `__proto__` only incidentally (`_` isn't in the
+  character class). The regex is NOT what stops this — `Object.create(null)`
+  on `data.keys`/`data.aliases` (`store.js` ~:22, re-normalized on load
+  ~:82-83) is the SOLE defence. The comment at `src/admin.js` ~:41-45 claims
+  keyHash validation guards the alias path; it does not — `admin.js` ~:279
+  passes `form.get('alias')` to `setAlias` with no KEYHASH_RE check, correctly,
+  since an alias isn't a hash. **Anyone who reads that comment and concludes
+  the null-prototype maps are redundant would reintroduce the vulnerability
+  instantly. Correcting that comment is the actual action item here.**
+
+- **Alias shadowing of infrastructure hostnames** is not reachable: aliases
+  need an authenticated admin (no squatting attacker); explicit DNS records beat
+  the wildcard, so a `mail` alias never sees that traffic; `_`-prefixed names
+  (`_acme-challenge`, `_dmarc`) are rejected by ALIAS_RE, which incidentally
+  protects Caddy's DNS-01 challenge; `www` is reserved for reachability, not
+  security; the 63-char cap matches the DNS label limit.
+
+- **Store growth is not attacker-reachable:** every growth path
+  (`setBlocked`/`setAlias`/`setPassword`) is admin-authenticated; the visitor
+  path is read-only. No unauthenticated DoS ceiling exists.
+
+### Recommended fix order
+
+1. **S2 (XFF)** — smallest fix, and it demotes S4 from CRITICAL to IMPORTANT
+   for free.
+2. **S1 (cookieDomainRewrite)** — one option on two call sites, closes a
+   confirmed cross-tenant compromise.
+3. **S5 + S6** — `mode: 0o600` + random tmp suffix. One-line-ish change
+   closing a full tenant-compromise primitive.
+4. **S7** — null rawKey in clearAlias. Highest value per line after the above.
+5. **S3** — websockets: cap slots AND idle-timeout (decided).
+6. **S10, S11, S8, S9, S12, S13** — the rest.
+7. **Comment corrections** (`admin.js` ~:41-45 prototype-pollution overclaim;
+   `store.js` ~:3-7 atomicity-vs-durability; `store.js` ~:5
+   sync-writes-are-correctness). No behaviour change, but these are what stop
+   S1–S7 being reintroduced by a well-meaning refactor.
+
+---
+
 ## Milestone 3 — NOT STARTED (reach & scale)
 
 ### 3a. Secure-mode (`s000…`) key support
