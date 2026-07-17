@@ -141,6 +141,9 @@ function buildRows(manager, store) {
       port: t ? t.port : null,
       inFlight: t ? t.inFlight : null,
       lastRequestAt: t ? t.lastRequestAt : null,
+      // Milestone 2d: surfaces manager.list()'s new health-probe fields.
+      healthy: t ? t.healthy : null,
+      lastProbeAt: t ? t.lastProbeAt : null,
     })
   }
   rows.sort((a, b) => a.keyHash.localeCompare(b.keyHash))

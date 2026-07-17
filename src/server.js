@@ -7,9 +7,9 @@ const config = require('./config')
 const { hostToKey } = require('./routing')
 const { parseKey } = require('./key')
 const { load: loadStore } = require('./store')
-const { TunnelManager, CapacityError, ConnectError, KeyError, BlockedError } = require('./tunnel-manager')
+const { TunnelManager, CapacityError, ConnectError, KeyError, BlockedError, CircuitOpenError } = require('./tunnel-manager')
 const { RateLimiter } = require('./rate-limit')
-const { escapeHtml, apexPage, impressumPage, termsPage, rateLimitPage, loginPage } = require('./pages')
+const { apexPage, impressumPage, termsPage, errorPage, offlinePage, rateLimitPage, loginPage } = require('./pages')
 const { handleAdmin } = require('./admin')
 const { hashPassword, verifyPassword, signSession, verifySession, parseCookies, timingSafeEqualStr } = require('./auth')
 const { renderMetrics } = require('./metrics')
@@ -45,6 +45,7 @@ const LOGIN_BODY_MAX_BYTES = 4096
 
 const manager = new TunnelManager(config, store)
 manager.startSweeper()
+manager.startHealthProbing()
 
 const limiter = new RateLimiter({
   windowMs: config.RATE_WINDOW_MS,
@@ -56,52 +57,83 @@ limiter.start()
 // xfwd: true adds X-Forwarded-For / X-Forwarded-Port / X-Forwarded-Proto.
 // changeOrigin defaults to false, which is what we want: the backend must
 // see the public Host, not 127.0.0.1:<port>.
-const proxy = httpProxy.createProxyServer({ xfwd: true })
+//
+// Bug fix (review of Milestone 2c/2d): proxyTimeout is the load-bearing
+// piece that makes a hung backend (accepts the connection, then never
+// responds -- deadlock, infinite loop, black-holed socket) fail LOUDLY
+// instead of pinning a tunnel forever. Without it, http-proxy never emits
+// 'error' for a hang, so proxy.on('error') below (which already calls
+// recordFailure + serves offlinePage) never fires, `release()` never runs
+// (res never gets 'close'/'finish'), `inFlight` never drains, and the
+// health probe's `inFlight > 0` skip (tunnel-manager.js's _probeOne) never
+// lets a probe run -- see that function's doc comment for why the probe
+// can't see this failure mode on its own even if it did run (it's a
+// transport-level loopback check, blind to an application-level hang).
+// http-proxy's ws pass (passes/ws-incoming.js) never reads
+// options.proxyTimeout, so setting it here -- once, on the shared proxy
+// options both .web() and .ws() close over -- cannot affect or kill a
+// long-lived websocket upgrade; it only ever applies to proxy.web().
+const proxy = httpProxy.createProxyServer({ xfwd: true, proxyTimeout: config.PROXY_TIMEOUT_MS })
 
 // Strip the key out of anything that might reach an app the visitor didn't
 // share the key with themselves.
-proxy.on('proxyRes', (proxyRes) => {
+//
+// Milestone 2c: also the "successful proxied response" half of the circuit
+// breaker's success signal (the other half is a successful cold create, in
+// tunnel-manager.js's _createTunnel). `req._janusTunnel` is stashed at the
+// ensureTunnel call site below purely so this handler -- which http-proxy
+// only ever calls with (proxyRes, req, res), no tunnel record -- can reach
+// the record's keyHash.
+proxy.on('proxyRes', (proxyRes, req) => {
   proxyRes.headers['referrer-policy'] = 'no-referrer'
+  if (req && req._janusTunnel) {
+    manager.recordSuccess(req._janusTunnel.keyHash)
+  }
 })
 
 // A backend hiccup (tunnel died mid-request, ECONNRESET, etc.) must not
 // crash the gateway process.
+//
+// Milestone 2c: this is the REACTIVE circuit-breaker trigger -- see the
+// module-level doc comment on connectWithPortGuard in tunnel-manager.js for
+// why there is no way to hook a holesail-client's death/drop directly (it
+// is not an EventEmitter and forwards no events). `req._janusTunnel` is
+// stashed at the ensureTunnel call site below for the same reason as
+// 'proxyRes' above -- this handler has no other way to reach the tunnel's
+// keyHash.
 proxy.on('error', (err, req, res) => {
   console.error('proxy error:', err.message)
+  if (req && req._janusTunnel) {
+    manager.recordFailure(req._janusTunnel.keyHash)
+  }
   if (res && !res.headersSent && typeof res.writeHead === 'function') {
+    // Milestone 2d (revised): a proxy error against a known tenant tunnel
+    // IS the backend being unreachable -- exactly what offlinePage exists
+    // to say, so serve it for ANY such error, not just once the periodic
+    // health probe had separately confirmed unhealthiness via
+    // `tunnel.healthy === false`. That gate is gone: a probe-failure streak
+    // now destroys the tunnel outright (see tunnel-manager.js's
+    // _probeOne/destroyTunnel), so `healthy` would almost never still be
+    // false by the time a request reaches this handler -- gating on it here
+    // would have made offlinePage dead code. The generic errorPage remains
+    // the fallback for a proxy error with no tunnel context at all (should
+    // not normally happen, but keeps that branch honest).
+    if (req && req._janusTunnel) {
+      const retryAfterSec = Math.ceil(config.HEALTH_PROBE_INTERVAL_MS / 1000)
+      res.writeHead(502, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Retry-After': String(retryAfterSec),
+      })
+      res.end(offlinePage({ config, retryAfterSec }))
+      return
+    }
     res.writeHead(502, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(errorPage(502, 'Bad Gateway', 'The backend tunnel closed unexpectedly.'))
+    res.end(errorPage(502, 'Bad Gateway', 'The backend tunnel closed unexpectedly.', config))
   } else if (res && typeof res.destroy === 'function') {
     // res is actually a raw socket (websocket upgrade path)
     res.destroy()
   }
 })
-
-function errorPage(code, title, msg) {
-  const safeTitle = escapeHtml(title)
-  const safeMsg = escapeHtml(msg)
-  return `<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>${code} ${safeTitle} - Janus</title>
-<style>
-  body { font-family: system-ui, sans-serif; background: #0b0d12; color: #e6e6e6; display: flex; min-height: 100vh; align-items: center; justify-content: center; margin: 0; }
-  .card { max-width: 32rem; padding: 2rem; border: 1px solid #2a2f3a; border-radius: 0.75rem; background: #12151c; }
-  h1 { font-size: 1.25rem; margin: 0 0 0.5rem; color: #7dd3fc; }
-  p { margin: 0; color: #b8bec9; line-height: 1.5; }
-  .code { color: #64748b; font-size: 0.85rem; margin-top: 1rem; }
-</style>
-</head>
-<body>
-  <div class="card">
-    <h1>${safeTitle}</h1>
-    <p>${safeMsg}</p>
-    <p class="code">Janus &middot; HTTP ${code}</p>
-  </div>
-</body>
-</html>`
-}
 
 // Phase 3: per-IP rate limiting needs a client IP. TRUST_PROXY should only
 // be true when the gateway sits behind a proxy we control (Caddy) that
@@ -164,6 +196,12 @@ function instrumentResponseBytes(res) {
 
 function statusForError(err) {
   if (err instanceof CapacityError) return 503
+  // Milestone 2c: a CircuitOpenError is deliberately 503, not 502 -- the
+  // backend isn't the one erroring right now, WE are refusing to even try
+  // it because we already know (from recent failures) that it's down. 503
+  // + Retry-After is the honest code for "we're choosing not to attempt
+  // this", as opposed to 502's "we tried and the backend failed".
+  if (err instanceof CircuitOpenError) return 503
   if (err instanceof ConnectError) return 502
   if (err instanceof KeyError) return 400
   if (err instanceof BlockedError) return 403
@@ -443,7 +481,7 @@ const server = http.createServer(async (req, res) => {
   }
   if (route.invalid) {
     res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(errorPage(404, 'Not Found', 'Unknown host.'))
+    res.end(errorPage(404, 'Not Found', 'Unknown host.', config))
     return
   }
   const rawKey = route.rawKey
@@ -482,10 +520,21 @@ const server = http.createServer(async (req, res) => {
   } catch (err) {
     const code = statusForError(err)
     console.error(`${err.name || 'Error'} handling ${req.method} ${req.url}: ${err.message}`)
-    res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8' })
-    res.end(errorPage(code, titleForStatus(code), err.message))
+    const headers = { 'Content-Type': 'text/html; charset=utf-8' }
+    if (err instanceof CircuitOpenError) {
+      headers['Retry-After'] = String(Math.max(1, Math.ceil((err.circuitOpenUntil - Date.now()) / 1000)))
+    }
+    res.writeHead(code, headers)
+    res.end(errorPage(code, titleForStatus(code), err.message, config))
     return
   }
+
+  // Milestone 2c: stash the tunnel record on the request so proxy.on(
+  // 'error'/'proxyRes') -- which http-proxy only invokes with (err, req,
+  // res) / (proxyRes, req, res), never the tunnel record -- can still reach
+  // its keyHash to feed the circuit breaker. Named with the `_janus` prefix
+  // and not otherwise touched/serialized anywhere, so it can't leak.
+  req._janusTunnel = tunnel
 
   let released = false
   const release = () => {
@@ -553,6 +602,11 @@ server.on('upgrade', async (req, socket, head) => {
     socket.destroy()
     return
   }
+
+  // Milestone 2c: same rationale as the HTTP path above -- lets the shared
+  // proxy.on('error') handler feed the circuit breaker for a websocket
+  // tunnel too (there is no 'proxyRes' equivalent on the ws path).
+  req._janusTunnel = tunnel
 
   let released = false
   const release = () => {

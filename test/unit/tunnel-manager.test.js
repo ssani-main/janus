@@ -153,3 +153,28 @@ test('list(): returns sanitized snapshots without client or raw key', () => {
   assert.ok(!('client' in entry))
   assert.ok(!('key' in entry))
 })
+
+test('list(): keeps every existing field and additionally carries healthy/lastProbeAt (Milestone 2d)', () => {
+  const manager = makeManager()
+  const record = fakeRecord({
+    keyHash: 'anotherhash',
+    port: 20006,
+    inFlight: 0,
+    firstSeenAt: 333,
+    lastRequestAt: 444,
+    healthy: false,
+    lastProbeAt: 555,
+  })
+  manager.tunnels.set('anotherhash', record)
+
+  const [entry] = manager.list()
+  // Pre-existing shape, untouched.
+  assert.equal(entry.keyHash, 'anotherhash')
+  assert.equal(entry.port, 20006)
+  assert.equal(entry.inFlight, 0)
+  assert.equal(entry.firstSeenAt, 333)
+  assert.equal(entry.lastRequestAt, 444)
+  // New health fields.
+  assert.equal(entry.healthy, false)
+  assert.equal(entry.lastProbeAt, 555)
+})

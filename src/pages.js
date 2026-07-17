@@ -241,6 +241,68 @@ function loginPage({ error, next, config }) {
 </html>`
 }
 
+// Generic error page (400/403/404/500/502/503, etc.), used by server.js for
+// every non-proxied failure branch. Moved here from server.js (which had a
+// local, hardcoded-dark-theme copy that never picked up the shared STYLE /
+// light+dark themes / self-hosted fonts) so it can share STYLE + footer()
+// like every other page instead of drifting from them.
+function errorPage(code, title, msg, config) {
+  const safeTitle = escapeHtml(title)
+  const safeMsg = escapeHtml(msg)
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>${code} ${safeTitle} - Janus</title>
+<style>${STYLE}</style>
+</head>
+<body>
+  <div class="card">
+    <h1>${safeTitle}</h1>
+    <p>${safeMsg}</p>
+    <p class="code">Janus &middot; HTTP ${code}</p>
+    ${footer(config)}
+  </div>
+</body>
+</html>`
+}
+
+// Milestone 2d: served in place of the generic errorPage(502, ...) when the
+// proxy errors out AND the periodic health probe has already confirmed
+// (via `req._janusTunnel.healthy === false`) that this isn't just a one-off
+// blip -- see server.js's proxy.on('error', ...) handler. Friendly and
+// honest: the backend is offline/unreachable, this is not the visitor's
+// fault, and there is nothing for them to log into or retry differently.
+// Deliberately leaks NOTHING operational -- no keyHash, port, or failure
+// counts -- a visitor hitting this page is not an operator and has no use
+// for (and no right to) that information.
+function offlinePage({ config, retryAfterSec }) {
+  const hasRetry = Number.isFinite(retryAfterSec) && retryAfterSec > 0
+  const safeRetry = hasRetry ? escapeHtml(String(Math.ceil(retryAfterSec))) : null
+  const retryHtml = hasRetry
+    ? `<p>Please try again in about ${safeRetry} second${safeRetry === '1' ? '' : 's'}.</p>`
+    : `<p>Please try again shortly.</p>`
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Backend Unavailable - Janus</title>
+<style>${STYLE}</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Backend unavailable</h1>
+    <p>The site behind this address is currently offline or unreachable.
+      This isn't something you did &mdash; there's nothing to log into or
+      configure on your end.</p>
+    ${retryHtml}
+    <p class="code">Janus &middot; HTTP 502</p>
+    ${footer(config)}
+  </div>
+</body>
+</html>`
+}
+
 function rateLimitPage() {
   return `<!doctype html>
 <html lang="en">
@@ -313,6 +375,11 @@ function adminDashboardPage({ rows, csrf, config, error }) {
     const lastRequestAt = row.live && row.lastRequestAt
       ? escapeHtml(new Date(row.lastRequestAt).toISOString())
       : '&mdash;'
+    // Milestone 2d: health-probe status. Only meaningful for a live tunnel
+    // -- an idle/never-created key has never been probed at all.
+    const health = row.live
+      ? (row.healthy === false ? '<span class="warn">unhealthy</span>' : 'healthy')
+      : '&mdash;'
     const safeKeyHash = escapeHtml(row.keyHash)
 
     const blockForm = `<form method="POST" action="/_admin/block" style="display:inline-flex">
@@ -346,6 +413,7 @@ function adminDashboardPage({ rows, csrf, config, error }) {
       <td>${status}</td>
       <td>${password}</td>
       <td>${port}</td>
+      <td>${health}</td>
       <td>${inFlight}</td>
       <td>${lastRequestAt}</td>
       <td style="display:flex; gap:0.5rem; flex-wrap:wrap">${blockForm}${clearAliasForm}${clearPasswordForm}</td>
@@ -408,13 +476,14 @@ function adminDashboardPage({ rows, csrf, config, error }) {
           <th>status</th>
           <th>password</th>
           <th>port</th>
+          <th>health</th>
           <th>inFlight</th>
           <th>lastRequestAt</th>
           <th>actions</th>
         </tr>
       </thead>
       <tbody>
-        ${tableRows || '<tr><td colspan="8">No tunnels or stored keys yet.</td></tr>'}
+        ${tableRows || '<tr><td colspan="9">No tunnels or stored keys yet.</td></tr>'}
       </tbody>
     </table>
 
@@ -429,6 +498,8 @@ module.exports = {
   apexPage,
   impressumPage,
   termsPage,
+  errorPage,
+  offlinePage,
   rateLimitPage,
   loginPage,
   adminLoginPage,

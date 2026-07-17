@@ -105,6 +105,32 @@ test('renderMetrics: rate-limit hits are labeled by dimension (request / new_tun
   assert.match(body, /^janus_ratelimit_hits_total\{limiter="new_tunnel"\} 3$/m)
 })
 
+// --- Bug fix (robustness): renderMetrics must never emit an invalid body ---
+
+test('renderMetrics: an incomplete/malformed stats object still yields a structurally valid Prometheus body', () => {
+  // Deliberately missing most fields (and one explicitly non-finite one) --
+  // manager.stats()/limiter.stats() are production-validated so this
+  // "can't happen" today, but the renderer must be structurally incapable
+  // of emitting a body a scraper would reject regardless.
+  const incompleteManager = { stats: () => ({ active: 2, circuitsOpen: NaN }) }
+  const incompleteLimiter = { stats: () => ({}) }
+  const body = renderMetrics({
+    manager: incompleteManager,
+    limiter: incompleteLimiter,
+    startedAt: Date.now(),
+  })
+
+  assert.doesNotMatch(body, /undefined/, 'body must never contain the literal string "undefined"')
+  assert.doesNotMatch(body, /NaN/, 'body must never contain the literal string "NaN"')
+
+  const lineRe = /^\S+(\{[^}]*\})? -?[0-9.]+$/
+  const sampleLines = body.split('\n').filter((l) => l && !l.startsWith('#'))
+  assert.ok(sampleLines.length > 0, 'expected at least one metric sample line')
+  for (const line of sampleLines) {
+    assert.match(line, lineRe, `invalid Prometheus sample line: "${line}"`)
+  }
+})
+
 // --- Security-critical: no keyHash / raw key can ever leak into /metrics ---
 
 test('renderMetrics: NEVER includes a live tunnel keyHash, even with real tunnels present', async () => {

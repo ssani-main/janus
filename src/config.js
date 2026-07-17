@@ -104,12 +104,123 @@ const config = {
   // default -- per-request logging is high volume and an operator should opt
   // in explicitly, same rationale as ADMIN_TOKEN being unset by default.
   LOG_REQUESTS: readBool('LOG_REQUESTS', false),
+  // Milestone 2c: circuit breaker + reconnect tuning. Consecutive cold-create
+  // (or reactive proxy-error) failures for a keyHash before its circuit
+  // opens and further cold creates fast-fail (503 + Retry-After) instead of
+  // paying for a DHT round trip against a backend we already know is down.
+  CIRCUIT_FAILURE_THRESHOLD: readInt('CIRCUIT_FAILURE_THRESHOLD', 5),
+  // How long a circuit stays open once it trips, in milliseconds. Default
+  // 30 seconds.
+  CIRCUIT_COOLDOWN_MS: readInt('CIRCUIT_COOLDOWN_MS', 30000),
+  // Milestone 2c: how many extra reconnect attempts `_createTunnel` makes
+  // (with exponential backoff + jitter) after the first cold-create attempt
+  // fails, before giving up and surfacing ConnectError. Default 3 (so up to
+  // 4 total attempts: 1 initial + 3 reconnects).
+  RECONNECT_MAX_ATTEMPTS: readInt('RECONNECT_MAX_ATTEMPTS', 3),
+  // Base delay for the reconnect backoff (`RECONNECT_BASE_DELAY_MS * 2^attempt`,
+  // capped at RECONNECT_MAX_DELAY_MS, jittered). Default 250ms.
+  RECONNECT_BASE_DELAY_MS: readInt('RECONNECT_BASE_DELAY_MS', 250),
+  // Cap on the reconnect backoff delay, in milliseconds. Default 5s.
+  RECONNECT_MAX_DELAY_MS: readInt('RECONNECT_MAX_DELAY_MS', 5000),
+  // Milestone 2d: how often the periodic health probe checks every cached
+  // tunnel's port for liveness (independent of the 60s idle sweeper, which
+  // is too coarse for this). Default 30 seconds.
+  HEALTH_PROBE_INTERVAL_MS: readInt('HEALTH_PROBE_INTERVAL_MS', 30000),
+  // Per-probe connect timeout. Must be well under HEALTH_PROBE_INTERVAL_MS
+  // (enforced below) -- a probe that can outlive its own interval would
+  // stack up behind the next tick instead of settling first. Default 2s.
+  HEALTH_PROBE_TIMEOUT_MS: readInt('HEALTH_PROBE_TIMEOUT_MS', 2000),
+  // Milestone 2d (bug fix): how long proxy.web() waits for the upstream
+  // (tunneled backend) to respond before http-proxy aborts the outgoing
+  // request and emits 'error' on the shared proxy instance -- see
+  // src/server.js's `httpProxy.createProxyServer` call. Without this, a
+  // backend that accepts the connection and then hangs (deadlock, infinite
+  // loop, black-holed socket) never errors, never releases `inFlight`, is
+  // never probed (the inFlight>0 guard in tunnel-manager.js's _probeOne
+  // assumes -- correctly, but only once this timeout exists -- that an
+  // in-flight request proves the backend is alive), and pins the tunnel
+  // forever. This is an IDLE-socket timeout (Node's ClientRequest.setTimeout
+  // semantics), not a hard cap on total response duration -- a backend that
+  // is merely slow but keeps the connection active would not be cut off
+  // mid-response by this alone. It applies ONLY to proxy.web() (plain HTTP
+  // proxying); http-proxy's ws pass never reads options.proxyTimeout, so a
+  // long-lived websocket upgrade is completely unaffected -- this knob
+  // cannot sever one. Default 30s: long enough not to sever a legitimately
+  // slow-but-working backend, short enough that a genuinely hung backend
+  // recovers automatically well within an operator's patience.
+  PROXY_TIMEOUT_MS: readInt('PROXY_TIMEOUT_MS', 30000),
 }
 
 if (config.TUNNEL_PORT_MIN >= config.TUNNEL_PORT_MAX) {
   throw new Error(
     `Invalid config: TUNNEL_PORT_MIN (${config.TUNNEL_PORT_MIN}) must be less than ` +
     `TUNNEL_PORT_MAX (${config.TUNNEL_PORT_MAX})`
+  )
+}
+
+// Milestone 2c: fail fast on nonsensical circuit-breaker/reconnect config,
+// same rationale as the port-range check above.
+if (config.CIRCUIT_FAILURE_THRESHOLD <= 0) {
+  throw new Error(
+    `Invalid config: CIRCUIT_FAILURE_THRESHOLD (${config.CIRCUIT_FAILURE_THRESHOLD}) must be a positive integer`
+  )
+}
+if (config.CIRCUIT_COOLDOWN_MS <= 0) {
+  throw new Error(
+    `Invalid config: CIRCUIT_COOLDOWN_MS (${config.CIRCUIT_COOLDOWN_MS}) must be a positive integer`
+  )
+}
+if (config.RECONNECT_MAX_ATTEMPTS < 0) {
+  throw new Error(
+    `Invalid config: RECONNECT_MAX_ATTEMPTS (${config.RECONNECT_MAX_ATTEMPTS}) must be a non-negative integer`
+  )
+}
+if (config.RECONNECT_BASE_DELAY_MS <= 0) {
+  throw new Error(
+    `Invalid config: RECONNECT_BASE_DELAY_MS (${config.RECONNECT_BASE_DELAY_MS}) must be a positive integer`
+  )
+}
+if (config.RECONNECT_MAX_DELAY_MS <= 0) {
+  throw new Error(
+    `Invalid config: RECONNECT_MAX_DELAY_MS (${config.RECONNECT_MAX_DELAY_MS}) must be a positive integer`
+  )
+}
+if (config.RECONNECT_BASE_DELAY_MS > config.RECONNECT_MAX_DELAY_MS) {
+  throw new Error(
+    `Invalid config: RECONNECT_BASE_DELAY_MS (${config.RECONNECT_BASE_DELAY_MS}) must be <= ` +
+    `RECONNECT_MAX_DELAY_MS (${config.RECONNECT_MAX_DELAY_MS})`
+  )
+}
+
+// Milestone 2d: fail fast on nonsensical health-probe config, same rationale
+// as the checks above.
+if (config.HEALTH_PROBE_INTERVAL_MS <= 0) {
+  throw new Error(
+    `Invalid config: HEALTH_PROBE_INTERVAL_MS (${config.HEALTH_PROBE_INTERVAL_MS}) must be a positive integer`
+  )
+}
+if (config.HEALTH_PROBE_TIMEOUT_MS <= 0) {
+  throw new Error(
+    `Invalid config: HEALTH_PROBE_TIMEOUT_MS (${config.HEALTH_PROBE_TIMEOUT_MS}) must be a positive integer`
+  )
+}
+if (config.HEALTH_PROBE_TIMEOUT_MS >= config.HEALTH_PROBE_INTERVAL_MS) {
+  throw new Error(
+    `Invalid config: HEALTH_PROBE_TIMEOUT_MS (${config.HEALTH_PROBE_TIMEOUT_MS}) must be well under ` +
+    `HEALTH_PROBE_INTERVAL_MS (${config.HEALTH_PROBE_INTERVAL_MS}) -- a probe that can outlive its own ` +
+    `interval would stack up behind the next tick instead of settling first`
+  )
+}
+
+// Milestone 2d (bug fix): fail fast on a nonsensical proxy timeout, same
+// rationale as the checks above. No cross-check against CONNECT_TIMEOUT_MS
+// is enforced -- the two guard completely different phases (one-time
+// tunnel/DHT connect vs. per-request upstream response wait) with no
+// ordering requirement between them; either can reasonably be larger than
+// the other depending on the backend.
+if (config.PROXY_TIMEOUT_MS <= 0) {
+  throw new Error(
+    `Invalid config: PROXY_TIMEOUT_MS (${config.PROXY_TIMEOUT_MS}) must be a positive integer`
   )
 }
 

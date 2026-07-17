@@ -42,6 +42,20 @@ class BlockedError extends Error {
   }
 }
 
+// Milestone 2c: thrown when a keyHash's circuit is open (repeated recent
+// connect failures) and we deliberately refuse to attempt a cold create --
+// see the manager-level `this.circuits` Map and `recordFailure`/
+// `recordSuccess` below. `circuitOpenUntil` (epoch ms) is attached so
+// server.js can compute an honest Retry-After header.
+class CircuitOpenError extends Error {
+  constructor(message, circuitOpenUntil, cause) {
+    super(message)
+    this.name = 'CircuitOpenError'
+    this.circuitOpenUntil = circuitOpenUntil
+    if (cause !== undefined) this.cause = cause
+  }
+}
+
 /**
  * Minimal in-memory fallback used when TunnelManager is constructed without
  * a store (e.g. existing tests calling `new TunnelManager(config)`
@@ -68,6 +82,44 @@ function _inMemoryStoreShim() {
 // unbounded scan.
 const MAX_PORT_ATTEMPTS = 5
 
+// Milestone 2c: fallback defaults used ONLY when `config` doesn't define
+// these fields at all (`undefined`, not merely falsy/0). src/config.js
+// always sets them, but several existing unit tests construct minimal,
+// hand-rolled config objects directly (predating Milestone 2c) that don't
+// include them -- without a fallback, `attempt >= undefined` is always
+// `false`, so the reconnect loop below would retry forever instead of
+// surfacing ConnectError once, and `reconnectDelayMs(attempt, undefined,
+// undefined)` would compute NaN and call `setTimeout(fn, NaN)`. These
+// defaults make TunnelManager degrade to pre-2c behavior (no circuit, no
+// reconnect retries) for any config that simply doesn't mention them,
+// rather than hanging.
+const DEFAULT_CIRCUIT_FAILURE_THRESHOLD = Infinity // circuit can never open
+const DEFAULT_CIRCUIT_COOLDOWN_MS = 30000
+const DEFAULT_RECONNECT_MAX_ATTEMPTS = 0 // no reconnect retries -- fail on first attempt, exactly like pre-2c
+const DEFAULT_RECONNECT_BASE_DELAY_MS = 250
+const DEFAULT_RECONNECT_MAX_DELAY_MS = 5000
+// Milestone 2d: same fallback rationale as the 2c defaults above -- several
+// existing hand-rolled test configs predate the health-probe knobs entirely.
+// Falling back to src/config.js's own defaults keeps those tests' behavior
+// unchanged (health probing simply never gets *started* unless a caller
+// explicitly calls startHealthProbing(), so an absent config field is
+// harmless either way -- these defaults only matter if a caller does start
+// it against a minimal config object).
+const DEFAULT_HEALTH_PROBE_INTERVAL_MS = 30000
+const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 2000
+
+// Milestone 2d: "open by default" -- a single flaky/failed liveness probe
+// must never be enough to gate traffic away from an otherwise-working
+// backend (a one-off blip, a momentary GC pause in the backend process,
+// etc. is not the same thing as "down"). A record's `healthy` flag only
+// flips to `false` after this many CONSECUTIVE failed probes in a row;
+// recovery is the opposite trade-off -- a single successful probe is enough
+// to flip it back to `true` immediately, since staying falsely "unhealthy"
+// after the backend has recovered is the costlier mistake (it would keep
+// serving the friendlier-but-still-an-error offline page to real, working
+// traffic).
+const HEALTH_PROBE_UNHEALTHY_STREAK = 2
+
 /**
  * Cheap pre-flight check: bind a throwaway net.Server on host:port and
  * immediately close it. If something else already holds the port this
@@ -91,6 +143,40 @@ function probeFree(port, host) {
 
 function isPortCollisionError(err) {
   return !!err && err.code === 'EADDRINUSE'
+}
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
+}
+
+/**
+ * Milestone 2c: exponential backoff with EQUAL jitter for the reconnect
+ * loop in `_createTunnel`. `attempt` is zero-indexed (0 = first reconnect,
+ * after the initial cold-create attempt already failed once).
+ *
+ * Equal jitter (delay uniformly random in [cap/2, cap]), not full jitter
+ * ([0, cap]) -- chosen so the *minimum* possible delay still grows
+ * monotonically with `attempt`, which is both a real backoff guarantee
+ * (not just "usually longer on average") and makes the growth easy to
+ * assert in tests. Jitter itself still exists specifically to stop N
+ * concurrent tunnels to the same dead backend from resynchronizing their
+ * retries and hammering the DHT in lockstep -- the entire reason the
+ * circuit breaker exists.
+ *
+ * Exported (not just used internally) so tests can assert on cap growth
+ * and jitter bounds directly, without needing to drive a full reconnect
+ * chain through TunnelManager.
+ *
+ * @param {number} attempt zero-indexed reconnect attempt number
+ * @param {number} baseDelayMs
+ * @param {number} maxDelayMs
+ * @returns {number} delay in milliseconds
+ */
+function reconnectDelayMs(attempt, baseDelayMs, maxDelayMs) {
+  const exp = baseDelayMs * Math.pow(2, attempt)
+  const capped = Math.min(exp, maxDelayMs)
+  const half = capped / 2
+  return half + Math.random() * half
 }
 
 /**
@@ -194,12 +280,30 @@ function connectWithPortGuard(client, options, timeoutMs) {
 
     pendingPorts.set(port, onPortError)
 
+    // client.connect() only ever throws SYNCHRONOUSLY in the "faithful
+    // stand-in" shape used by our tests; the real HolesailClient fails via
+    // the internal-server 'error' event this whole function exists to
+    // guard against, not a rejection. But connect() is declared `async` on
+    // some client shapes, so it can also return a rejected Promise (a
+    // failure occurring after its first `await`, never reaching the sync
+    // throw path below). Without capturing and `.catch`ing that returned
+    // value, such a rejection would become an unhandled rejection instead
+    // of a wrapped ConnectError -- a latent correctness gap found during
+    // 2a/2b testing, fixed here. `cleanupAndSettle`'s `settled` guard makes
+    // this safe to attach unconditionally: if the callback already resolved
+    // us, a later rejection on the same returned promise is a no-op.
+    let maybePromise
     try {
-      client.connect(options, () => {
+      maybePromise = client.connect(options, () => {
         cleanupAndSettle(resolve, undefined)
       })
     } catch (err) {
       cleanupAndSettle(reject, err)
+    }
+    if (maybePromise && typeof maybePromise.then === 'function') {
+      maybePromise.catch((err) => {
+        cleanupAndSettle(reject, err)
+      })
     }
   })
 }
@@ -255,7 +359,20 @@ class TunnelManager {
     this.tunnels = new Map()
     /** @type {Map<string, Promise<{ client: any, port: number, keyHash: string, lastRequestAt: number, inFlight: number }>>} */
     this.pending = new Map()
+    // Milestone 2c: circuit-breaker state, keyed by keyHash, living at the
+    // MANAGER level -- deliberately NOT a per-tunnel-record field. A record
+    // in `this.tunnels` is deleted by `destroyTunnel` exactly when a backend
+    // dies, so per-record circuit state would vanish at the one moment it's
+    // needed and could never fast-fail the next cold create. Surviving
+    // record destruction is the entire point of this Map.
+    // @type {Map<string, { failures: number, circuitOpenUntil: number, lastFailureAt: number }>}
+    this.circuits = new Map()
     this._sweeperHandle = null
+    // Milestone 2d: separate interval handle for the periodic health probe
+    // -- deliberately NOT folded into the 60s sweeper interval, which is too
+    // coarse for liveness checking and has a different job (idle-eviction +
+    // circuit-entry expiry).
+    this._healthProbeHandle = null
     // Milestone 1: blocklist state now lives in the persistent store so it
     // survives restarts. If no store is supplied (e.g. existing tests that
     // construct `new TunnelManager(config)` directly), fall back to an
@@ -272,6 +389,13 @@ class TunnelManager {
       swept: 0,
       connectFailures: 0,
       portRetries: 0,
+      // Milestone 2c: cumulative circuit-breaker / reconnect counters.
+      circuitOpens: 0,
+      reconnectAttempts: 0,
+      reconnectSuccesses: 0,
+      // Milestone 2d: cumulative health-probe counters.
+      healthProbes: 0,
+      healthProbeFailures: 0,
     }
   }
 
@@ -304,6 +428,29 @@ class TunnelManager {
       existing.lastRequestAt = Date.now()
       existing.inFlight++
       return existing
+    }
+
+    // Milestone 2c circuit-breaker fast-fail. Deliberately placed AFTER the
+    // cached-tunnel check above, not before it (even though it sits
+    // "alongside" the blocklist check conceptually): a circuit only ever
+    // opens in response to COLD-CREATE failures (see recordFailure, called
+    // from _createTunnel's reconnect loop and server.js's proxy error
+    // handler for the reactive trigger). By the time it's open we already
+    // know a *fresh connect* to that backend has been failing -- but a
+    // tunnel that is already cached and being returned above is proof the
+    // backend is alive RIGHT NOW. Honoring "open by default", a stale
+    // circuit must never kill an already-healthy, already-established
+    // tunnel; it only ever gates the expensive cold-create path (DHT round
+    // trip + connect + liveness probe), which is exactly the cost this
+    // check exists to avoid paying against a backend we already know is
+    // down.
+    const circuit = this.circuits.get(keyHash)
+    if (circuit && circuit.circuitOpenUntil > Date.now()) {
+      const retryAfterMs = circuit.circuitOpenUntil - Date.now()
+      throw new CircuitOpenError(
+        `circuit open for this key after repeated connect failures; retry in ${Math.ceil(retryAfterMs / 1000)}s`,
+        circuit.circuitOpenUntil
+      )
     }
 
     if (this.pending.has(keyHash)) {
@@ -351,14 +498,62 @@ class TunnelManager {
       this.counters.evicted++
     }
 
-    // A port handed out by PortPool is only reserved *in this process* --
-    // see src/port-pool.js. It never checks whether the OS actually has the
-    // port free, so anything else already bound to it (another process,
-    // an old orphaned tunnel, etc.) makes the real listen() fail. That
-    // failure must never be allowed to escalate to uncaughtException and
-    // take down every other tenant's tunnel with it, so we retry onto the
-    // next pool port a bounded number of times instead of propagating a
-    // raw crash.
+    // Milestone 2c reconnect-with-backoff loop. This is a COMPLETELY
+    // DIFFERENT concern from `_attemptPortConnect`'s port-collision retry
+    // loop below: that one retries IMMEDIATELY, with no backoff, onto the
+    // NEXT pool port, because EADDRINUSE is bind contention, not a dead
+    // backend. THIS loop only fires when an entire `_attemptPortConnect()`
+    // call fails with ConnectError (every port attempt exhausted, or a
+    // non-collision failure like a liveness-probe timeout) -- i.e. the
+    // backend itself looks unreachable -- and it backs off exponentially
+    // with jitter before retrying the *same* key, so N concurrent requests
+    // to one dead backend don't resynchronize and hammer the DHT in
+    // lockstep. This entire loop runs inside the single Promise `ensureTunnel`
+    // stores in `this.pending` for this keyHash, so concurrent callers for
+    // the same key share this one retry/backoff chain instead of each
+    // kicking off their own.
+    let lastErr
+    for (let attempt = 0; ; attempt++) {
+      try {
+        const record = await this._attemptPortConnect(parsed)
+        if (attempt > 0) this.counters.reconnectSuccesses++
+        this.recordSuccess(parsed.keyHash)
+        return record
+      } catch (err) {
+        lastErr = err
+        this.recordFailure(parsed.keyHash)
+        const maxAttempts = this.config.RECONNECT_MAX_ATTEMPTS ?? DEFAULT_RECONNECT_MAX_ATTEMPTS
+        if (attempt >= maxAttempts) {
+          throw lastErr
+        }
+        this.counters.reconnectAttempts++
+        const delayMs = reconnectDelayMs(
+          attempt,
+          this.config.RECONNECT_BASE_DELAY_MS ?? DEFAULT_RECONNECT_BASE_DELAY_MS,
+          this.config.RECONNECT_MAX_DELAY_MS ?? DEFAULT_RECONNECT_MAX_DELAY_MS
+        )
+        await sleep(delayMs)
+      }
+    }
+  }
+
+  /**
+   * Single cold-create attempt: the pre-existing port-collision retry loop,
+   * unchanged in behavior from before Milestone 2c -- extracted verbatim so
+   * `_createTunnel` can wrap it in the reconnect-with-backoff loop above.
+   * Not exposed directly; only called from `_createTunnel`.
+   *
+   * A port handed out by PortPool is only reserved *in this process* -- see
+   * src/port-pool.js. It never checks whether the OS actually has the port
+   * free, so anything else already bound to it (another process, an old
+   * orphaned tunnel, etc.) makes the real listen() fail. That failure must
+   * never be allowed to escalate to uncaughtException and take down every
+   * other tenant's tunnel with it, so we retry onto the next pool port a
+   * bounded number of times instead of propagating a raw crash.
+   *
+   * @param {{ key: string, keyHash: string }} parsed
+   */
+  async _attemptPortConnect(parsed) {
     let lastErr
     for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS; attempt++) {
       let port
@@ -406,6 +601,17 @@ class TunnelManager {
         firstSeenAt: Date.now(),
         lastRequestAt: Date.now(),
         inFlight: 0,
+        // Milestone 2d: per-record, transient health-probe state -- unlike
+        // circuit-breaker state (this.circuits, manager-level), this
+        // describes *this* tunnel instance specifically and should die with
+        // it, not survive into whatever tunnel eventually replaces it.
+        healthy: true,
+        lastProbeAt: null,
+        // Internal-only bookkeeping (not part of the sanitized `list()`
+        // shape below) -- consecutive failed-probe streak used to decide
+        // when `healthy` actually flips false; see
+        // HEALTH_PROBE_UNHEALTHY_STREAK above.
+        _probeFailStreak: 0,
       }
       this.tunnels.set(parsed.keyHash, record)
       this.counters.created++
@@ -418,6 +624,61 @@ class TunnelManager {
       `failed to connect tunnel for key: exhausted ${MAX_PORT_ATTEMPTS} port attempts`,
       lastErr
     )
+  }
+
+  /**
+   * Milestone 2c: record a cold-create (or reactive, proxy-error-triggered)
+   * failure for a keyHash, opening its circuit once consecutive failures
+   * reach CIRCUIT_FAILURE_THRESHOLD. Re-arms `circuitOpenUntil` on every
+   * threshold-or-above failure (not just the first) so a backend that fails
+   * again right after its cooldown expires re-opens the circuit instead of
+   * silently falling back to "closed" forever.
+   *
+   * Callers, by design: a cold-create ConnectError (`_createTunnel`'s
+   * reconnect loop, below) and a real proxied-request error
+   * (proxy.on('error') in server.js). Both are strong signals -- an actual
+   * attempt to reach the real backend failed. The periodic health probe
+   * (Milestone 2d, `_probeOne` below) is deliberately NOT a caller: a
+   * loopback TCP connect to our own holesail-client proxy port is too weak a
+   * signal to open a circuit against a backend that may not have failed a
+   * single real request. See `_probeOne`'s doc comment for what a probe
+   * failure streak does instead (destroys the tunnel, letting the next
+   * request's cold-create -- which DOES feed this breaker -- decide honestly
+   * whether the backend is really down).
+   *
+   * @param {string} keyHash
+   */
+  recordFailure(keyHash) {
+    let circuit = this.circuits.get(keyHash)
+    if (!circuit) {
+      circuit = { failures: 0, circuitOpenUntil: 0, lastFailureAt: 0 }
+      this.circuits.set(keyHash, circuit)
+    }
+    circuit.failures++
+    circuit.lastFailureAt = Date.now()
+    const threshold = this.config.CIRCUIT_FAILURE_THRESHOLD ?? DEFAULT_CIRCUIT_FAILURE_THRESHOLD
+    if (circuit.failures >= threshold) {
+      const now = Date.now()
+      const wasOpen = circuit.circuitOpenUntil > now
+      circuit.circuitOpenUntil = now + (this.config.CIRCUIT_COOLDOWN_MS ?? DEFAULT_CIRCUIT_COOLDOWN_MS)
+      if (!wasOpen) this.counters.circuitOpens++
+    }
+  }
+
+  /**
+   * Milestone 2c: record a success for a keyHash -- either a successful
+   * cold create (called from `_createTunnel` above) or a successful
+   * proxied response through an already-cached tunnel (called from
+   * server.js's `proxy.on('proxyRes', ...)`). Simply deletes the circuit
+   * entry: an absent entry is treated identically to
+   * `{ failures: 0, circuitOpenUntil: 0 }` everywhere else in this file, and
+   * dropping it here (rather than zeroing its fields) also means a healthy,
+   * steadily-succeeding key never accumulates unbounded circuit state.
+   *
+   * @param {string} keyHash
+   */
+  recordSuccess(keyHash) {
+    this.circuits.delete(keyHash)
   }
 
   /**
@@ -490,6 +751,10 @@ class TunnelManager {
       firstSeenAt: record.firstSeenAt,
       lastRequestAt: record.lastRequestAt,
       inFlight: record.inFlight,
+      // Milestone 2d: health-probe state -- purely additive, every
+      // pre-existing field above is untouched.
+      healthy: record.healthy,
+      lastProbeAt: record.lastProbeAt,
     }))
   }
 
@@ -497,13 +762,32 @@ class TunnelManager {
    * Snapshot of current + cumulative tunnel stats for the /metrics endpoint.
    * Returns a copy (not the live counters object) so callers can't mutate
    * our internal state.
-   * @returns {{ active: number, pending: number, maxTunnels: number, created: number, evicted: number, swept: number, connectFailures: number, portRetries: number }}
+   * @returns {{ active: number, pending: number, maxTunnels: number, circuitsOpen: number, created: number, evicted: number, swept: number, connectFailures: number, portRetries: number, circuitOpens: number, reconnectAttempts: number, reconnectSuccesses: number }}
    */
   stats() {
+    // circuitsOpen is a live GAUGE (unlike the cumulative counters spread in
+    // below), so it's computed fresh here rather than tracked incrementally
+    // -- it must reflect circuits that are open RIGHT NOW, including ones
+    // whose cooldown has since expired without a fresh failure/success.
+    const now = Date.now()
+    let circuitsOpen = 0
+    for (const circuit of this.circuits.values()) {
+      if (circuit.circuitOpenUntil > now) circuitsOpen++
+    }
+    // Milestone 2d: unhealthy, like circuitsOpen above, is a live GAUGE --
+    // computed fresh from current tunnel state rather than tracked
+    // incrementally, so it always reflects reality right now (a tunnel that
+    // recovers or is torn down must stop counting immediately).
+    let unhealthy = 0
+    for (const record of this.tunnels.values()) {
+      if (!record.healthy) unhealthy++
+    }
     return {
       active: this.tunnels.size,
       pending: this.pending.size,
       maxTunnels: this.config.MAX_TUNNELS,
+      circuitsOpen,
+      unhealthy,
       ...this.counters,
     }
   }
@@ -560,8 +844,34 @@ class TunnelManager {
             .catch(() => {})
         }
       }
+      this._sweepCircuits(now)
     }, 60000)
     if (this._sweeperHandle.unref) this._sweeperHandle.unref()
+  }
+
+  /**
+   * Milestone 2c: drop circuit-breaker entries from `this.circuits` that
+   * are no longer doing any useful work, so the Map doesn't grow unbounded
+   * across the process lifetime (same rationale/shape as
+   * src/rate-limit.js's bucket sweep). An entry is dropped when its circuit
+   * is NOT currently open AND it has been at least CIRCUIT_COOLDOWN_MS
+   * since its last recorded failure -- i.e. it's been quiet for a full
+   * cooldown window with nothing to fast-fail. An entry whose circuit IS
+   * currently open is always kept (it's actively doing its job); one that
+   * failed recently (within a cooldown window) is also kept, since another
+   * failure right now should count toward re-opening it rather than
+   * starting the failure count over from zero.
+   * @param {number} now
+   */
+  _sweepCircuits(now) {
+    const cooldownMs = this.config.CIRCUIT_COOLDOWN_MS ?? DEFAULT_CIRCUIT_COOLDOWN_MS
+    for (const [keyHash, circuit] of this.circuits) {
+      const isOpen = circuit.circuitOpenUntil > now
+      const quietLongEnough = now - circuit.lastFailureAt > cooldownMs
+      if (!isOpen && quietLongEnough) {
+        this.circuits.delete(keyHash)
+      }
+    }
   }
 
   stopSweeper() {
@@ -572,14 +882,136 @@ class TunnelManager {
   }
 
   /**
-   * Stop the sweeper and tear down every live tunnel. Call on graceful
-   * shutdown.
+   * Milestone 2d: start the periodic health-probe interval. Deliberately a
+   * SEPARATE interval from the 60s sweeper (startSweeper above) -- that
+   * interval is hardcoded and too coarse for liveness checking, and mixing
+   * "idle eviction + circuit expiry" with "is this backend still alive"
+   * into one tick would couple two unrelated tuning knobs together.
+   */
+  startHealthProbing() {
+    if (this._healthProbeHandle) return
+    const intervalMs = this.config.HEALTH_PROBE_INTERVAL_MS ?? DEFAULT_HEALTH_PROBE_INTERVAL_MS
+    this._healthProbeHandle = setInterval(() => {
+      this._probeTunnels().catch(() => {
+        // _probeTunnels/_probeOne already handle their own per-record
+        // failures (recordFailure, marking unhealthy) -- this catch only
+        // guards against something unexpected escaping Promise.all so a
+        // single bad tick can never kill the interval.
+      })
+    }, intervalMs)
+    if (this._healthProbeHandle.unref) this._healthProbeHandle.unref()
+  }
+
+  stopHealthProbing() {
+    if (this._healthProbeHandle) {
+      clearInterval(this._healthProbeHandle)
+      this._healthProbeHandle = null
+    }
+  }
+
+  /**
+   * Probe every currently-cached tunnel once. Not exposed as public API --
+   * called by the interval above, and directly by tests.
+   */
+  async _probeTunnels() {
+    const timeoutMs = this.config.HEALTH_PROBE_TIMEOUT_MS ?? DEFAULT_HEALTH_PROBE_TIMEOUT_MS
+    const records = [...this.tunnels.values()]
+    await Promise.all(records.map((record) => this._probeOne(record, timeoutMs)))
+  }
+
+  /**
+   * Probe a single tunnel record's port and update its health state.
+   *
+   * Do NOT probe a tunnel with `inFlight > 0` -- it is demonstrably alive
+   * (it's actively serving a request right now), so probing it is wasted
+   * work that only adds extra connection churn against the backend.
+   *
+   * Probes deliberately do NOT touch the manager-level circuit breaker in
+   * either direction -- neither `recordFailure` nor `recordSuccess`. A
+   * passing/failing loopback TCP connect to our own holesail-client proxy
+   * port only proves (or fails to prove) that OUR port is accepting
+   * connections; it says nothing about whether the real backend behind it
+   * is up, so it is too weak a signal to open OR close a circuit that gates
+   * real traffic. See `recordFailure`'s doc comment for which signals are
+   * strong enough to do that.
+   *
+   * Instead, a probe failure streak reaching HEALTH_PROBE_UNHEALTHY_STREAK
+   * destroys the tunnel outright (see destroyTunnel below) rather than just
+   * flipping `healthy` and leaving the dead record cached indefinitely --
+   * that is precisely what used to pin a dead backend's tunnel forever (no
+   * idle-sweep would ever fire because visitors kept refreshing and bumping
+   * lastRequestAt, and nothing else ever acted on `healthy`). Destroying it
+   * frees the port and lets the NEXT request cold-create through the
+   * existing backoff + circuit-breaker machinery, which IS driven by a
+   * strong signal (a real ConnectError) -- so a truly dead backend still
+   * legitimately opens the circuit, and a recovered backend just works,
+   * automatically, with no operator action.
+   *
+   * `healthy` still survives as an observability-only signal (admin
+   * dashboard column, `janus_tunnels_unhealthy` gauge) -- it's just a
+   * short-lived transient now, since the record it describes is destroyed
+   * almost immediately after flipping false.
+   *
+   * @param {object} record
+   * @param {number} timeoutMs
+   */
+  async _probeOne(record, timeoutMs) {
+    // This guard is only sound BECAUSE src/server.js's proxy now sets
+    // proxyTimeout (config.PROXY_TIMEOUT_MS): a hung backend's proxied
+    // request eventually errors out on its own, which drains `inFlight`
+    // back to 0 via the existing release() wiring. Do NOT remove the
+    // timeout without removing/rethinking this guard too -- without it, an
+    // in-flight request against a backend that hangs forever would never
+    // release, this skip would never let a probe run, and the tunnel would
+    // pin forever (the exact bug this guard's timeout dependency closes).
+    if (record.inFlight > 0) return
+    this.counters.healthProbes++
+    record.lastProbeAt = Date.now()
+    try {
+      await probePort(record.port, '127.0.0.1', timeoutMs)
+      record._probeFailStreak = 0
+      record.healthy = true
+    } catch {
+      this.counters.healthProbeFailures++
+      record._probeFailStreak = (record._probeFailStreak || 0) + 1
+      // "Open by default": a single failed probe must never be enough to
+      // mark a tunnel unhealthy and start gating traffic away from a
+      // working backend -- see HEALTH_PROBE_UNHEALTHY_STREAK's doc comment.
+      if (record._probeFailStreak >= HEALTH_PROBE_UNHEALTHY_STREAK) {
+        record.healthy = false
+        // Re-check inFlight (and that this exact record is still the one
+        // cached for its keyHash) immediately before destroying -- a
+        // request can arrive and start using this tunnel in the time
+        // between this probe starting (the inFlight===0 check at the top
+        // of this function) and its async probePort() settling here. Same
+        // inFlight guard the idle sweeper already applies before evicting.
+        if (record.inFlight === 0 && this.tunnels.get(record.keyHash) === record) {
+          await this.destroyTunnel(record.keyHash)
+        }
+      }
+    }
+  }
+
+  /**
+   * Stop the sweeper + health probe and tear down every live tunnel. Call
+   * on graceful shutdown.
    */
   async shutdown() {
     this.stopSweeper()
+    this.stopHealthProbing()
     const keyHashes = [...this.tunnels.keys()]
     await Promise.all(keyHashes.map((keyHash) => this.destroyTunnel(keyHash)))
   }
 }
 
-module.exports = { TunnelManager, CapacityError, ConnectError, KeyError, BlockedError }
+module.exports = {
+  TunnelManager,
+  CapacityError,
+  ConnectError,
+  KeyError,
+  BlockedError,
+  CircuitOpenError,
+  // Exported purely so unit tests can assert on backoff-cap growth and
+  // jitter bounds directly -- see test/unit/tunnel-manager-circuit.test.js.
+  reconnectDelayMs,
+}
