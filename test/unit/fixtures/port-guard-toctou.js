@@ -55,6 +55,9 @@ class RacingHolesailClient {
   }
 }
 
+// Port range 20110-20115 -- see test/unit/fixtures/port-ranges.js for the
+// full cross-file allocation map (test files run in parallel, so ranges
+// must stay disjoint).
 async function main() {
   const config = {
     MAX_TUNNELS: 5,

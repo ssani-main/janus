@@ -30,6 +30,9 @@ class BuggyClient {
   async destroy() {}
 }
 
+// Port range 20150-20155 -- see test/unit/fixtures/port-ranges.js for the
+// full cross-file allocation map (test files run in parallel, so ranges
+// must stay disjoint).
 async function main() {
   const config = {
     MAX_TUNNELS: 5,

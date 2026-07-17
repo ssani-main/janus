@@ -38,6 +38,9 @@ class FakeHolesailClient {
   }
 }
 
+// Port ranges 20500-20520, 20550-20560, 20570-20580, 20590-20595 -- see
+// test/unit/fixtures/port-ranges.js for the full cross-file allocation map
+// (test files run in parallel, so ranges must stay disjoint).
 function baseConfig(overrides) {
   return Object.assign(
     {

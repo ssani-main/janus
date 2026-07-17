@@ -149,6 +149,9 @@ test('renderMetrics: NEVER includes a live tunnel keyHash, even with real tunnel
     }
   }
 
+  // Port range 20600-20610 -- see test/unit/fixtures/port-ranges.js for the
+  // full cross-file allocation map (test files run in parallel, so ranges
+  // must stay disjoint).
   const config = {
     MAX_TUNNELS: 5,
     TUNNEL_PORT_MIN: 20600,

@@ -63,6 +63,9 @@ class SilentClient {
   async destroy() {}
 }
 
+// Port ranges 20400-20420, 20430-20435 -- see
+// test/unit/fixtures/port-ranges.js for the full cross-file allocation map
+// (test files run in parallel, so ranges must stay disjoint).
 function baseConfig(overrides) {
   return Object.assign(
     {

@@ -37,8 +37,11 @@ process.env.RATE_MAX_REQUESTS = '1000'
 process.env.RATE_MAX_NEW_TUNNELS = '1000'
 process.env.LOG_REQUESTS = 'false'
 process.env.COOKIE_SECURE = 'false'
-process.env.TUNNEL_PORT_MIN = '20000'
-process.env.TUNNEL_PORT_MAX = '20999'
+// Port range 20900-20910 -- see test/unit/fixtures/port-ranges.js for the
+// full cross-file allocation map (test files run in parallel via
+// `node --test`, so ranges must stay disjoint).
+process.env.TUNNEL_PORT_MIN = '20900'
+process.env.TUNNEL_PORT_MAX = '20910'
 process.env.MAX_TUNNELS = '7'
 
 const { server, manager } = require('../../src/server')
@@ -98,7 +101,7 @@ const KEY_CONNECT_ERR = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
 const KEY_CAPACITY_ERR = 'cccccccccccccccccccccccccccccccccccccccccccccccccc'
 
 test('ConnectError from a port-probe timeout does not leak the internal 127.0.0.1:<port> into the visitor-facing page', async () => {
-  const leakyPort = 20573 // inside TUNNEL_PORT_MIN..TUNNEL_PORT_MAX
+  const leakyPort = 20905 // inside TUNNEL_PORT_MIN..TUNNEL_PORT_MAX
   const detailedMessage = `failed to connect tunnel for key: liveness probe timed out for 127.0.0.1:${leakyPort}`
   manager.ensureTunnel = async () => {
     throw new ConnectError(detailedMessage)
@@ -119,13 +122,13 @@ test('ConnectError from a port-probe timeout does not leak the internal 127.0.0.
   // Sanity: no digit sequence in the page's actual TEXT (excluding the
   // embedded <style> block's base64 font data, which legitimately contains
   // incidental digit runs unrelated to this leak) falls inside the
-  // configured tunnel port range (20000-20999).
+  // configured tunnel port range (20900-20910).
   const bodyWithoutStyle = res.body.replace(/<style>[\s\S]*?<\/style>/, '')
   const numbers = bodyWithoutStyle.match(/\b\d{5}\b/g) || []
   for (const n of numbers) {
     const value = Number(n)
     assert.ok(
-      !(value >= 20000 && value <= 20999),
+      !(value >= 20900 && value <= 20910),
       `body contains a 5-digit number (${n}) inside the tunnel port range`
     )
   }

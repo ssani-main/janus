@@ -5,6 +5,9 @@ const assert = require('node:assert/strict')
 const { TunnelManager, BlockedError } = require('../../src/tunnel-manager')
 const { parseKey } = require('../../src/key')
 
+// Port range 20000-20010 -- see test/unit/fixtures/port-ranges.js for the
+// full cross-file allocation map (test files run in parallel, so ranges
+// must stay disjoint).
 const FAKE_CONFIG = {
   MAX_TUNNELS: 2,
   TUNNEL_PORT_MIN: 20000,

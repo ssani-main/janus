@@ -58,12 +58,15 @@ class NeverBindsClient {
   async destroy() {}
 }
 
+// Port range 20800-20810 -- see test/unit/fixtures/port-ranges.js for the
+// full cross-file allocation map (test files run in parallel via
+// `node --test`, so ranges must stay disjoint).
 function baseConfig(overrides) {
   return Object.assign(
     {
       MAX_TUNNELS: 5,
-      TUNNEL_PORT_MIN: 20700,
-      TUNNEL_PORT_MAX: 20710,
+      TUNNEL_PORT_MIN: 20800,
+      TUNNEL_PORT_MAX: 20810,
       IDLE_TTL_MS: 1e9,
       CONNECT_TIMEOUT_MS: 2000,
       CIRCUIT_FAILURE_THRESHOLD: 1e9, // don't let the circuit interfere with this test

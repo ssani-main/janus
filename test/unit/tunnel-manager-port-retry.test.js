@@ -66,6 +66,9 @@ class FakeHolesailClient {
   }
 }
 
+// Port ranges 20100-20105, 20120-20122, 20130-20132 -- see
+// test/unit/fixtures/port-ranges.js for the full cross-file allocation map
+// (test files run in parallel, so ranges must stay disjoint).
 test('_createTunnel: port occupied by a foreign listener retries onto the next pool port and succeeds', async () => {
   const config = {
     MAX_TUNNELS: 5,
