@@ -43,5 +43,11 @@ gateway.example.com, *.gateway.example.com {
 	reverse_proxy 127.0.0.1:3000 {
 		header_up Host {host}
 		header_up X-Forwarded-Proto {scheme}
+		# Security audit S2: OVERWRITE X-Forwarded-For with the real remote
+		# host instead of appending to whatever the client sent. Without this,
+		# a client-supplied X-Forwarded-For survives to Node, and since
+		# src/server.js's clientIp() (with TRUST_PROXY) trusts it, a client
+		# could prepend a fake entry to dodge/frame another IP's rate limit.
+		header_up X-Forwarded-For {remote_host}
 	}
 }

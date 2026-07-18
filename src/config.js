@@ -77,6 +77,13 @@ const config = {
   ABUSE_EMAIL,
   ADMIN_TOKEN,
   TRUST_PROXY,
+  // Security audit S2: number of trusted reverse proxies (e.g. Caddy) between
+  // the client and this gateway. clientIp() (src/server.js) reads the
+  // X-Forwarded-For entry this many positions from the RIGHT, not the
+  // leftmost -- Caddy's reverse_proxy APPENDS to XFF rather than replacing
+  // it, so the leftmost entry is attacker-controlled while the rightmost N
+  // entries are appended by trusted hops. Default 1 (a single Caddy).
+  TRUSTED_PROXY_HOPS: readInt('TRUSTED_PROXY_HOPS', 1),
   RATE_WINDOW_MS: readInt('RATE_WINDOW_MS', 60000),
   RATE_MAX_REQUESTS: readInt('RATE_MAX_REQUESTS', 120),
   RATE_MAX_NEW_TUNNELS: readInt('RATE_MAX_NEW_TUNNELS', 10),
@@ -252,6 +259,21 @@ if (config.ENSURE_TUNNEL_TIMEOUT_MS <= config.CONNECT_TIMEOUT_MS) {
     `CONNECT_TIMEOUT_MS (${config.CONNECT_TIMEOUT_MS}) -- it bounds the whole cold-create chain, ` +
     `which includes at least one full connect attempt`
   )
+}
+
+// Security audit S2: fail fast on a nonsensical trusted-hop count. Only
+// enforced when TRUST_PROXY is true -- clientIp() never reads
+// TRUSTED_PROXY_HOPS otherwise. Must be a finite integer >= 1: 0 (or
+// negative) would index at or past the leftmost, attacker-controlled entry,
+// defeating the whole point of right-indexing.
+if (config.TRUST_PROXY) {
+  if (!Number.isFinite(config.TRUSTED_PROXY_HOPS) || config.TRUSTED_PROXY_HOPS < 1) {
+    throw new Error(
+      `Invalid config: TRUSTED_PROXY_HOPS (${config.TRUSTED_PROXY_HOPS}) must be a finite integer >= 1 ` +
+      `when TRUST_PROXY is true -- it is the number of trusted proxies (e.g. Caddy) between the client ` +
+      `and this gateway, and clientIp() indexes X-Forwarded-For from the right by this amount`
+    )
+  }
 }
 
 module.exports = Object.freeze(config)

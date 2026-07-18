@@ -126,12 +126,14 @@ support lands.
 ## Security backlog (audit 2026-07-17)
 
 These findings came from a multi-dimension audit of the code as of commit
-c503e04; **nothing here is fixed**, and all severities assume the Linux deploy
+c503e04; **S1 and S2 were fixed on 2026-07-18 (see below); everything else remains open**, and all severities assume the Linux deploy
 target documented in [DEPLOY.md](./DEPLOY.md).
 
 ### CRITICAL
 
-#### S1. Cross-tenant cookie injection (no `cookieDomainRewrite`)
+#### S1. ✅ FIXED (2026-07-18) — Cross-tenant cookie injection (no `cookieDomainRewrite`)
+
+> **Resolved 2026-07-18:** `cookieDomainRewrite: ''` is now set on the shared `httpProxy.createProxyServer()` options in `src/server.js`, so every `proxy.web()` strips the `Domain=` attribute from backend `Set-Cookie` headers (host-only cookies). Regression test: `test/unit/server-cookie-domain-rewrite.test.js`.
 
 **Where:** `src/server.js` — the `proxy.web()` and `proxy.ws()` call sites;
 `httpProxy.createProxyServer` options.
@@ -160,7 +162,9 @@ pwned=1; Domain=gw.example.com; Path=/` through to the visitor unmodified.
 host-only cookies. Consider `cookiePathRewrite` as defence-in-depth against
 `/_admin` path collisions.
 
-#### S2. Rate limiter buckets on an attacker-controlled value (X-Forwarded-For spoofing)
+#### S2. ✅ FIXED (2026-07-18) — Rate limiter buckets on an attacker-controlled value (X-Forwarded-For spoofing)
+
+> **Resolved 2026-07-18:** fixed at both layers — the `Caddyfile` now sets `header_up X-Forwarded-For {remote_host}` (Caddy overwrites rather than appends), and `clientIp()` in `src/server.js` now reads the XFF entry indexed from the RIGHT by the new `TRUSTED_PROXY_HOPS` config (default 1, validated `>= 1` when `TRUST_PROXY`), so a client-spoofed leftmost entry can't win even if Caddy is misconfigured. Regression test: `test/unit/server-xff-spoofing.test.js`.
 
 **Where:** `src/server.js` `clientIp()` (~:142-150); `src/config.js`
 `TRUST_PROXY` (~:62, defaults **true**); `Caddyfile` (~:43-45).
@@ -227,6 +231,8 @@ notifications socket can be silent for hours, and severing it would be a real
 regression.
 
 #### S4. Port-pool exhaustion via fake-key cold-creates — severity derived from S2
+
+> **Update 2026-07-18:** with S2 now fixed, S4 is demoted from CRITICAL to IMPORTANT — the single-source escalation depended on S2's spoofable per-IP limiter. The finding itself remains open.
 
 **Where:** `src/tunnel-manager.js` `_createTunnel` ~:507-574,
 `_attemptPortConnect` ~:595-685 (`portPool.acquire()` ~:612, `release()` ~:642);

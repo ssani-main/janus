@@ -73,7 +73,20 @@ limiter.start()
 // options.proxyTimeout, so setting it here -- once, on the shared proxy
 // options both .web() and .ws() close over -- cannot affect or kill a
 // long-lived websocket upgrade; it only ever applies to proxy.web().
-const proxy = httpProxy.createProxyServer({ xfwd: true, proxyTimeout: config.PROXY_TIMEOUT_MS })
+//
+// Security audit S1: cookieDomainRewrite: '' is likewise set here so every
+// proxy.web() call inherits it (same pattern as proxyTimeout above). Tenant
+// backends are UNTRUSTED -- anyone can run one and share their key -- and
+// without this, http-proxy copies a backend's Set-Cookie headers verbatim,
+// so a malicious backend could set `Domain=<BASE_DOMAIN>` and have its
+// cookie apply to the apex and every sibling tenant subdomain (cross-tenant
+// cookie injection / session fixation, see RFC 6265). Setting it to '' strips
+// the Domain attribute, forcing host-only cookies.
+const proxy = httpProxy.createProxyServer({
+  xfwd: true,
+  proxyTimeout: config.PROXY_TIMEOUT_MS,
+  cookieDomainRewrite: '',
+})
 
 // Strip the key out of anything that might reach an app the visitor didn't
 // share the key with themselves.
@@ -139,11 +152,24 @@ proxy.on('error', (err, req, res) => {
 // be true when the gateway sits behind a proxy we control (Caddy) that
 // overwrites/sets X-Forwarded-For itself -- otherwise a client could spoof
 // it to dodge the limiter.
+//
+// Security audit S2: Caddy's reverse_proxy APPENDS to X-Forwarded-For rather
+// than replacing it, so the LEFTMOST entry is attacker-controlled, not the
+// rightmost. This indexes from the right by TRUSTED_PROXY_HOPS instead --
+// see the inline comment below for the exact rationale.
 function clientIp(req) {
   if (config.TRUST_PROXY) {
     const xff = req.headers['x-forwarded-for']
     if (xff) {
-      return String(xff).split(',')[0].trim()
+      const parts = String(xff).split(',').map((s) => s.trim()).filter(Boolean)
+      // Index from the RIGHT: the trusted proxy (Caddy) appends the peer
+      // it actually saw as the LAST entry, so with N trusted hops the real
+      // client is at parts[length - N]. A client can prepend/spoof entries
+      // on the LEFT, but cannot forge what the trusted proxy appends on the
+      // right -- so the leftmost entry (the old behaviour) is exactly the
+      // attacker-controlled one. See security audit S2.
+      const idx = parts.length - config.TRUSTED_PROXY_HOPS
+      if (idx >= 0 && parts[idx]) return parts[idx]
     }
   }
   return req.socket.remoteAddress
