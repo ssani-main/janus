@@ -30,7 +30,17 @@ after(() => {
       // best-effort
     }
     try {
-      fs.unlinkSync(`${p}.tmp.${process.pid}`)
+      const dir = path.dirname(p)
+      const prefix = `${path.basename(p)}.tmp.`
+      for (const name of fs.readdirSync(dir)) {
+        if (name.startsWith(prefix)) {
+          try {
+            fs.unlinkSync(path.join(dir, name))
+          } catch {
+            // best-effort
+          }
+        }
+      }
     } catch {
       // best-effort
     }
@@ -67,7 +77,14 @@ test('atomic write: no pid-scoped .tmp file is left behind after a mutation', ()
   store.setBlocked(keyHash, true)
 
   assert.equal(fs.existsSync(p), true)
-  assert.equal(fs.existsSync(`${p}.tmp.${process.pid}`), false)
+  // _persist() now uses a RANDOM tmp suffix (`${p}.tmp.<pid>.<hex>`, S5), so
+  // assert on the PREFIX -- scan the dir and confirm no `${basename}.tmp.`
+  // sibling survives a successful persist, rather than checking one
+  // hard-coded name (which would now pass vacuously).
+  const dir = path.dirname(p)
+  const tmpPrefix = `${path.basename(p)}.tmp.`
+  const leftover = fs.readdirSync(dir).filter((n) => n.startsWith(tmpPrefix))
+  assert.deepEqual(leftover, [], `unexpected tmp files left behind: ${leftover.join(', ')}`)
 })
 
 test('setBlocked/isBlocked: true then false', () => {

@@ -24,6 +24,10 @@ RestartSec=2
 NoNewPrivileges=true
 ProtectSystem=strict
 ReadWritePaths=/opt/janus
+# S5: belt-and-braces -- any file the process creates (store, tmp files)
+# comes out owner-only even if a future code change forgets to pass an
+# explicit mode.
+UMask=0077
 
 [Install]
 WantedBy=multi-user.target
@@ -32,6 +36,13 @@ WantedBy=multi-user.target
 Create a dedicated non-root user first (`useradd --system --no-create-home
 holesail`), `chown` the deploy directory to it, and keep `.env` readable
 only by that user (`chmod 600 .env`).
+
+`janus-data.json` (the runtime store) also holds plaintext raw Holesail
+keys, so it needs the same treatment (S5). The code now creates it -- and
+its tmp files -- at `0600` itself, and an atomic rename means an existing
+`0644` store self-heals to `0600` the next time anything writes to it. On
+an already-deployed box, don't wait for that: run `chmod 600
+janus-data.json` immediately after upgrading.
 
 ```sh
 sudo systemctl daemon-reload

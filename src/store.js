@@ -7,10 +7,45 @@
 // a crash mid-write never corrupts the store.
 
 const fs = require('node:fs')
+const crypto = require('node:crypto')
+const path = require('node:path')
 const { parseKey } = require('./key')
 
 const VERSION = 1
 const ALIAS_RE = /^[a-z0-9-]{1,63}$/
+
+/**
+ * S6: best-effort removal of crash-orphaned tmp files left behind by a
+ * previous process that died between _persist()'s open() and rename() (e.g.
+ * OOM-killed, `kill -9`, power loss). Because each tmp file now gets a
+ * random suffix (see _persist(), S5), an orphan is never overwritten
+ * in-place by a later write -- it just sits there forever holding a stale
+ * copy of every raw key, unless something sweeps it. This sweep is that
+ * something. It's safe to run unconditionally at startup because the
+ * gateway is single-instance (one systemd process owns the store file) and
+ * load() always runs before any writer becomes active, so there's no
+ * concurrent writer whose live tmp file we could race and delete out from
+ * under it.
+ *
+ * @param {string} filePath
+ */
+function _sweepOrphanTmps(filePath) {
+  try {
+    const dir = path.dirname(filePath)
+    const prefix = `${path.basename(filePath)}.tmp.`
+    for (const name of fs.readdirSync(dir)) {
+      if (name.startsWith(prefix)) {
+        try {
+          fs.unlinkSync(path.join(dir, name))
+        } catch {
+          // best-effort: another actor may have already removed it
+        }
+      }
+    }
+  } catch {
+    // best-effort: never block startup on an unreadable/missing directory
+  }
+}
 
 /**
  * @returns {{ version: number, keys: object, aliases: object }}
@@ -56,6 +91,11 @@ class Store {
    * @returns {Store}
    */
   static load(filePath) {
+    // S6: reclaim any tmp file orphaned by a prior crash before we even
+    // attempt to read the real store, so it happens on every startup path
+    // including first-run (ENOENT) below.
+    _sweepOrphanTmps(filePath)
+
     let raw
     try {
       raw = fs.readFileSync(filePath, 'utf8')
@@ -88,16 +128,46 @@ class Store {
 
   /**
    * Persist the current in-memory state to disk atomically: write to a
-   * pid-scoped tmp file, then rename over the real path. Cleans up the tmp
-   * file on failure.
+   * pid-and-random-scoped tmp file, then rename over the real path. Cleans
+   * up the tmp file on failure.
+   *
+   * S5: this store holds plaintext raw Holesail keys (live credentials), so
+   * the tmp file -- and therefore the real file, via rename -- must never
+   * be created world-readable. Two things matter here:
+   *
+   *  (a) `mode` on fs.open()/writeFileSync() is only honoured by open(2)
+   *      when the call actually CREATES the file. If the tmp path were
+   *      reused (e.g. just `${path}.tmp.${pid}`) and it already existed as
+   *      a crash-orphan from a previous run, opening it for write would
+   *      truncate-in-place and silently keep that orphan's old mode (often
+   *      0o644 from before this fix) -- the requested 0o600 would never
+   *      apply. Using `wx` (O_CREAT | O_EXCL | O_WRONLY) plus a random
+   *      suffix guarantees every _persist() call creates a brand-new inode,
+   *      so the 0o600 mode is always actually applied.
+   *  (b) `renameSync` preserves the mode of the new (tmp) inode, not the
+   *      old one -- so the real store file ends up 0o600 too. As a bonus,
+   *      this means an already-deployed store that's currently 0o644
+   *      self-heals to 0o600 the very next time anything writes to it.
    */
   _persist() {
-    const tmpPath = `${this.path}.tmp.${process.pid}`
+    const rnd = crypto.randomBytes(6).toString('hex')
+    const tmpPath = `${this.path}.tmp.${process.pid}.${rnd}`
     const json = JSON.stringify(this.data, null, 2)
+    let fd
     try {
-      fs.writeFileSync(tmpPath, json, 'utf8')
+      fd = fs.openSync(tmpPath, 'wx', 0o600)
+      fs.writeFileSync(fd, json, 'utf8')
+      fs.closeSync(fd)
+      fd = undefined
       fs.renameSync(tmpPath, this.path)
     } catch (err) {
+      if (fd !== undefined) {
+        try {
+          fs.closeSync(fd)
+        } catch {
+          // best-effort cleanup; ignore secondary errors
+        }
+      }
       try {
         fs.unlinkSync(tmpPath)
       } catch {
