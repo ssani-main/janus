@@ -148,6 +148,14 @@ class Store {
    *      old one -- so the real store file ends up 0o600 too. As a bonus,
    *      this means an already-deployed store that's currently 0o644
    *      self-heals to 0o600 the very next time anything writes to it.
+   *
+   * S10: `writeFileSync`/`renameSync` returning does NOT mean the write is
+   * durable -- both can complete at the page cache without ever reaching
+   * the physical disk, so an acknowledged admin action (block a tenant,
+   * clear a password) can silently vanish on power loss and fail OPEN.
+   * This method now fsyncs the tmp file's data before the rename, and
+   * best-effort fsyncs the parent directory after the rename, so the write
+   * survives a crash immediately after _persist() returns.
    */
   _persist() {
     const rnd = crypto.randomBytes(6).toString('hex')
@@ -157,9 +165,29 @@ class Store {
     try {
       fd = fs.openSync(tmpPath, 'wx', 0o600)
       fs.writeFileSync(fd, json, 'utf8')
+      // S10 -- writeFileSync only reaches the page cache; fsync the fd so
+      // the store contents are durable before the rename makes them visible.
+      fs.fsyncSync(fd)
       fs.closeSync(fd)
       fd = undefined
       fs.renameSync(tmpPath, this.path)
+
+      // S10: the file data is durable (fsync above), but the rename that
+      // makes it the live store is only durable once the parent directory
+      // entry is flushed too. Best-effort + guarded: opening a directory for
+      // fsync fails on some platforms (e.g. Windows dev boxes); the Linux
+      // deploy target -- the one that matters for durability -- supports it.
+      let dirFd
+      try {
+        dirFd = fs.openSync(path.dirname(this.path), 'r')
+        fs.fsyncSync(dirFd)
+      } catch {
+        // best-effort: platform can't fsync a directory handle
+      } finally {
+        if (dirFd !== undefined) {
+          try { fs.closeSync(dirFd) } catch {}
+        }
+      }
     } catch (err) {
       if (fd !== undefined) {
         try {

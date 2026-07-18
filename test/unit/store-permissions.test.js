@@ -1,6 +1,6 @@
 'use strict'
 
-// Regression tests for two security fixes to src/store.js:
+// Regression tests for three security fixes to src/store.js:
 //
 //   S5 -- _persist() now creates its tmp file via fs.openSync(tmpPath, 'wx',
 //         0o600) with a random suffix (${path}.tmp.${pid}.${randomHex}), then
@@ -10,6 +10,13 @@
 //   S6 -- Store.load() sweeps and unlinks any sibling `${basename}.tmp.*`
 //         file before reading, reclaiming tmp files orphaned by a process
 //         that crashed between _persist()'s open() and rename().
+//   S10 -- _persist() now fsyncs the tmp file's data (fs.fsyncSync(fd))
+//         before closing/renaming, and best-effort fsyncs the parent
+//         directory after the rename, so an acknowledged admin write can't
+//         silently vanish on power loss (fail-open). True power-loss
+//         durability isn't unit-testable, so this test instead verifies the
+//         fsync CALLS happen by counting invocations of fs.fsyncSync on the
+//         same cached `node:fs` module object that store.js requires.
 //
 // This file mirrors the harness in store.test.js (tmpStorePath() helper +
 // a single after() hook that best-effort cleans up every temp path used).
@@ -131,4 +138,43 @@ test('S6: the sweep leaves unrelated sibling files alone and real store data sti
   assert.equal(fs.readFileSync(unrelated, 'utf8'), 'do not touch me')
   // The sweep must not have interfered with reading the real store data.
   assert.equal(store2.isBlocked(keyHash), true)
+})
+
+// --- S10: fsync durability on every persist --------------------------------
+
+test('S10: _persist() calls fs.fsyncSync at least once for the tmp file data, and (non-win32) again for the parent directory', () => {
+  const p = tmpStorePath('fsync-durability')
+  const store = load(p)
+  const { keyHash } = parseKey(KEY_A)
+
+  // Node caches the `node:fs` module object, and store.js does
+  // `const fs = require('node:fs')` -- so wrapping fsyncSync on this same
+  // `fs` object (required above) intercepts store.js's calls too. The
+  // try/finally is critical: leaking a wrapped fsyncSync into other tests
+  // would corrupt their behavior/timing.
+  const originalFsyncSync = fs.fsyncSync
+  let fsyncCount = 0
+  fs.fsyncSync = function wrappedFsyncSync(...args) {
+    fsyncCount += 1
+    return originalFsyncSync.apply(this, args)
+  }
+
+  try {
+    store.setBlocked(keyHash, true)
+  } finally {
+    fs.fsyncSync = originalFsyncSync
+  }
+
+  // Unconditional: the tmp file's data is always fsynced before rename.
+  assert.ok(fsyncCount >= 1, `expected fs.fsyncSync to be called at least once, got ${fsyncCount}`)
+
+  if (process.platform !== 'win32') {
+    // Non-Windows: the best-effort parent-directory fsync also succeeds, so
+    // we expect a second call (data fd + dir fd).
+    assert.ok(fsyncCount >= 2, `expected fs.fsyncSync to be called at least twice on ${process.platform}, got ${fsyncCount}`)
+  }
+
+  // Confirm the fsync wrapping didn't disturb the actual persisted data.
+  const reloaded = load(p)
+  assert.equal(reloaded.isBlocked(keyHash), true)
 })

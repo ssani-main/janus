@@ -400,7 +400,9 @@ the real work — but it's a static shared secret shaped like a nonce.
 **Fix:** bind to `iat` plus a random per-login value stored in the session
 payload, generated fresh at login.
 
-#### S10. No fsync — an acknowledged admin action can silently vanish, failing OPEN
+#### S10. ✅ FIXED (2026-07-18) — No fsync — an acknowledged admin action can silently vanish, failing OPEN
+
+> **Resolved 2026-07-18:** `_persist()` in `src/store.js` now `fsync`s the tmp file's fd before the rename (durable data) and best-effort `fsync`s the parent directory after the rename (durable directory entry), so an acknowledged admin action survives an immediate power loss. The dir fsync is guarded for platforms that can't fsync a directory handle (e.g. Windows); the Linux deploy target supports it. Folded into the S5 `openSync`-based write. Regression test: `test/unit/store-permissions.test.js`.
 
 **Where:** `src/store.js` ~:98-99.
 
