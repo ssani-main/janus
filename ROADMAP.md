@@ -340,7 +340,9 @@ reach the repo — the repo lifetime was considered; the on-disk lifetime wasn't
 best-effort sweep in `Store.load` for `<basename>.tmp.`-prefixed siblings —
 with random tmp names a sweep becomes the only way orphans are ever reclaimed.
 
-#### S7. `clearAlias` never clears `rawKey` — the plaintext secret cannot be deleted through any interface
+#### S7. ✅ FIXED (2026-07-18) — `clearAlias` never clears `rawKey` — the plaintext secret cannot be deleted through any interface
+
+> **Resolved 2026-07-18 (purge-on-clear):** `clearAlias` in `src/store.js` now nulls `record.rawKey` when the record has no password (`if (!record.password) record.rawKey = null`), and `clearPassword` symmetrically nulls it when the record has no alias (`if (!record.alias) record.rawKey = null`) — so clearing a tenant's alias (or password) now actually removes the live credential from disk once no other feature still needs it. The asymmetric guards are required because `setAlias` and `setPassword` both store `rawKey`. The fuller `deleteKey()` + dashboard-button variant (full record removal, a bound on record growth) was intentionally deferred per operator decision; note it as remaining follow-up. Regression tests: `test/unit/store.test.js`.
 
 **Where:** `src/store.js` `clearAlias` ~:203-214. Sets `record.alias = null`
 but leaves `record.rawKey` untouched. `rawKey` is set at ~:192-193 (`setAlias`)

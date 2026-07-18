@@ -306,6 +306,14 @@ class Store {
     const record = this.data.keys[keyHash]
     if (record && record.alias === normalized) {
       record.alias = null
+      // S7: rawKey is a live credential (direct backend access). Once the
+      // alias is gone, the only remaining reason to retain it is a password
+      // (setPassword also stores rawKey), so drop it when there's no
+      // password -- otherwise an offboarded tenant's key lingers on disk
+      // forever with no interface to remove it. The `!record.password` guard
+      // is required: an unconditional null-out would break a passworded,
+      // non-aliased key.
+      if (!record.password) record.rawKey = null
       record.updatedAt = Date.now()
     }
     this._persist()
@@ -340,6 +348,13 @@ class Store {
     if (!record || !record.password) return
     record.pwdVersion = (record.pwdVersion || 0) + 1
     record.password = null
+    // S7 (symmetric): setPassword also stores rawKey. Once the password is
+    // cleared, if no alias still points at this key there's no remaining
+    // reason to keep the raw credential on disk -- drop it. The
+    // `!record.alias` guard is required so clearing a password on an
+    // aliased key doesn't make the alias undialable (getByAlias needs
+    // rawKey).
+    if (!record.alias) record.rawKey = null
     record.updatedAt = Date.now()
     this._persist()
   }

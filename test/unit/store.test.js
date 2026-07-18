@@ -189,6 +189,83 @@ test('setPassword/getPassword/clearPassword: pwdVersion starts at 1, bumps on cl
   assert.ok(second.pwdVersion > first.pwdVersion)
 })
 
+// S7: rawKey (record.rawKey) is a live credential shared between the alias
+// and password features. clearAlias()/clearPassword() must only purge it
+// when the OTHER feature isn't still relying on it -- an unconditional
+// null-out would silently break a passworded, non-aliased key (or make an
+// aliased key undialable). These tests pin all four branches of that
+// asymmetric guard, plus persistence of a purge across a fresh load().
+
+test('S7 clearAlias: with NO password, rawKey is purged and the alias becomes undialable', () => {
+  const p = tmpStorePath('s7-clearalias-no-password')
+  const store = load(p)
+  const { keyHash } = parseKey(KEY_A)
+
+  store.setAlias('myalias', KEY_A)
+  assert.deepEqual(store.getByAlias('myalias'), { keyHash, rawKey: KEY_A })
+  assert.equal(store.getKey(keyHash).rawKey, KEY_A)
+
+  store.clearAlias('myalias')
+  assert.equal(store.getKey(keyHash).rawKey, null)
+  assert.equal(store.getByAlias('myalias'), undefined)
+})
+
+test('S7 clearAlias: WITH a password still set, rawKey is preserved', () => {
+  const p = tmpStorePath('s7-clearalias-with-password')
+  const store = load(p)
+  const { keyHash } = parseKey(KEY_A)
+
+  store.setAlias('myalias', KEY_A)
+  store.setPassword(keyHash, KEY_A, 'hash1', 'salt1')
+
+  store.clearAlias('myalias')
+  const record = store.getKey(keyHash)
+  assert.equal(record.rawKey, KEY_A, 'rawKey must survive because the password still needs it')
+  assert.equal(record.alias, null)
+  // The alias itself is still gone, only rawKey retention differs.
+  assert.equal(store.getByAlias('myalias'), undefined)
+})
+
+test('S7 clearPassword: with NO alias, rawKey is purged', () => {
+  const p = tmpStorePath('s7-clearpassword-no-alias')
+  const store = load(p)
+  const { keyHash } = parseKey(KEY_A)
+
+  store.setPassword(keyHash, KEY_A, 'hash1', 'salt1')
+  assert.equal(store.getKey(keyHash).rawKey, KEY_A)
+
+  store.clearPassword(keyHash)
+  assert.equal(store.getKey(keyHash).rawKey, null)
+})
+
+test('S7 clearPassword: WITH an alias still set, rawKey is preserved and the alias stays dialable', () => {
+  const p = tmpStorePath('s7-clearpassword-with-alias')
+  const store = load(p)
+  const { keyHash } = parseKey(KEY_A)
+
+  store.setAlias('myalias', KEY_A)
+  store.setPassword(keyHash, KEY_A, 'hash1', 'salt1')
+
+  store.clearPassword(keyHash)
+  const record = store.getKey(keyHash)
+  assert.equal(record.rawKey, KEY_A, 'rawKey must survive because the alias still needs it')
+  assert.deepEqual(store.getByAlias('myalias'), { keyHash, rawKey: KEY_A })
+})
+
+test('S7 persistence: a clearAlias-triggered rawKey purge survives a fresh load()', () => {
+  const p = tmpStorePath('s7-clearalias-persist')
+  const store1 = load(p)
+  const { keyHash } = parseKey(KEY_A)
+
+  store1.setAlias('myalias', KEY_A)
+  store1.clearAlias('myalias')
+  assert.equal(store1.getKey(keyHash).rawKey, null)
+
+  const store2 = load(p)
+  assert.equal(store2.getKey(keyHash).rawKey, null, 'purge must be persisted to disk, not just in-memory')
+  assert.equal(store2.getByAlias('myalias'), undefined)
+})
+
 test('load: a corrupt JSON file throws', () => {
   const p = tmpStorePath('corrupt')
   fs.writeFileSync(p, 'this is not { valid json', 'utf8')
