@@ -11,12 +11,26 @@ const { signSession, csrfToken } = require('../../src/auth')
 const ADMIN_TOKEN = 'testtoken123'
 const SESSION_SECRET = 'a'.repeat(64)
 const TOKEN_HASH = crypto.createHash('sha256').update(ADMIN_TOKEN).digest('hex')
+// S9: CSRF tokens are now bound to a per-login random `sid`, not the static
+// TOKEN_HASH -- tests that hand-construct a session cookie (bypassing the
+// real /_admin/login handler, which would generate its own random sid) need
+// a fixed, known sid so they can also hand-construct a matching CSRF token.
+const SID = 'test-session-id-0123456789abcdef'
+// S8: a fixed test IP for handleAdmin's `ip` dep (server.js threads in
+// clientIp(req) for the per-IP login lockout -- admin.js's `loginFails` map
+// is module-level, so any test hitting POST /_admin/login needs a real
+// (even if fake) ip value here).
+const TEST_IP = '203.0.113.7'
 
 const baseConfig = () => ({
   ADMIN_TOKEN,
   ADMIN_SESSION_TTL_MS: 43200000,
   COOKIE_SECURE: false,
   SESSION_TTL_MS: 604800000,
+  // S8: mirror config.js's defaults so these tests exercise the same
+  // lockout thresholds a real deployment would.
+  ADMIN_LOGIN_MAX_FAILS: 5,
+  ADMIN_LOGIN_LOCKOUT_MS: 60000,
 })
 
 /**
@@ -87,8 +101,11 @@ function fakeStore(overrides = {}) {
   }
 }
 
-function adminCookieValue() {
-  return signSession(SESSION_SECRET, { adm: 1, th: TOKEN_HASH, iat: Date.now() })
+function adminCookieValue(sid = SID) {
+  // S9: real sessions (issued by POST /_admin/login) now carry a random
+  // `sid` alongside `th` -- tests that fabricate a cookie directly need to
+  // include one too, so CSRF tokens computed against SID (below) verify.
+  return signSession(SESSION_SECRET, { adm: 1, th: TOKEN_HASH, sid, iat: Date.now() })
 }
 
 async function run(req, res, deps) {
@@ -156,7 +173,7 @@ test('handleAdmin: POST /_admin/login with correct token -> 302 + Set-Cookie', a
     body: `token=${encodeURIComponent(ADMIN_TOKEN)}`,
   })
   const res = mockRes()
-  await run(req, res, { manager: fakeManager(), config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET })
+  await run(req, res, { manager: fakeManager(), config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET, ip: TEST_IP })
   assert.equal(res.statusCode, 302)
   assert.equal(res.headers['Location'], '/_admin')
   const setCookie = res.headers['Set-Cookie']
@@ -167,7 +184,11 @@ test('handleAdmin: POST /_admin/login with correct token -> 302 + Set-Cookie', a
   assert.match(setCookie, /Path=\/_admin/)
 })
 
-test('handleAdmin: POST /_admin/login with wrong token -> login page again, no cookie', async () => {
+// S8: a failed login must return 401, not 200 -- a 200 here would be
+// indistinguishable from a normal page render to any log/metrics pipeline
+// watching status codes, defeating brute-force detection. Updated per the
+// S8 spec (was previously asserting 200).
+test('handleAdmin: POST /_admin/login with wrong token -> 401 login page again, no cookie', async () => {
   const req = mockReq({
     method: 'POST',
     url: '/_admin/login',
@@ -175,10 +196,37 @@ test('handleAdmin: POST /_admin/login with wrong token -> login page again, no c
     body: 'token=nope',
   })
   const res = mockRes()
-  await run(req, res, { manager: fakeManager(), config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET })
-  assert.equal(res.statusCode, 200)
+  await run(req, res, { manager: fakeManager(), config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET, ip: TEST_IP })
+  assert.equal(res.statusCode, 401)
   assert.equal(res.headers['Set-Cookie'], undefined)
   assert.match(res.body, /Incorrect token\./)
+})
+
+// S8: repeated failed logins from the same IP eventually get locked out
+// (429 + Retry-After), independent of whether the token guess is right --
+// the whole point of the lockout is to refuse the attempt before even
+// checking the token once the threshold is hit.
+test('handleAdmin: POST /_admin/login: repeated wrong tokens from one IP trigger a 429 lockout', async () => {
+  const ip = '203.0.113.99'
+  const config = baseConfig()
+  for (let i = 0; i < config.ADMIN_LOGIN_MAX_FAILS; i++) {
+    const req = mockReq({ method: 'POST', url: '/_admin/login', headers: {}, body: 'token=nope' })
+    const res = mockRes()
+    await run(req, res, { manager: fakeManager(), config, store: fakeStore(), sessionSecret: SESSION_SECRET, ip })
+    assert.equal(res.statusCode, 401)
+  }
+  // One more attempt (even with the CORRECT token) must now be locked out.
+  const lockedReq = mockReq({
+    method: 'POST',
+    url: '/_admin/login',
+    headers: {},
+    body: `token=${encodeURIComponent(ADMIN_TOKEN)}`,
+  })
+  const lockedRes = mockRes()
+  await run(lockedReq, lockedRes, { manager: fakeManager(), config, store: fakeStore(), sessionSecret: SESSION_SECRET, ip })
+  assert.equal(lockedRes.statusCode, 429)
+  assert.ok(lockedRes.headers['Retry-After'], 'expected a Retry-After header')
+  assert.equal(lockedRes.headers['Set-Cookie'], undefined, 'must not issue a cookie while locked out')
 })
 
 // --- 5. GET /_admin with a valid admin cookie --------------------------------
@@ -231,7 +279,7 @@ test('handleAdmin: POST /_admin/block with valid cookie but wrong csrf -> 403, n
 
 test('handleAdmin: POST /_admin/block with valid cookie and correct csrf -> block succeeds, 302', async () => {
   const cookieVal = adminCookieValue()
-  const csrf = csrfToken(SESSION_SECRET, TOKEN_HASH)
+  const csrf = csrfToken(SESSION_SECRET, SID)
   const manager = fakeManager()
   const keyHash = 'a'.repeat(64)
   const req = mockReq({
@@ -250,7 +298,7 @@ test('handleAdmin: POST /_admin/block with valid cookie and correct csrf -> bloc
 // --- 7. Form POST without a valid admin cookie (bearer not accepted) --------
 
 test('handleAdmin: POST /_admin/block with bearer only (no cookie) -> rejected, no action performed', async () => {
-  const csrf = csrfToken(SESSION_SECRET, TOKEN_HASH)
+  const csrf = csrfToken(SESSION_SECRET, SID)
   const manager = fakeManager()
   const req = mockReq({
     method: 'POST',
@@ -268,7 +316,7 @@ test('handleAdmin: POST /_admin/block with bearer only (no cookie) -> rejected, 
 
 test('handleAdmin: POST /_admin/alias set with valid cookie+csrf -> calls store.setAlias, 302', async () => {
   const cookieVal = adminCookieValue()
-  const csrf = csrfToken(SESSION_SECRET, TOKEN_HASH)
+  const csrf = csrfToken(SESSION_SECRET, SID)
   const store = fakeStore()
   const req = mockReq({
     method: 'POST',
@@ -285,7 +333,7 @@ test('handleAdmin: POST /_admin/alias set with valid cookie+csrf -> calls store.
 
 test('handleAdmin: POST /_admin/alias set where store.setAlias throws -> dashboard re-rendered with error, no crash', async () => {
   const cookieVal = adminCookieValue()
-  const csrf = csrfToken(SESSION_SECRET, TOKEN_HASH)
+  const csrf = csrfToken(SESSION_SECRET, SID)
   const store = fakeStore({
     setAlias: () => {
       throw new Error('invalid alias')
@@ -302,4 +350,145 @@ test('handleAdmin: POST /_admin/alias set where store.setAlias throws -> dashboa
   assert.equal(res.statusCode, 200)
   assert.match(res.body, /invalid alias/)
   assert.match(res.body, /<table>/)
+})
+
+// --- 9. S12: admin responses set Cache-Control: no-store ---------------------
+//
+// The admin surface renders keyHashes, aliases, ports, and the live CSRF
+// token; a shared/intermediate cache (or a shared-computer browser's back-
+// forward cache) must never be able to serve a stale copy of any of that.
+// sendHtml/sendJson in admin.js both set this header explicitly -- these
+// tests pin it on one HTML response and one JSON response so a future
+// refactor that drops it from either helper is caught.
+
+test('S12: GET /_admin dashboard (authenticated) sets Cache-Control: no-store', async () => {
+  const cookieVal = adminCookieValue()
+  const req = mockReq({
+    method: 'GET',
+    url: '/_admin',
+    headers: { cookie: `janus_admin=${cookieVal}` },
+  })
+  const res = mockRes()
+  await run(req, res, { manager: fakeManager(), config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.headers['Cache-Control'], 'no-store')
+})
+
+test('S12: GET /_admin/tunnels (JSON API, bearer) sets Cache-Control: no-store', async () => {
+  const req = mockReq({
+    method: 'GET',
+    url: '/_admin/tunnels',
+    headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+  })
+  const res = mockRes()
+  await run(req, res, { manager: fakeManager(), config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 200)
+  assert.equal(res.headers['Cache-Control'], 'no-store')
+})
+
+// --- 10. S13: logout requires CSRF -------------------------------------------
+//
+// Logout mutates session state (clears the cookie) and is cookie-reachable
+// just like block/alias/password, so it needs the same CSRF gate -- before
+// S13 it was the one mutating form endpoint that skipped verifyCsrf entirely.
+
+test('S13: POST /_admin/logout with valid cookie but missing csrf -> 403, no cookie cleared', async () => {
+  const cookieVal = adminCookieValue()
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/logout',
+    headers: { cookie: `janus_admin=${cookieVal}` },
+    body: '',
+  })
+  const res = mockRes()
+  await run(req, res, { manager: fakeManager(), config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 403)
+  assert.deepEqual(JSON.parse(res.body), { error: 'forbidden' })
+  assert.equal(res.headers['Set-Cookie'], undefined, 'must not clear the session cookie without a valid CSRF token')
+})
+
+test('S13: POST /_admin/logout with valid cookie but wrong csrf -> 403, no cookie cleared', async () => {
+  const cookieVal = adminCookieValue()
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/logout',
+    headers: { cookie: `janus_admin=${cookieVal}` },
+    body: 'csrf=deadbeef',
+  })
+  const res = mockRes()
+  await run(req, res, { manager: fakeManager(), config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 403)
+  assert.deepEqual(JSON.parse(res.body), { error: 'forbidden' })
+  assert.equal(res.headers['Set-Cookie'], undefined, 'must not clear the session cookie without a valid CSRF token')
+})
+
+test('S13: POST /_admin/logout with valid cookie and correct csrf -> 302, cookie cleared (Max-Age=0)', async () => {
+  const cookieVal = adminCookieValue()
+  const csrf = csrfToken(SESSION_SECRET, SID)
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/logout',
+    headers: { cookie: `janus_admin=${cookieVal}` },
+    body: `csrf=${csrf}`,
+  })
+  const res = mockRes()
+  await run(req, res, { manager: fakeManager(), config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 302)
+  assert.equal(res.headers['Location'], '/_admin')
+  const setCookie = res.headers['Set-Cookie']
+  assert.ok(setCookie, 'expected a Set-Cookie header clearing the session')
+  assert.match(setCookie, /^janus_admin=;/)
+  assert.match(setCookie, /Max-Age=0/)
+})
+
+// --- 11. S9: CSRF is per-session (cross-session isolation) -------------------
+//
+// Before S9, the CSRF token was bound only to a hash of the (static, shared)
+// ADMIN_TOKEN -- every session sharing one ADMIN_TOKEN therefore shared one
+// CSRF token, forever, until the token was rotated. Now csrfToken/verifyCsrf
+// are bound to the per-login random `sid` carried in the signed session
+// cookie, so a token minted for one session must be rejected for a different
+// session, even though both sessions are otherwise fully valid (same
+// ADMIN_TOKEN, same tokenHash). These two tests pin exactly that: the same
+// csrf value is accepted for the session it was minted against, and rejected
+// for a different session.
+
+test('S9: CSRF token minted for session A is rejected when submitted under session B\'s cookie', async () => {
+  const SID_B = 'test-session-id-B-0123456789abcd'
+  const cookieA = adminCookieValue(SID)
+  const cookieB = adminCookieValue(SID_B)
+  const csrfA = csrfToken(SESSION_SECRET, SID)
+  const manager = fakeManager()
+  const keyHash = 'b'.repeat(64)
+
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/block',
+    // session B's cookie, but session A's csrf token.
+    headers: { cookie: `janus_admin=${cookieB}` },
+    body: `action=block&keyHash=${keyHash}&csrf=${csrfA}`,
+  })
+  const res = mockRes()
+  await run(req, res, { manager, config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 403, 'a CSRF token from a different session must not validate')
+  assert.deepEqual(manager.recorded, [], 'no mutation should have occurred')
+})
+
+test('S9: CSRF token minted for session A is accepted when submitted under session A\'s own cookie', async () => {
+  const cookieA = adminCookieValue(SID)
+  const csrfA = csrfToken(SESSION_SECRET, SID)
+  const manager = fakeManager()
+  const keyHash = 'b'.repeat(64)
+
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/block',
+    headers: { cookie: `janus_admin=${cookieA}` },
+    body: `action=block&keyHash=${keyHash}&csrf=${csrfA}`,
+  })
+  const res = mockRes()
+  await run(req, res, { manager, config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 302, 'the matching session\'s own CSRF token must be accepted')
+  assert.equal(res.headers['Location'], '/_admin')
+  assert.deepEqual(manager.recorded, [['destroy', keyHash], ['block', keyHash]])
 })

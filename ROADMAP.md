@@ -126,7 +126,7 @@ support lands.
 ## Security backlog (audit 2026-07-17)
 
 These findings came from a multi-dimension audit of the code as of commit
-c503e04; **S1 and S2 were fixed on 2026-07-18; S3 and S4-mitigation were fixed on 2026-07-19 (see below); all CRITICAL findings are now resolved; remaining findings are HIGH and below**, and all severities assume the Linux deploy
+c503e04; **S1 and S2 were fixed on 2026-07-18; S3 and S4-mitigation were fixed on 2026-07-19; S8, S9, S11, S12, S13 were fixed on 2026-07-19 — the entire security backlog (S1–S13, plus S4-as-mitigated) is now resolved; no findings remain open**, and all severities assume the Linux deploy
 target documented in [DEPLOY.md](./DEPLOY.md).
 
 ### CRITICAL
@@ -374,7 +374,9 @@ record growth.
 
 ### IMPORTANT
 
-#### S8. No login rate limiting; failed login returns 200; no ADMIN_TOKEN entropy check
+#### S8. ✅ FIXED (2026-07-19) — No login rate limiting; failed login returns 200; no ADMIN_TOKEN entropy check
+
+> **Resolved 2026-07-19:** `/_admin/login` now enforces a per-IP failed-attempt lockout with exponential backoff (`ADMIN_LOGIN_MAX_FAILS` default 5, `ADMIN_LOGIN_LOCKOUT_MS` default 60000, capped at 2^6×), returns **401** (not 200) on a wrong token and **429 + Retry-After** while locked, logs failures (ip + timestamp + count, never the token), and `config.js` fail-fasts if a set `ADMIN_TOKEN` is < 16 chars. Regression tests in `test/unit/admin.test.js`.
 
 **Where:** `src/admin.js` ~:179-194.
 
@@ -389,7 +391,9 @@ the per-IP budget isn't even a real bound.
 (IP + timestamp, never the token), return 401, and fail-fast in config.js if
 ADMIN_TOKEN is short.
 
-#### S9. CSRF token is static per ADMIN_TOKEN, not per session
+#### S9. ✅ FIXED (2026-07-19) — CSRF token is static per ADMIN_TOKEN, not per session
+
+> **Resolved 2026-07-19:** login now mints a per-session random `sid` carried in the signed admin cookie, and every CSRF token is bound to `session.sid` instead of the static `tokenHash`, so a leaked token isn't valid across sessions or after re-login. Tests assert cross-session isolation in `test/unit/admin.test.js`.
 
 **Where:** `src/auth.js` `csrfToken` ~:133-135; call sites `src/admin.js`
 ~:213, ~:288, ~:326, ~:346 all pass `tokenHash` (sha256 of ADMIN_TOKEN) —
@@ -425,7 +429,9 @@ that silently un-revokes. Fails open, with no signal.
 then fsync the parent dir — guard the dir fsync for Windows dev. Admin
 actions are rare; the cost is nil.
 
-#### S11. `listMetadata()` returns rawKey and password material
+#### S11. ✅ FIXED (2026-07-19) — `listMetadata()` returns rawKey and password material
+
+> **Resolved 2026-07-19:** `store.listMetadata()` now projects onto a strict allowlist (`keyHash`, `alias`, `blocked`, `hasPassword` boolean, `createdAt`, `updatedAt`) at the source, so `rawKey` and password hash/salt can never leak through the admin API even if a caller spreads it. `admin.js` buildRows reads the `hasPassword` boolean. Test in `test/unit/store.test.js`.
 
 **Where:** `src/store.js` ~:262-267 spreads the whole record — `rawKey`,
 `password.hash`, `password.salt`.
@@ -443,7 +449,9 @@ rather than by convention at one call site (note `admin.js:140` needs
 `hasPassword` passed through explicitly, since `!!undefined` would silently
 become false).
 
-#### S12. No `Cache-Control: no-store` on admin responses
+#### S12. ✅ FIXED (2026-07-19) — No `Cache-Control: no-store` on admin responses
+
+> **Resolved 2026-07-19:** `admin.js` `sendHtml`/`sendJson` now set `Cache-Control: no-store` on every admin response. Test in `test/unit/admin.test.js`.
 
 **Where:** `src/admin.js` — every `sendHtml`/`sendJson` omits it (the only
 `no-store` in the tree is `/metrics` in server.js). The dashboard renders
@@ -452,7 +460,9 @@ shared machine, or a misconfigured intermediate cache, exposes it.
 
 **Fix:** add to `sendHtml`/`sendJson`.
 
-#### S13. `/_admin/logout` does not verify CSRF
+#### S13. ✅ FIXED (2026-07-19) — `/_admin/logout` does not verify CSRF
+
+> **Resolved 2026-07-19:** `/_admin/logout` now applies the same `verifyCsrf` gate as the other mutating form endpoints (bound to `session.sid`). Test in `test/unit/admin.test.js`.
 
 **Where:** `src/admin.js` ~:196-203, though the form in pages.js does send one.
 

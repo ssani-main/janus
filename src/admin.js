@@ -12,12 +12,17 @@
 //  - Cookie session (Feature 4) -- a signed `janus_admin` cookie, obtained
 //    via POST /_admin/login (token -> cookie), that additionally unlocks an
 //    HTML dashboard (GET /_admin) and browser form endpoints (set/clear
-//    alias, set/clear password, block/unblock), each CSRF-protected since
-//    they're reachable from a browser session.
+//    alias, set/clear password, block/unblock, logout), each CSRF-protected
+//    since they're reachable from a browser session (S13: logout included --
+//    it mutates session state just like the others).
 //
 // The admin cookie's payload is bound to a hash of the *current*
 // ADMIN_TOKEN (`th`), so rotating ADMIN_TOKEN invalidates every outstanding
 // admin session immediately, without needing a separate revocation list.
+// S9: it also carries a per-login random `sid`, which is what CSRF tokens
+// are actually bound to (see csrfToken/verifyCsrf calls below) -- `th` alone
+// would mean every session sharing one ADMIN_TOKEN also shares one CSRF
+// token, forever, which is exactly what S9 closes.
 //
 // Only reachable at all when ADMIN_TOKEN is set (server.js routes
 // /_admin/* here on the apex host only).
@@ -45,6 +50,15 @@ const FORM_BODY_MAX_BYTES = 4096
 // corrupt the in-memory store via prototype pollution.
 const KEYHASH_RE = /^[0-9a-f]{64}$/
 
+// S8: per-IP failed-login tracking for POST /_admin/login, keyed by
+// clientIp(req) (threaded in from server.js as `ip`). Module-level (not
+// per-request) so it actually accumulates across requests -- that's the
+// whole point of a lockout. Each entry is
+// `{ fails: number, lockedUntil: number, lastAt: number }`; entries are
+// pruned opportunistically (see the top of the /_admin/login handler) so a
+// distributed brute force can't grow this Map without bound.
+const loginFails = new Map()
+
 /**
  * @param {*} s
  * @returns {boolean}
@@ -55,12 +69,17 @@ function isValidKeyHash(s) {
 
 function sendJson(res, code, body) {
   const json = JSON.stringify(body)
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' })
+  // S12 -- the admin surface renders keyHashes, aliases, ports, and the live
+  // CSRF token; never let a shared/intermediate cache retain it.
+  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' })
   res.end(json)
 }
 
 function sendHtml(res, code, html) {
-  res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8' })
+  // S12 -- see sendJson above: same rationale, this is the branch that
+  // actually renders the dashboard HTML (keyHashes, aliases, ports, CSRF
+  // token).
+  res.writeHead(code, { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' })
   res.end(html)
 }
 
@@ -136,7 +155,9 @@ function buildRows(manager, store) {
       keyHash,
       alias: (m && m.alias) || null,
       blocked: !!(m && m.blocked),
-      hasPassword: !!(m && m.password),
+      // S11: listMetadata() now returns hasPassword as a plain boolean (never
+      // the password hash/salt/rawKey) -- m.password no longer exists.
+      hasPassword: !!(m && m.hasPassword),
       live: !!t,
       port: t ? t.port : null,
       inFlight: t ? t.inFlight : null,
@@ -153,9 +174,9 @@ function buildRows(manager, store) {
 /**
  * @param {import('http').IncomingMessage} req
  * @param {import('http').ServerResponse} res
- * @param {{ manager: any, config: any, store: any, sessionSecret: string }} deps
+ * @param {{ manager: any, config: any, store: any, sessionSecret: string, ip: string }} deps
  */
-async function handleAdmin(req, res, { manager, config, store, sessionSecret }) {
+async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip }) {
   if (!config.ADMIN_TOKEN) {
     sendJson(res, 404, { error: 'not found' })
     return
@@ -177,10 +198,54 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret }) 
   // --- Login / logout (cookie-session bootstrap, no prior auth required) --
 
   if (pathname === '/_admin/login' && req.method === 'POST') {
+    const now = Date.now()
+
+    // S8: opportunistically prune stale lockout records at the top of every
+    // login attempt, so loginFails can't grow unbounded under a distributed
+    // brute force (many attacking IPs, each attempted only a few times). An
+    // entry is only dropped once its lockout (if any) has already expired
+    // AND it hasn't been touched in a good while -- 10x the base lockout is
+    // comfortably longer than any legitimate retry gap.
+    for (const [k, rec] of loginFails) {
+      if (rec.lockedUntil < now && now - rec.lastAt > 10 * config.ADMIN_LOGIN_LOCKOUT_MS) {
+        loginFails.delete(k)
+      }
+    }
+
+    // S8: if this IP is currently locked out, refuse before even reading/
+    // checking the submitted token -- a locked-out attacker gets no signal
+    // about whether their guess was right or wrong.
+    const failRec = loginFails.get(ip)
+    if (failRec && failRec.lockedUntil > now) {
+      // Never log the token -- only ip + timestamp, so this line is safe to
+      // ship to any log aggregator.
+      console.warn(`[admin] login blocked (locked out): ip=${ip} at=${new Date(now).toISOString()}`)
+      const retryAfterSec = Math.ceil((failRec.lockedUntil - now) / 1000)
+      // sendHtml already sets Cache-Control: no-store (S12), but it doesn't
+      // set Retry-After, so this branch writes headers explicitly instead.
+      res.writeHead(429, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Cache-Control': 'no-store',
+        'Retry-After': String(retryAfterSec),
+      })
+      res.end(adminLoginPage({ error: 'Too many attempts, try again later.' }))
+      return
+    }
+
     const form = await readForm(req)
     const token = form.get('token') || ''
     if (timingSafeEqualStr(token, config.ADMIN_TOKEN)) {
-      const cookieVal = signSession(sessionSecret, { adm: 1, th: tokenHash, iat: Date.now() })
+      // S8: a correct login clears this IP's accumulated failure record --
+      // otherwise a legitimate operator who mistyped a few times would stay
+      // partway toward a lockout indefinitely.
+      loginFails.delete(ip)
+      // S9: bind CSRF to a per-login random `sid` carried in the signed
+      // session, so a leaked CSRF token isn't valid across sessions /
+      // forever. This does NOT change the `th` (ADMIN_TOKEN-hash) binding
+      // used to auth the session cookie itself -- rotating ADMIN_TOKEN still
+      // invalidates every outstanding session immediately.
+      const sid = crypto.randomBytes(16).toString('hex')
+      const cookieVal = signSession(sessionSecret, { adm: 1, th: tokenHash, sid, iat: Date.now() })
       const secureAttr = config.COOKIE_SECURE ? '; Secure' : ''
       res.writeHead(302, {
         'Set-Cookie': `${COOKIE_NAME}=${cookieVal}; HttpOnly; SameSite=Strict; Path=/_admin; Max-Age=${Math.floor(config.ADMIN_SESSION_TTL_MS / 1000)}${secureAttr}`,
@@ -189,11 +254,39 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret }) 
       res.end()
       return
     }
-    sendHtml(res, 200, adminLoginPage({ error: 'Incorrect token.' }))
+
+    // S8: incorrect token. Track the failure per-IP with exponential
+    // backoff once ADMIN_LOGIN_MAX_FAILS is reached (capped at 2^6 lockout
+    // multiples so a very persistent attacker doesn't get an effectively
+    // infinite lockout window either). Respond 401, NOT 200 -- a 200 on a
+    // failed login is indistinguishable from a normal page render to any
+    // log/metrics pipeline watching status codes, which is exactly the
+    // signal an operator needs to detect a brute-force attempt. Never log
+    // the submitted token, only ip + timestamp + running fail count.
+    const rec = loginFails.get(ip) || { fails: 0, lockedUntil: 0, lastAt: 0 }
+    rec.fails += 1
+    rec.lastAt = now
+    if (rec.fails >= config.ADMIN_LOGIN_MAX_FAILS) {
+      const backoffExp = Math.min(rec.fails - config.ADMIN_LOGIN_MAX_FAILS, 6)
+      rec.lockedUntil = now + config.ADMIN_LOGIN_LOCKOUT_MS * 2 ** backoffExp
+    }
+    loginFails.set(ip, rec)
+    console.warn(`[admin] failed login attempt: ip=${ip} at=${new Date(now).toISOString()} fails=${rec.fails}`)
+    sendHtml(res, 401, adminLoginPage({ error: 'Incorrect token.' }))
     return
   }
 
   if (pathname === '/_admin/logout' && req.method === 'POST') {
+    // S13: logout mutates session state (clears the cookie) and is
+    // cookie-reachable, so it needs the same CSRF gate as the other form
+    // POSTs below -- SameSite=Strict already blocks the cross-site POST
+    // today, but every other mutating form endpoint here is CSRF-protected
+    // in depth on top of SameSite, and logout was the one gap.
+    const form = await readForm(req)
+    if (!cookieValid || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
+      sendJson(res, 403, { error: 'forbidden' })
+      return
+    }
     res.writeHead(302, {
       'Set-Cookie': `${COOKIE_NAME}=; HttpOnly; SameSite=Strict; Path=/_admin; Max-Age=0`,
       'Location': '/_admin',
@@ -210,7 +303,11 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret }) 
       return
     }
     const rows = buildRows(manager, store)
-    const csrf = csrfToken(sessionSecret, tokenHash)
+    // S9: the dashboard is reachable via bearer OR cookie -- a bearer-only
+    // caller has no session (and therefore no sid) to bind a CSRF token to.
+    // That's fine: bearer callers use the JSON API below, never these HTML
+    // forms, so an empty token here is harmless.
+    const csrf = session && session.sid ? csrfToken(sessionSecret, session.sid) : ''
     sendHtml(res, 200, adminDashboardPage({ rows, csrf, config }))
     return
   }
@@ -271,7 +368,10 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret }) 
 
   if (pathname === '/_admin/alias' && req.method === 'POST') {
     const form = await readForm(req)
-    if (!cookieValid || !verifyCsrf(sessionSecret, tokenHash, form.get('csrf'))) {
+    // S9: CSRF verified against the session's sid, not the static tokenHash
+    // -- cookieValid ⇒ session is set (cookieValid checks session.adm/th),
+    // so session.sid is always readable here.
+    if (!cookieValid || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
       sendJson(res, 403, { error: 'forbidden' })
       return
     }
@@ -285,7 +385,7 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret }) 
         store.clearAlias(alias)
       }
     } catch (err) {
-      const csrf = csrfToken(sessionSecret, tokenHash)
+      const csrf = csrfToken(sessionSecret, session.sid)
       const rows = buildRows(manager, store)
       sendHtml(res, 200, adminDashboardPage({ rows, csrf, config, error: err.message }))
       return
@@ -297,7 +397,8 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret }) 
 
   if (pathname === '/_admin/password' && req.method === 'POST') {
     const form = await readForm(req)
-    if (!cookieValid || !verifyCsrf(sessionSecret, tokenHash, form.get('csrf'))) {
+    // S9: see /_admin/alias above -- CSRF is bound to session.sid.
+    if (!cookieValid || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
       sendJson(res, 403, { error: 'forbidden' })
       return
     }
@@ -323,7 +424,7 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret }) 
         store.clearPassword(keyHash)
       }
     } catch (err) {
-      const csrf = csrfToken(sessionSecret, tokenHash)
+      const csrf = csrfToken(sessionSecret, session.sid)
       const rows = buildRows(manager, store)
       sendHtml(res, 200, adminDashboardPage({ rows, csrf, config, error: err.message }))
       return
@@ -335,7 +436,8 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret }) 
 
   if (pathname === '/_admin/block' && req.method === 'POST') {
     const form = await readForm(req)
-    if (!cookieValid || !verifyCsrf(sessionSecret, tokenHash, form.get('csrf'))) {
+    // S9: see /_admin/alias above -- CSRF is bound to session.sid.
+    if (!cookieValid || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
       sendJson(res, 403, { error: 'forbidden' })
       return
     }
@@ -343,7 +445,7 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret }) 
     const keyHash = form.get('keyHash') || ''
     if (keyHash) {
       if (!isValidKeyHash(keyHash)) {
-        const csrf = csrfToken(sessionSecret, tokenHash)
+        const csrf = csrfToken(sessionSecret, session.sid)
         const rows = buildRows(manager, store)
         sendHtml(res, 200, adminDashboardPage({ rows, csrf, config, error: 'invalid keyHash' }))
         return

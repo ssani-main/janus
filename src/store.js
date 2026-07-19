@@ -370,13 +370,27 @@ class Store {
   }
 
   /**
-   * @returns {Array<object>}
+   * S11 -- never return rawKey (a live credential) or password hash/salt
+   * over the admin API; project to a safe allowlist here so a future
+   * `sendJson(res, 200, store.listMetadata())` can't leak them. This used to
+   * spread the whole record (`...this.data.keys[keyHash]`), which included
+   * `rawKey` and `password.{hash,salt}` verbatim -- the boundary must be
+   * enforced here, at the source, not left to every caller to remember.
+   *
+   * @returns {Array<{ keyHash: string, alias: ?string, blocked: boolean, hasPassword: boolean, createdAt: number, updatedAt: number }>}
    */
   listMetadata() {
-    return Object.keys(this.data.keys).map((keyHash) => ({
-      keyHash,
-      ...this.data.keys[keyHash],
-    }))
+    return Object.keys(this.data.keys).map((keyHash) => {
+      const r = this.data.keys[keyHash]
+      return {
+        keyHash,
+        alias: r.alias,
+        blocked: !!r.blocked,
+        hasPassword: !!r.password, // boolean only -- never the hash/salt
+        createdAt: r.createdAt,
+        updatedAt: r.updatedAt,
+      }
+    })
   }
 
   /**

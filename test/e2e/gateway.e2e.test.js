@@ -237,7 +237,7 @@ test('per-IP request rate limit returns 429 once exceeded', { timeout: TIMEOUT }
 test('admin API: 401 without token, 200 with token, kill+block -> 403, unblock -> 200 again', { timeout: TIMEOUT }, async () => {
   const gw = spawnGateway({
     PORT: '18103',
-    ADMIN_TOKEN: 'secret',
+    ADMIN_TOKEN: 'secret-secret-secret',
     TUNNEL_PORT_MIN: '21200',
     TUNNEL_PORT_MAX: '21299',
   })
@@ -253,7 +253,7 @@ test('admin API: 401 without token, 200 with token, kill+block -> 403, unblock -
     const noAuth = await request(18103, { pth: '/_admin/tunnels', headers: { host: BASE } })
     assert.equal(noAuth.status, 401)
 
-    const listed = await request(18103, { pth: '/_admin/tunnels', headers: { host: BASE, authorization: 'Bearer secret' } })
+    const listed = await request(18103, { pth: '/_admin/tunnels', headers: { host: BASE, authorization: 'Bearer secret-secret-secret' } })
     assert.equal(listed.status, 200)
     const parsed = JSON.parse(listed.body)
     assert.ok(parsed.count >= 1)
@@ -263,7 +263,7 @@ test('admin API: 401 without token, 200 with token, kill+block -> 403, unblock -
     const killed = await request(18103, {
       method: 'POST',
       pth: `/_admin/kill?keyHash=${keyHash}&block=1`,
-      headers: { host: BASE, authorization: 'Bearer secret' },
+      headers: { host: BASE, authorization: 'Bearer secret-secret-secret' },
     })
     assert.equal(killed.status, 200)
     assert.equal(JSON.parse(killed.body).blocked, true)
@@ -275,7 +275,7 @@ test('admin API: 401 without token, 200 with token, kill+block -> 403, unblock -
     const unblocked = await request(18103, {
       method: 'POST',
       pth: `/_admin/unblock?keyHash=${keyHash}`,
-      headers: { host: BASE, authorization: 'Bearer secret' },
+      headers: { host: BASE, authorization: 'Bearer secret-secret-secret' },
     })
     assert.equal(unblocked.status, 200)
 

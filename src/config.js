@@ -51,6 +51,20 @@ const ABUSE_EMAIL = process.env.ABUSE_EMAIL || OPERATOR_EMAIL
 // /_admin/* endpoints entirely (404) -- an operator must opt in explicitly.
 const ADMIN_TOKEN = process.env.ADMIN_TOKEN || null
 
+// S8: fail fast on a weak ADMIN_TOKEN. Still fully optional -- unset (null)
+// disables the admin surface entirely, same as before, and is not an error.
+// But once an operator DOES set one, it grants full admin API + dashboard
+// access (list every tunnel, kill/block any key, read aliases), so it must
+// not be brute-forceable. 16 chars is a hard floor, not a strong
+// recommendation -- pair it with a real random generator, not a memorable
+// phrase.
+if (ADMIN_TOKEN && ADMIN_TOKEN.length < 16) {
+  throw new Error(
+    'ADMIN_TOKEN must be at least 16 characters when set (weak admin tokens are brute-forceable); ' +
+    'set a longer random token'
+  )
+}
+
 // Whether to trust X-Forwarded-For for client IP (only correct when the
 // gateway sits behind a proxy we control, e.g. Caddy -- see TRUST_PROXY doc
 // in .env.example).
@@ -112,6 +126,15 @@ const config = {
   // sessions) since the admin session grants far more power and should be
   // shorter-lived by default. Default 12 hours.
   ADMIN_SESSION_TTL_MS: readInt('ADMIN_SESSION_TTL_MS', 43200000),
+  // S8: per-IP login-attempt lockout tuning for POST /_admin/login (see
+  // src/admin.js's `loginFails` map). ADMIN_LOGIN_MAX_FAILS is the
+  // consecutive-failure threshold before an IP starts getting locked out;
+  // ADMIN_LOGIN_LOCKOUT_MS is the base lockout duration -- each additional
+  // failure past the threshold doubles it (capped at 2^6x) so a persistent
+  // attacker faces a growing, not fixed, delay. Defaults: 5 failures / 60s
+  // base lockout.
+  ADMIN_LOGIN_MAX_FAILS: readInt('ADMIN_LOGIN_MAX_FAILS', 5),
+  ADMIN_LOGIN_LOCKOUT_MS: readInt('ADMIN_LOGIN_LOCKOUT_MS', 60000),
   // Milestone 2a: whether to emit a JSON line per request to stdout. Off by
   // default -- per-request logging is high volume and an operator should opt
   // in explicitly, same rationale as ADMIN_TOKEN being unset by default.
@@ -287,6 +310,19 @@ if (config.ENSURE_TUNNEL_TIMEOUT_MS <= config.CONNECT_TIMEOUT_MS) {
     `Invalid config: ENSURE_TUNNEL_TIMEOUT_MS (${config.ENSURE_TUNNEL_TIMEOUT_MS}) must exceed ` +
     `CONNECT_TIMEOUT_MS (${config.CONNECT_TIMEOUT_MS}) -- it bounds the whole cold-create chain, ` +
     `which includes at least one full connect attempt`
+  )
+}
+
+// S8: fail fast on nonsensical login-lockout config, same rationale as the
+// checks above.
+if (!Number.isFinite(config.ADMIN_LOGIN_MAX_FAILS) || config.ADMIN_LOGIN_MAX_FAILS < 1) {
+  throw new Error(
+    `Invalid config: ADMIN_LOGIN_MAX_FAILS (${config.ADMIN_LOGIN_MAX_FAILS}) must be a finite integer >= 1`
+  )
+}
+if (!Number.isFinite(config.ADMIN_LOGIN_LOCKOUT_MS) || config.ADMIN_LOGIN_LOCKOUT_MS < 0) {
+  throw new Error(
+    `Invalid config: ADMIN_LOGIN_LOCKOUT_MS (${config.ADMIN_LOGIN_LOCKOUT_MS}) must be a finite integer >= 0`
   )
 }
 

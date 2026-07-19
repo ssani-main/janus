@@ -491,7 +491,10 @@ const server = http.createServer(async (req, res) => {
   const route = resolveRoute(hostToKey(req.headers.host, config.BASE_DOMAIN), store)
   if (route.apex) {
     if (url.pathname.startsWith('/_admin')) {
-      await handleAdmin(req, res, { manager, config, store, sessionSecret })
+      // S8: admin.js's per-IP login lockout needs the client IP; `ip` is
+      // already computed above (clientIp(req)) for the request logger/rate
+      // limiter, so reuse it here instead of recomputing.
+      await handleAdmin(req, res, { manager, config, store, sessionSecret, ip })
       return
     }
     if (url.pathname === '/impressum') {

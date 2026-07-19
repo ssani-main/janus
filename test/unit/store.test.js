@@ -266,6 +266,64 @@ test('S7 persistence: a clearAlias-triggered rawKey purge survives a fresh load(
   assert.equal(store2.getByAlias('myalias'), undefined)
 })
 
+// S11: listMetadata() is the only view of the store's per-key metadata that
+// ever crosses the admin API boundary (see admin.js's buildRows()), so it
+// must never expose a live credential (rawKey) or a password's hash/salt --
+// only a `hasPassword` boolean. These tests pin that allowlist directly
+// against a record that actually has both a rawKey and a password set, so a
+// regression back to spreading `...record` would be caught immediately.
+
+test('S11 listMetadata: never leaks rawKey or password hash/salt; hasPassword is true when a password is set', () => {
+  const p = tmpStorePath('s11-listmetadata-with-password')
+  const store = load(p)
+  const { keyHash } = parseKey(KEY_A)
+
+  store.setAlias('myapp', KEY_A)
+  store.setPassword(keyHash, KEY_A, 'secrethash', 'secretsalt')
+
+  const rows = store.listMetadata()
+  assert.equal(rows.length, 1)
+  const row = rows[0]
+
+  // Must-have safe fields.
+  assert.ok('keyHash' in row)
+  assert.ok('alias' in row)
+  assert.ok('blocked' in row)
+  assert.ok('hasPassword' in row)
+  assert.ok('createdAt' in row)
+  assert.ok('updatedAt' in row)
+  assert.equal(row.keyHash, keyHash)
+  assert.equal(row.alias, 'myapp')
+  assert.equal(row.blocked, false)
+  assert.equal(row.hasPassword, true)
+  assert.equal(typeof row.createdAt, 'number')
+  assert.equal(typeof row.updatedAt, 'number')
+
+  // Must-NOT-have credential fields, even though the underlying record has
+  // both a live rawKey and a password hash/salt at this point.
+  assert.equal('rawKey' in row, false, 'listMetadata() must never expose rawKey')
+  assert.equal('password' in row, false, 'listMetadata() must never expose the password sub-object (hash/salt)')
+})
+
+test('S11 listMetadata: hasPassword is false for a key with no password set', () => {
+  const p = tmpStorePath('s11-listmetadata-no-password')
+  const store = load(p)
+  const { keyHash } = parseKey(KEY_B)
+
+  // setBlocked creates a bare record (rawKey: null, password: null) --
+  // exercises the "no password" branch without ever calling setPassword.
+  store.setBlocked(keyHash, true)
+
+  const rows = store.listMetadata()
+  assert.equal(rows.length, 1)
+  const row = rows[0]
+  assert.equal(row.keyHash, keyHash)
+  assert.equal(row.hasPassword, false)
+  assert.equal(row.blocked, true)
+  assert.equal('rawKey' in row, false)
+  assert.equal('password' in row, false)
+})
+
 test('load: a corrupt JSON file throws', () => {
   const p = tmpStorePath('corrupt')
   fs.writeFileSync(p, 'this is not { valid json', 'utf8')
