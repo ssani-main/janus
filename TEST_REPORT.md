@@ -7,6 +7,12 @@
 
 ---
 
+## Automated test suite (as of 2026-07-19)
+
+Beyond the primitive library verification documented below, the repository now ships an in-repo automated suite: **209 unit tests** (`npm test`) and **7 live-DHT end-to-end tests** (`npm run test:e2e`), all passing. Coverage spans the full feature set — host routing, key parsing, tunnel lifecycle / LRU eviction, circuit breaker, health probes, rate limiting, the persistent store, and the admin dashboard/API — plus the complete security audit backlog: all 13 findings (S1–S13) fixed with dedicated regression tests, and the S7 full-record-deletion feature (`store.deleteKey` / `POST /_admin/delete`). See [`ROADMAP.md`](./ROADMAP.md) for the per-finding detail and [`README.md`](./README.md) for the feature summary.
+
+---
+
 ## What was proven
 
 | Area | Check | Result | Measured |
