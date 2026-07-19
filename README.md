@@ -6,7 +6,7 @@
 
 One small always-on VPS with a single wildcard domain becomes the public front door for an arbitrary number of backend projects. Each backend runs anywhere (home PC, laptop, Pi, VPS) with **no domain, no port forwarding, no public IP**, reachable only over Holesail's [HyperDHT](https://github.com/holepunchto/hyperdht) tunnel. The gateway runs the Holesail *client* on the visitor's behalf and reverse-proxies plain HTTPS to it, so visitors just open a link.
 
-> **Status:** ✅ Built and verified end-to-end against live Holesail tunnels — Phase 0 (10/10) · Phase 1 (13/13) · Phase 2 (9/9) · Phase 3 (19/19). **Milestone 1** adds a persistent store, named aliases, optional per-key passwords, and an HTML admin dashboard. **Milestone 2** adds observability (`/healthz`, `/metrics`, structured request logging) and resilience (exponential-backoff reconnect, circuit breaker, periodic health probes, friendly offline page). See [`GATEWAY_DESIGN.md`](./GATEWAY_DESIGN.md) for the full design, [`ROADMAP.md`](./ROADMAP.md) for what's next, and [`TEST_REPORT.md`](./TEST_REPORT.md) for the verification report.
+> **Status:** ✅ Built and verified end-to-end against live Holesail tunnels — Phase 0 (10/10) · Phase 1 (13/13) · Phase 2 (9/9) · Phase 3 (19/19). **Milestone 1** adds a persistent store, named aliases, optional per-key passwords, and an HTML admin dashboard. **Milestone 2** adds observability (`/healthz`, `/metrics`, structured request logging) and resilience (exponential-backoff reconnect, circuit breaker, periodic health probes, friendly offline page). **Security:** all 13 findings from the 2026-07 audit are fixed — cross-tenant cookie isolation, X-Forwarded-For hardening, websocket-DoS bounds, `0600` store with fsync durability, credential purge on clear, and admin login lockout + per-session CSRF. **200 unit tests + 7 live-DHT e2e tests pass.** See [`GATEWAY_DESIGN.md`](./GATEWAY_DESIGN.md) for the full design, [`ROADMAP.md`](./ROADMAP.md) for the audit backlog and what's next, and [`TEST_REPORT.md`](./TEST_REPORT.md) for the verification report.
 
 ---
 
@@ -93,8 +93,9 @@ All via environment variables (see [`.env.example`](./.env.example)).
 | `IDLE_TTL_MS` | `900000` | tear down a tunnel after this long with no requests (15 min) |
 | `OPERATOR_NAME` / `OPERATOR_ADDRESS` / `OPERATOR_EMAIL` | `''` | Impressum fields; pages warn until set |
 | `ABUSE_EMAIL` | = `OPERATOR_EMAIL` | abuse contact shown on apex/ToS |
-| `ADMIN_TOKEN` | *(unset → admin disabled)* | bearer token for the operator kill-switch API |
+| `ADMIN_TOKEN` | *(unset → admin disabled)* | bearer token for the operator kill-switch API and admin dashboard login. **Must be ≥16 chars when set** — the process fails fast at startup otherwise (S8); use a long random value. |
 | `TRUST_PROXY` | `true` | trust `X-Forwarded-For` for client IP (true when behind Caddy) |
+| `TRUSTED_PROXY_HOPS` | `1` | number of trusted proxies (e.g. Caddy) in front of the gateway; `clientIp()` reads the `X-Forwarded-For` entry this many positions from the right, so a client-spoofed left-hand entry can't bypass per-IP limits (S2). Only used when `TRUST_PROXY` is true. |
 | `RATE_WINDOW_MS` | `60000` | rate-limit window |
 | `RATE_MAX_REQUESTS` | `120` | max requests per IP per window |
 | `RATE_MAX_NEW_TUNNELS` | `10` | max new (cold) tunnels per IP per window |
@@ -103,6 +104,8 @@ All via environment variables (see [`.env.example`](./.env.example)).
 | `SESSION_TTL_MS` | `604800000` | how long a visitor's passworded-key session (after login) stays valid, in milliseconds (default 7 days) |
 | `COOKIE_SECURE` | `true` | whether session cookies get the Secure attribute (HTTPS-only). Must be `true` in production — only set `false` for local HTTP-only development. |
 | `ADMIN_SESSION_TTL_MS` | `43200000` | how long an admin dashboard login session stays valid, in milliseconds (default 12 hours). Rotating `ADMIN_TOKEN` immediately invalidates all outstanding admin sessions. |
+| `ADMIN_LOGIN_MAX_FAILS` | `5` | consecutive failed `/_admin/login` attempts (per IP) before lockout begins (S8). |
+| `ADMIN_LOGIN_LOCKOUT_MS` | `60000` | base lockout duration once the failure threshold is hit, in milliseconds; each further failure doubles it (capped at 2⁶×) (S8). |
 | `LOG_REQUESTS` | `false` | whether to emit a JSON line per request to stdout (Milestone 2a). High volume; opt in explicitly. Set to `true` or `"1"` to enable. |
 | `CIRCUIT_FAILURE_THRESHOLD` | `5` | consecutive cold-create failures before a keyHash's circuit opens (Milestone 2c). Once open, further cold creates fast-fail with 503 instead of attempting a DHT round trip. |
 | `CIRCUIT_COOLDOWN_MS` | `30000` | how long a circuit stays open once it trips, in milliseconds (Milestone 2c). |
@@ -113,6 +116,9 @@ All via environment variables (see [`.env.example`](./.env.example)).
 | `HEALTH_PROBE_TIMEOUT_MS` | `2000` | per-probe connect timeout, in milliseconds (Milestone 2d). Must be well under `HEALTH_PROBE_INTERVAL_MS` so probes never stack up. |
 | `PROXY_TIMEOUT_MS` | `30000` | http-proxy idle-socket timeout for tunneled requests, in milliseconds (Milestone 2d). Detects hung backends; does NOT apply to WebSocket upgrades. |
 | `ENSURE_TUNNEL_TIMEOUT_MS` | `45000` | overall wall-clock deadline on a single `ensureTunnel` cold create, in milliseconds. Bounds the reconnect loop, port-collision retry loop, and all associated timeouts and sleeps; must exceed `CONNECT_TIMEOUT_MS`. |
+| `WS_MAX_SLOTS` | `30` (~60% of `MAX_TUNNELS`) | max distinct tunnel slots websockets may pin at once; must be `< MAX_TUNNELS` so HTTP always keeps headroom (S3). A new ws to an already-ws-pinned key is free. |
+| `WS_MAX_PER_IP` | `16` | max concurrent websocket connections a single client IP may hold (S3). |
+| `WS_IDLE_TIMEOUT_MS` | `3600000` | close a websocket after this long idle in BOTH directions, in milliseconds (default 1h); refreshes on read/write so heartbeating/server-push sockets survive; `0` disables (S3). |
 
 ---
 
