@@ -324,6 +324,100 @@ test('S11 listMetadata: hasPassword is false for a key with no password set', ()
   assert.equal('password' in row, false)
 })
 
+// S7 "fuller fix": deleteKey(keyHash) is the only path that fully removes a
+// stored record. clearAlias/clearPassword only ever null out individual
+// fields; without deleteKey an offboarded tenant's record persists forever.
+// The one wrinkle is the blocked-preservation rule: deleting a BLOCKED
+// record must not silently un-block it (the blocklist lives inside the
+// record itself, record.blocked), so a blocked record is purged (rawKey/
+// alias/password nulled, pwdVersion bumped) but kept with blocked: true --
+// only an unblocked record is actually removed from data.keys. These tests
+// pin both branches, their persistence across a fresh load(), and the
+// no-op-on-unknown-keyHash contract.
+
+test('S7 deleteKey: unblocked record is fully removed (record + alias)', () => {
+  const p = tmpStorePath('s7-deletekey-unblocked')
+  const store = load(p)
+  const { keyHash } = parseKey(KEY_A)
+
+  store.setAlias('myalias', KEY_A)
+  assert.ok(store.getKey(keyHash), 'record should exist before delete')
+  assert.deepEqual(store.getByAlias('myalias'), { keyHash, rawKey: KEY_A })
+
+  store.deleteKey(keyHash)
+
+  assert.equal(store.getKey(keyHash), undefined)
+  assert.equal(store.getByAlias('myalias'), undefined)
+  const rows = store.listMetadata()
+  assert.equal(rows.some((r) => r.keyHash === keyHash), false, 'listMetadata() must no longer list the deleted key')
+})
+
+test('S7 deleteKey: blocked record is preserved (blocked=true) but credentials are purged', () => {
+  const p = tmpStorePath('s7-deletekey-blocked')
+  const store = load(p)
+  const { keyHash } = parseKey(KEY_A)
+
+  store.setAlias('myalias', KEY_A)
+  store.setPassword(keyHash, KEY_A, 'hash1', 'salt1')
+  store.setBlocked(keyHash, true)
+
+  store.deleteKey(keyHash)
+
+  const record = store.getKey(keyHash)
+  assert.ok(record, 'a blocked record must survive deleteKey, not be dropped')
+  assert.equal(store.isBlocked(keyHash), true, 'the block itself must survive')
+  assert.equal(record.rawKey, null, 'the live credential must be purged')
+  assert.equal(record.alias, null, 'the alias field on the record must be purged')
+  assert.equal(store.getPassword(keyHash), undefined, 'the password must be purged')
+  assert.equal(store.getByAlias('myalias'), undefined, 'the alias entry must be dropped even though the record survives')
+})
+
+test("S7 deleteKey persistence: an unblocked record's removal survives a fresh load()", () => {
+  const p = tmpStorePath('s7-deletekey-unblocked-persist')
+  const store1 = load(p)
+  const { keyHash } = parseKey(KEY_A)
+
+  store1.setAlias('myalias', KEY_A)
+  store1.deleteKey(keyHash)
+  assert.equal(store1.getKey(keyHash), undefined)
+
+  const store2 = load(p)
+  assert.equal(store2.getKey(keyHash), undefined, 'removal must be persisted to disk, not just in-memory')
+  assert.equal(store2.getByAlias('myalias'), undefined)
+})
+
+test("S7 deleteKey persistence: a blocked record's purge (rawKey null, blocked true) survives a fresh load()", () => {
+  const p = tmpStorePath('s7-deletekey-blocked-persist')
+  const store1 = load(p)
+  const { keyHash } = parseKey(KEY_A)
+
+  store1.setAlias('myalias', KEY_A)
+  store1.setBlocked(keyHash, true)
+  store1.deleteKey(keyHash)
+
+  const store2 = load(p)
+  assert.equal(store2.isBlocked(keyHash), true, 'the block must be persisted to disk')
+  assert.equal(store2.getKey(keyHash).rawKey, null, 'the credential purge must be persisted to disk')
+  assert.equal(store2.getByAlias('myalias'), undefined)
+})
+
+test('S7 deleteKey: no-op on an unknown (valid-shaped) keyHash -- does not throw, store unchanged', () => {
+  const p = tmpStorePath('s7-deletekey-unknown')
+  const store = load(p)
+  const { keyHash } = parseKey(KEY_A)
+  store.setAlias('myalias', KEY_A)
+  const before = JSON.stringify(store.data)
+
+  // A well-formed 64-lowercase-hex keyHash (matches admin.js's KEYHASH_RE)
+  // that simply has no record in this store.
+  const unknownKeyHash = 'deadbeef'.repeat(8)
+  assert.doesNotThrow(() => store.deleteKey(unknownKeyHash))
+
+  assert.equal(JSON.stringify(store.data), before, 'a no-op delete must leave the store byte-for-byte unchanged')
+  assert.ok(store.getKey(keyHash), 'an unrelated record must be untouched')
+  assert.deepEqual(store.getByAlias('myalias'), { keyHash, rawKey: KEY_A })
+})
+
 test('load: a corrupt JSON file throws', () => {
   const p = tmpStorePath('corrupt')
   fs.writeFileSync(p, 'this is not { valid json', 'utf8')

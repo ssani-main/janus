@@ -360,6 +360,62 @@ class Store {
   }
 
   /**
+   * S7 "fuller fix": clearAlias/clearPassword null out rawKey once nothing
+   * still needs it, but neither of them ever removes the record itself --
+   * aliases/passwords/blocks are append-only history on that record, and an
+   * offboarded tenant's (now-empty) record persists in data.keys forever
+   * with no interface to remove it. This is the only path that fully
+   * removes a stored record, and therefore the only bound on unbounded
+   * record growth in the store file.
+   *
+   * Blocked-preservation rule: the blocklist is keyed on keyHash and lives
+   * *inside* the record (record.blocked), not in a separate structure --
+   * so deleting a blocked record outright would silently un-block an
+   * abusive tenant the moment an operator clicks "Delete". Instead, for a
+   * blocked record, this purges the live credential/alias/password (the
+   * same things clearAlias/clearPassword would purge) but keeps a bare
+   * `blocked: true` record so the block itself survives. pwdVersion is
+   * bumped (mirroring clearPassword) so any stale password cookie stops
+   * validating.
+   *
+   * Any alias entries pointing at this keyHash are always dropped, blocked
+   * or not -- a removed/purged record must never leave a dangling alias.
+   *
+   * No-op if the keyHash has no record. Returns nothing (void); like every
+   * other mutator here, success/failure is observed by re-reading the
+   * store, not via a return value.
+   *
+   * @param {string} keyHash
+   */
+  deleteKey(keyHash) {
+    const record = this.data.keys[keyHash]
+    if (!record) return
+    // Drop every alias entry that points at this key, so the aliases map
+    // never keeps a dangling reference to a removed/cleared record.
+    for (const [label, kh] of Object.entries(this.data.aliases)) {
+      if (kh === keyHash) delete this.data.aliases[label]
+    }
+    if (record.blocked) {
+      // S7: preserve the block. The blocklist is keyed on keyHash, so
+      // dropping the whole record would silently un-block an abusive
+      // tenant. Purge the live credential + metadata but keep a bare
+      // blocked record. pwdVersion is bumped (like clearPassword) so any
+      // stale password cookie stops validating.
+      record.rawKey = null
+      record.alias = null
+      if (record.password) {
+        record.pwdVersion = (record.pwdVersion || 0) + 1
+        record.password = null
+      }
+      record.updatedAt = Date.now()
+    } else {
+      // Not blocked: nothing to preserve -- remove the record entirely.
+      delete this.data.keys[keyHash]
+    }
+    this._persist()
+  }
+
+  /**
    * @param {string} keyHash
    * @returns {{ hash: string, salt: string, pwdVersion: number } | undefined}
    */

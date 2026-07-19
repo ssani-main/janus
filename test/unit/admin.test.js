@@ -97,6 +97,9 @@ function fakeStore(overrides = {}) {
     clearAlias: (alias) => recorded.push(['clearAlias', alias]),
     setPassword: (keyHash, rawKey, hash, salt) => recorded.push(['setPassword', keyHash, rawKey, hash, salt]),
     clearPassword: (keyHash) => recorded.push(['clearPassword', keyHash]),
+    // S7 "fuller fix": POST /_admin/delete calls store.deleteKey(keyHash)
+    // after tearing down any live tunnel.
+    deleteKey: (keyHash) => recorded.push(['deleteKey', keyHash]),
     ...overrides,
   }
 }
@@ -491,4 +494,94 @@ test('S9: CSRF token minted for session A is accepted when submitted under sessi
   assert.equal(res.statusCode, 302, 'the matching session\'s own CSRF token must be accepted')
   assert.equal(res.headers['Location'], '/_admin')
   assert.deepEqual(manager.recorded, [['destroy', keyHash], ['block', keyHash]])
+})
+
+// --- 12. S7 "fuller fix": POST /_admin/delete --------------------------------
+//
+// Mirrors /_admin/block: cookie session + CSRF (bound to session.sid),
+// isValidKeyHash guard with a dashboard-error re-render on failure, and on
+// success `await manager.destroyTunnel(keyHash)` then `store.deleteKey
+// (keyHash)` before the 302 redirect. deleteKey is the only endpoint that
+// fully removes a stored record (see store.js#deleteKey for the
+// blocked-preservation rule), so these tests pin the HTTP-layer contract:
+// CSRF gates it exactly like block, an invalid keyHash never reaches the
+// store, and a valid request calls both destroyTunnel and deleteKey with the
+// same keyHash.
+
+test('S7 delete: POST /_admin/delete with valid cookie but missing csrf -> 403, store.deleteKey not called', async () => {
+  const cookieVal = adminCookieValue()
+  const manager = fakeManager()
+  const store = fakeStore()
+  const keyHash = 'c'.repeat(64)
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/delete',
+    headers: { cookie: `janus_admin=${cookieVal}` },
+    body: `keyHash=${keyHash}`,
+  })
+  const res = mockRes()
+  await run(req, res, { manager, config: baseConfig(), store, sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 403)
+  assert.deepEqual(JSON.parse(res.body), { error: 'forbidden' })
+  assert.deepEqual(store.recorded, [], 'store.deleteKey must not be called without a valid csrf')
+  assert.deepEqual(manager.recorded, [], 'manager.destroyTunnel must not be called without a valid csrf')
+})
+
+test('S7 delete: POST /_admin/delete with valid cookie but wrong csrf -> 403, store.deleteKey not called', async () => {
+  const cookieVal = adminCookieValue()
+  const manager = fakeManager()
+  const store = fakeStore()
+  const keyHash = 'c'.repeat(64)
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/delete',
+    headers: { cookie: `janus_admin=${cookieVal}` },
+    body: `keyHash=${keyHash}&csrf=deadbeef`,
+  })
+  const res = mockRes()
+  await run(req, res, { manager, config: baseConfig(), store, sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 403)
+  assert.deepEqual(JSON.parse(res.body), { error: 'forbidden' })
+  assert.deepEqual(store.recorded, [], 'store.deleteKey must not be called with a wrong csrf')
+  assert.deepEqual(manager.recorded, [], 'manager.destroyTunnel must not be called with a wrong csrf')
+})
+
+test('S7 delete: POST /_admin/delete with valid cookie and correct csrf -> 302, destroyTunnel then deleteKey both called with the same keyHash', async () => {
+  const cookieVal = adminCookieValue()
+  const csrf = csrfToken(SESSION_SECRET, SID)
+  const manager = fakeManager()
+  const store = fakeStore()
+  const keyHash = 'c'.repeat(64)
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/delete',
+    headers: { cookie: `janus_admin=${cookieVal}` },
+    body: `keyHash=${keyHash}&csrf=${csrf}`,
+  })
+  const res = mockRes()
+  await run(req, res, { manager, config: baseConfig(), store, sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 302)
+  assert.equal(res.headers['Location'], '/_admin')
+  assert.deepEqual(manager.recorded, [['destroy', keyHash]])
+  assert.deepEqual(store.recorded, [['deleteKey', keyHash]])
+})
+
+test('S7 delete: POST /_admin/delete with valid cookie+csrf but a malformed keyHash -> 200 dashboard error, no delete/destroy performed', async () => {
+  const cookieVal = adminCookieValue()
+  const csrf = csrfToken(SESSION_SECRET, SID)
+  const manager = fakeManager()
+  const store = fakeStore()
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/delete',
+    headers: { cookie: `janus_admin=${cookieVal}` },
+    body: `keyHash=nothex&csrf=${csrf}`,
+  })
+  const res = mockRes()
+  await run(req, res, { manager, config: baseConfig(), store, sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 200)
+  assert.match(res.body, /invalid keyHash/)
+  assert.match(res.body, /<table>/)
+  assert.deepEqual(manager.recorded, [], 'manager.destroyTunnel must not be called for an invalid keyHash')
+  assert.deepEqual(store.recorded, [], 'store.deleteKey must not be called for an invalid keyHash')
 })

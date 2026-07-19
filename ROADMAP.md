@@ -344,7 +344,7 @@ with random tmp names a sweep becomes the only way orphans are ever reclaimed.
 
 #### S7. ✅ FIXED (2026-07-18) — `clearAlias` never clears `rawKey` — the plaintext secret cannot be deleted through any interface
 
-> **Resolved 2026-07-18 (purge-on-clear):** `clearAlias` in `src/store.js` now nulls `record.rawKey` when the record has no password (`if (!record.password) record.rawKey = null`), and `clearPassword` symmetrically nulls it when the record has no alias (`if (!record.alias) record.rawKey = null`) — so clearing a tenant's alias (or password) now actually removes the live credential from disk once no other feature still needs it. The asymmetric guards are required because `setAlias` and `setPassword` both store `rawKey`. The fuller `deleteKey()` + dashboard-button variant (full record removal, a bound on record growth) was intentionally deferred per operator decision; note it as remaining follow-up. Regression tests: `test/unit/store.test.js`.
+> **Resolved 2026-07-18 (purge-on-clear):** `clearAlias` in `src/store.js` now nulls `record.rawKey` when the record has no password (`if (!record.password) record.rawKey = null`), and `clearPassword` symmetrically nulls it when the record has no alias (`if (!record.alias) record.rawKey = null`) — so clearing a tenant's alias (or password) now actually removes the live credential from disk once no other feature still needs it. The asymmetric guards are required because `setAlias` and `setPassword` both store `rawKey`. **Update 2026-07-19:** the fuller fix is now also implemented — `store.deleteKey(keyHash)` fully removes a stored record (the only bound on record growth) and is exposed as a CSRF-protected `POST /_admin/delete` with a 'Delete' button per dashboard row. A **blocked** record is preserved (credential/alias/password purged, `blocked` flag kept) so deleting an abusive tenant can't silently un-block them. Regression tests in `test/unit/store.test.js` and `test/unit/admin.test.js`.
 
 **Where:** `src/store.js` `clearAlias` ~:203-214. Sets `record.alias = null`
 but leaves `record.rawKey` untouched. `rawKey` is set at ~:192-193 (`setAlias`)
@@ -368,8 +368,8 @@ operator running an Impressum page.
 key, drop it — `if (!record.password) record.rawKey = null`. The
 `!record.password` guard is REQUIRED: `setPassword` legitimately stores rawKey
 independently of aliasing, so an unconditional null-out breaks a passworded
-non-aliased key. Fuller fix: add `deleteKey(keyHash)` dropping the record and
-its alias entry, exposed as a dashboard button — also the only real bound on
+non-aliased key. Fuller fix (implemented 2026-07-19): `deleteKey(keyHash)` drops the record and
+its alias entry, exposed as a CSRF-protected dashboard delete button — also the only real bound on
 record growth.
 
 ### IMPORTANT

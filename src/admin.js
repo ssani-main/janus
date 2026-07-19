@@ -12,9 +12,9 @@
 //  - Cookie session (Feature 4) -- a signed `janus_admin` cookie, obtained
 //    via POST /_admin/login (token -> cookie), that additionally unlocks an
 //    HTML dashboard (GET /_admin) and browser form endpoints (set/clear
-//    alias, set/clear password, block/unblock, logout), each CSRF-protected
-//    since they're reachable from a browser session (S13: logout included --
-//    it mutates session state just like the others).
+//    alias, set/clear password, block/unblock, delete, logout), each
+//    CSRF-protected since they're reachable from a browser session (S13:
+//    logout included -- it mutates session state just like the others).
 //
 // The admin cookie's payload is bound to a hash of the *current*
 // ADMIN_TOKEN (`th`), so rotating ADMIN_TOKEN invalidates every outstanding
@@ -456,6 +456,37 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip
       } else if (action === 'unblock') {
         manager.unblock(keyHash)
       }
+    }
+    res.writeHead(302, { 'Location': '/_admin' })
+    res.end()
+    return
+  }
+
+  // S7 "fuller fix": the only endpoint that fully removes a stored record
+  // (store.deleteKey) rather than just clearing one field of it -- see
+  // store.js#deleteKey for the blocked-preservation rule (a blocked record
+  // is purged but not dropped, so the block itself survives). Modeled
+  // exactly on /_admin/block above: cookie session + CSRF via session.sid,
+  // isValidKeyHash guard, error re-render, 302 redirect on success.
+  if (pathname === '/_admin/delete' && req.method === 'POST') {
+    const form = await readForm(req)
+    // S9: see /_admin/alias above -- CSRF is bound to session.sid.
+    if (!cookieValid || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
+      sendJson(res, 403, { error: 'forbidden' })
+      return
+    }
+    const keyHash = form.get('keyHash') || ''
+    if (keyHash) {
+      if (!isValidKeyHash(keyHash)) {
+        const csrf = csrfToken(sessionSecret, session.sid)
+        const rows = buildRows(manager, store)
+        sendHtml(res, 200, adminDashboardPage({ rows, csrf, config, error: 'invalid keyHash' }))
+        return
+      }
+      // Tear down any live tunnel for this key too (deleteKey only removes
+      // stored metadata; the port stays held until the tunnel is destroyed).
+      await manager.destroyTunnel(keyHash)
+      store.deleteKey(keyHash)
     }
     res.writeHead(302, { 'Location': '/_admin' })
     res.end()

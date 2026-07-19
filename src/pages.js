@@ -91,6 +91,12 @@ const STYLE = `
   input:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
   button { padding: 0.5rem 1rem; border-radius: 4px; border: 1px solid var(--rule); background: var(--accent); color: var(--bg); font-weight: 500; cursor: pointer; }
   button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  /* S7 "fuller fix": destructive-action styling for the dashboard's Delete
+     button -- reuses the existing --warn token (already used for the
+     "blocked" status badge) rather than introducing a new color, so it
+     stays visually consistent with the rest of the theme in both
+     light/dark modes. */
+  button.danger { background: var(--warn); }
   .code { color: var(--muted); font-size: 0.85rem; margin-top: 1rem; font-variant-numeric: tabular-nums; }
   .warn { color: var(--warn); }
   .tagline { font-family: var(--font-mono); color: var(--muted); font-size: 0.85rem; letter-spacing: 0.02em; margin-top: -0.5rem; margin-bottom: 2rem; }
@@ -413,6 +419,22 @@ function adminDashboardPage({ rows, csrf, config, error }) {
     </form>`
       : ''
 
+    // S7 "fuller fix": only offer Delete where there's actually stored data
+    // to delete (alias, password, or a block) -- a purely-live row with no
+    // stored metadata has nothing for store.deleteKey to remove, and the
+    // existing Kill control already covers that case. The confirm() guard
+    // matches the destructive nature of the action (drops rawKey/alias/
+    // password; a blocked key stays blocked -- see store.js#deleteKey);
+    // these pages emit no Content-Security-Policy, so the inline onsubmit
+    // handler is safe to use.
+    const deleteForm = (row.alias || row.hasPassword || row.blocked)
+      ? `<form method="POST" action="/_admin/delete" style="display:inline-flex" onsubmit="return confirm('Delete this key\\'s stored data (alias, password, raw key)? A blocked key stays blocked.')">
+      <input type="hidden" name="csrf" value="${safeCsrf}">
+      <input type="hidden" name="keyHash" value="${safeKeyHash}">
+      <button type="submit" class="danger">Delete</button>
+    </form>`
+      : ''
+
     return `<tr>
       <td><code>${shortHash}&hellip;</code></td>
       <td>${alias}</td>
@@ -422,7 +444,7 @@ function adminDashboardPage({ rows, csrf, config, error }) {
       <td>${health}</td>
       <td>${inFlight}</td>
       <td>${lastRequestAt}</td>
-      <td style="display:flex; gap:0.5rem; flex-wrap:wrap">${blockForm}${clearAliasForm}${clearPasswordForm}</td>
+      <td style="display:flex; gap:0.5rem; flex-wrap:wrap">${blockForm}${clearAliasForm}${clearPasswordForm}${deleteForm}</td>
     </tr>`
   }).join('\n')
 
