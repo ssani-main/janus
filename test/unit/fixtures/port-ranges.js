@@ -53,6 +53,7 @@ const PORT_RANGES = [
   { file: 'tunnel-manager-health.test.js', ranges: [[20700, 20720]] },
   { file: 'tunnel-manager-ensure-tunnel-deadline.test.js', ranges: [[20800, 20810]] },
   { file: 'server-error-page-leak.test.js', ranges: [[20900, 20910]] },
+  { file: 'tunnel-manager-ws-slots.test.js', ranges: [[20960, 20965]] },
 ]
 
 /** Returns every overlap found across all declared ranges, as human-readable strings. */

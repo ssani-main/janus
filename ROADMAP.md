@@ -126,7 +126,7 @@ support lands.
 ## Security backlog (audit 2026-07-17)
 
 These findings came from a multi-dimension audit of the code as of commit
-c503e04; **S1 and S2 were fixed on 2026-07-18 (see below); everything else remains open**, and all severities assume the Linux deploy
+c503e04; **S1 and S2 were fixed on 2026-07-18; S3 and S4-mitigation were fixed on 2026-07-19 (see below); all CRITICAL findings are now resolved; remaining findings are HIGH and below**, and all severities assume the Linux deploy
 target documented in [DEPLOY.md](./DEPLOY.md).
 
 ### CRITICAL
@@ -194,7 +194,9 @@ change `clientIp()` to index from the RIGHT by a configured trusted-hop count.
 The Caddyfile fix is smallest; the `clientIp()` fix is the one that's robust
 to a misconfigured deployment.
 
-#### S3. Websockets pin tunnels permanently — gateway-wide DoS
+#### S3. ✅ FIXED (2026-07-19) — Websockets pin tunnels permanently — gateway-wide DoS
+
+> **Resolved 2026-07-19 (both parts, per the decided fix):** (a) websockets can now pin at most `WS_MAX_SLOTS` distinct tunnel slots (default ~60% of `MAX_TUNNELS`, validated `< MAX_TUNNELS` so HTTP always keeps headroom) plus a per-IP cap `WS_MAX_PER_IP` (default 16); a new ws to an already-ws-pinned key is free, so a legit app with many connections to ONE key is unaffected — only the many-distinct-keys attack shape is capped. Slot accounting lives on `TunnelManager` (`canAcceptWs`/`acquireWs`/`releaseWs`, per-record `wsCount`, `destroyTunnel` decrements safely). (b) An idle timeout `WS_IDLE_TIMEOUT_MS` (default 3600000 = 1h, `0` disables) reclaims genuinely-silent sockets via `socket.setTimeout` (refreshes on read AND write, so heartbeating/server-push sockets are never cut) — set AFTER `proxy.ws()` because http-proxy's setupSocket calls `socket.setTimeout(0)`. New `/metrics`: `janus_ws_slots`, `janus_ws_slots_max`, `janus_ws_rejected_total`. Regression tests: `test/unit/tunnel-manager-ws-slots.test.js` and `test/unit/server-ws-idle-timeout.test.js`. NOTE: with S1, S2, S3, S4-mitigation, S5, S6, S7, S10 done, S3 was the last CRITICAL.
 
 **Where:** `src/tunnel-manager.js` — `inFlight` increments at ~:435 (cached
 reuse), ~:465 (pending reuse), ~:487 (cold-create); `manager.release()`

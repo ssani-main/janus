@@ -56,6 +56,11 @@ function renderMetrics({ manager, limiter, startedAt }) {
   body += gauge('janus_circuits_open', 'Number of keyHash circuits currently open (fast-failing cold creates).', num(m.circuitsOpen))
   // Milestone 2d: aggregate-only, same rationale -- NEVER label with a keyHash.
   body += gauge('janus_tunnels_unhealthy', 'Number of currently cached tunnels the periodic health probe considers unhealthy.', num(m.unhealthy))
+  // Security audit S3: aggregate-only gauges/counter for the websocket slot
+  // cap that prevents websockets from pinning every tunnel slot forever --
+  // same "never label with a keyHash" rationale as the module-level comment.
+  body += gauge('janus_ws_slots', 'Number of tunnel slots currently pinned by at least one live websocket.', num(m.wsSlots))
+  body += gauge('janus_ws_slots_max', 'Configured maximum number of tunnel slots websockets may pin at once (WS_MAX_SLOTS).', num(m.wsSlotsMax))
 
   body += counter('janus_tunnels_created_total', 'Total number of tunnels created since process start.', num(m.created))
   body += counter('janus_tunnels_evicted_total', 'Total number of tunnels evicted to make room for a new one.', num(m.evicted))
@@ -67,6 +72,10 @@ function renderMetrics({ manager, limiter, startedAt }) {
   body += counter('janus_reconnect_successes_total', 'Total number of reconnect attempts that succeeded.', num(m.reconnectSuccesses))
   body += counter('janus_health_probes_total', 'Total number of periodic tunnel health probes performed.', num(m.healthProbes))
   body += counter('janus_health_probe_failures_total', 'Total number of periodic tunnel health probes that failed.', num(m.healthProbeFailures))
+  // Security audit S3: cumulative count of websocket upgrades rejected by
+  // the WS_MAX_SLOTS / WS_MAX_PER_IP caps -- see tunnel-manager.js's
+  // noteWsRejected and src/server.js's upgrade handler.
+  body += counter('janus_ws_rejected_total', 'Total number of websocket upgrades rejected by the WS_MAX_SLOTS/WS_MAX_PER_IP caps.', num(m.wsRejected))
 
   body += help('janus_ratelimit_hits_total', 'Total number of requests denied by the rate limiter, by dimension.')
   body += type('janus_ratelimit_hits_total', 'counter')

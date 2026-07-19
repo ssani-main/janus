@@ -61,6 +61,11 @@ function readBool(name, def) {
 }
 const TRUST_PROXY = readBool('TRUST_PROXY', true)
 
+// Security audit S3: hoisted to a local const (same pattern as TRUST_PROXY
+// above) so WS_MAX_SLOTS's default below can be derived from it -- it must
+// exist before the config object literal, not just as a property on it.
+const MAX_TUNNELS = readInt('MAX_TUNNELS', 50)
+
 const config = {
   PORT: readInt('PORT', 3000),
   BIND_HOST: process.env.BIND_HOST || '127.0.0.1',
@@ -70,7 +75,7 @@ const config = {
   TUNNEL_PORT_MAX: readInt('TUNNEL_PORT_MAX', 20999),
   CONNECT_TIMEOUT_MS: readInt('CONNECT_TIMEOUT_MS', 8000),
   IDLE_TTL_MS: readInt('IDLE_TTL_MS', 900000),
-  MAX_TUNNELS: readInt('MAX_TUNNELS', 50),
+  MAX_TUNNELS,
   OPERATOR_NAME,
   OPERATOR_ADDRESS,
   OPERATOR_EMAIL,
@@ -169,6 +174,30 @@ const config = {
   // successful cold create (one DHT round trip well under
   // CONNECT_TIMEOUT_MS=8000), far below the ~175s worst case.
   ENSURE_TUNNEL_TIMEOUT_MS: readInt('ENSURE_TUNNEL_TIMEOUT_MS', 45000),
+  // Security audit S3: a websocket upgrade that pins its tunnel and never
+  // closes (a hung/hostile client that just never sends the TCP FIN) used to
+  // be able to pin EVERY tunnel slot forever -- inFlight never drains, which
+  // blocks both _pickEvictable (skips inFlight>0) and the 60s sweeper
+  // (requires inFlight===0), so plain HTTP visitors got CapacityError with
+  // no recovery path. WS_MAX_SLOTS caps how many DISTINCT tunnel slots
+  // websockets may pin at once, leaving HTTP always with headroom (see
+  // tunnel-manager.js's canAcceptWs/acquireWs/releaseWs -- a new websocket
+  // to an ALREADY-ws-pinned key is always allowed; only lighting up a fresh
+  // ws slot counts against this cap, so a legit app with many connections to
+  // one key is unaffected). Default ~60% of MAX_TUNNELS.
+  WS_MAX_SLOTS: readInt('WS_MAX_SLOTS', Math.max(1, Math.floor(MAX_TUNNELS * 0.6))),
+  // Security audit S3: max concurrent websocket upgrades a single client IP
+  // may hold at once, independent of WS_MAX_SLOTS -- bounds a single attacker
+  // from using up the entire ws slot budget by itself. Default 16.
+  WS_MAX_PER_IP: readInt('WS_MAX_PER_IP', 16),
+  // Security audit S3: idle timeout for a websocket connection, enforced via
+  // socket.setTimeout() -- Node refreshes this timer on BOTH read and write,
+  // so an actively heartbeating or server-pushing socket is never cut; only
+  // a genuinely silent one times out and gets destroyed, which drains
+  // inFlight/wsCount via the existing close handler and lets the tunnel be
+  // reclaimed normally. Default 1 hour; 0 disables (operator opt-out for
+  // legitimately silent long-lived websockets).
+  WS_IDLE_TIMEOUT_MS: readInt('WS_IDLE_TIMEOUT_MS', 3600000),
 }
 
 if (config.TUNNEL_PORT_MIN >= config.TUNNEL_PORT_MAX) {
@@ -274,6 +303,29 @@ if (config.TRUST_PROXY) {
       `and this gateway, and clientIp() indexes X-Forwarded-For from the right by this amount`
     )
   }
+}
+
+// Security audit S3: fail fast on a nonsensical ws slot cap. Must be a
+// finite integer strictly less than MAX_TUNNELS -- websockets must never be
+// able to pin every slot, or an HTTP visitor could be starved with no
+// recovery path (the exact bug this fix closes). Strict `<` (not `<=`)
+// deliberately leaves at least one slot always reachable by plain HTTP.
+if (!Number.isInteger(config.WS_MAX_SLOTS) || config.WS_MAX_SLOTS < 1 || config.WS_MAX_SLOTS >= config.MAX_TUNNELS) {
+  throw new Error(
+    `Invalid config: WS_MAX_SLOTS (${config.WS_MAX_SLOTS}) must be a finite integer with ` +
+    `1 <= WS_MAX_SLOTS < MAX_TUNNELS (${config.MAX_TUNNELS}) -- websockets must never be able to pin ` +
+    `every tunnel slot, or HTTP visitors would have no headroom left`
+  )
+}
+if (!Number.isInteger(config.WS_MAX_PER_IP) || config.WS_MAX_PER_IP < 1) {
+  throw new Error(
+    `Invalid config: WS_MAX_PER_IP (${config.WS_MAX_PER_IP}) must be a finite integer >= 1`
+  )
+}
+if (!Number.isInteger(config.WS_IDLE_TIMEOUT_MS) || config.WS_IDLE_TIMEOUT_MS < 0) {
+  throw new Error(
+    `Invalid config: WS_IDLE_TIMEOUT_MS (${config.WS_IDLE_TIMEOUT_MS}) must be a finite integer >= 0 (0 disables it)`
+  )
 }
 
 module.exports = Object.freeze(config)

@@ -385,6 +385,13 @@ class TunnelManager {
     // in-memory-only shim with the same isBlocked/setBlocked surface.
     this.store = store || _inMemoryStoreShim()
     this.clientFactory = clientFactory || ((opts) => new HolesailClient(opts))
+    // Security audit S3: manager-level count of DISTINCT tunnel records
+    // currently pinned by at least one live websocket (i.e. the number of
+    // records with wsCount > 0), NOT a count of websocket connections
+    // themselves -- see canAcceptWs/acquireWs/releaseWs below. Compared
+    // against config.WS_MAX_SLOTS to bound how many tunnel slots websockets
+    // may hold open at once, leaving HTTP visitors always with headroom.
+    this._wsSlotCount = 0
     // Milestone 2a: cumulative, monotonically-increasing counters for the
     // /metrics endpoint -- unlike `this.tunnels`, these never shrink, so an
     // operator can see totals across the process lifetime, not just current
@@ -402,6 +409,9 @@ class TunnelManager {
       // Milestone 2d: cumulative health-probe counters.
       healthProbes: 0,
       healthProbeFailures: 0,
+      // Security audit S3: cumulative count of websocket upgrades rejected
+      // by the WS_MAX_SLOTS / WS_MAX_PER_IP caps (see noteWsRejected below).
+      wsRejected: 0,
     }
   }
 
@@ -670,6 +680,13 @@ class TunnelManager {
         // when `healthy` actually flips false; see
         // HEALTH_PROBE_UNHEALTHY_STREAK above.
         _probeFailStreak: 0,
+        // Security audit S3: number of LIVE websocket connections currently
+        // pinning this slot. Tracked per-record (not just a manager-level
+        // total) so canAcceptWs/acquireWs/releaseWs below can tell "a new ws
+        // to an already-ws-pinned key" (free) apart from "a new ws to a
+        // key with zero live ws connections" (consumes a slot against
+        // WS_MAX_SLOTS) -- see those methods' doc comments.
+        wsCount: 0,
       }
       this.tunnels.set(parsed.keyHash, record)
       this.counters.created++
@@ -769,6 +786,66 @@ class TunnelManager {
   }
 
   /**
+   * Security audit S3: whether a NEW websocket upgrade for `keyHash` may
+   * proceed under the WS_MAX_SLOTS cap. A websocket reusing a slot that's
+   * already ws-pinned (an already-cached tunnel with wsCount > 0) is always
+   * allowed and consumes no additional slot -- a legitimate app that opens
+   * many websocket connections to ONE key must not be penalized for it; only
+   * lighting up a brand-new ws slot (the first live websocket for a given
+   * key) counts against the global cap.
+   *
+   * Small acceptable race, same shape/rationale as `_createTunnel`'s
+   * documented MAX_TUNNELS overshoot: this is checked in server.js's
+   * upgrade handler BEFORE the async `ensureTunnel` call settles, so several
+   * concurrent upgrades for distinct new keys can all observe
+   * `_wsSlotCount < WS_MAX_SLOTS` and all proceed, momentarily overshooting
+   * the cap by the number of in-flight upgrades. This is acceptable and
+   * self-correcting (the cap is re-checked on every new upgrade), not a bug.
+   *
+   * @param {string} keyHash
+   * @returns {boolean}
+   */
+  canAcceptWs(keyHash) {
+    const rec = this.tunnels.get(keyHash)
+    if (rec && rec.wsCount > 0) return true // existing ws slot, no new slot needed
+    return this._wsSlotCount < this.config.WS_MAX_SLOTS
+  }
+
+  /**
+   * Security audit S3: register one live websocket against `record`,
+   * incrementing the global `_wsSlotCount` only the first time this record
+   * transitions from zero to one live websocket (i.e. only when a NEW slot
+   * is actually consumed). Must be paired 1:1 with `releaseWs` below.
+   * @param {{ wsCount: number }} record
+   */
+  acquireWs(record) {
+    if (!record) return
+    if (record.wsCount === 0) this._wsSlotCount++
+    record.wsCount++
+  }
+
+  /**
+   * Reverse of `acquireWs`. Decrements the global `_wsSlotCount` only when
+   * this record's last live websocket goes away (wsCount drops back to
+   * zero), freeing its slot back up for another key.
+   * @param {{ wsCount: number }} record
+   */
+  releaseWs(record) {
+    if (!record || record.wsCount <= 0) return
+    record.wsCount--
+    if (record.wsCount === 0) this._wsSlotCount--
+  }
+
+  /**
+   * Security audit S3: bump the cumulative counter of websocket upgrades
+   * rejected by the WS_MAX_SLOTS / WS_MAX_PER_IP caps -- called from
+   * server.js's upgrade handler.
+   */
+  noteWsRejected() {
+    this.counters.wsRejected++
+  }
+
+  /**
    * Bump the last-activity timestamp for a cached tunnel (used by the idle
    * sweeper's real-activity signal).
    * @param {string} keyHash
@@ -834,7 +911,7 @@ class TunnelManager {
    * Snapshot of current + cumulative tunnel stats for the /metrics endpoint.
    * Returns a copy (not the live counters object) so callers can't mutate
    * our internal state.
-   * @returns {{ active: number, pending: number, maxTunnels: number, circuitsOpen: number, created: number, evicted: number, swept: number, connectFailures: number, portRetries: number, circuitOpens: number, reconnectAttempts: number, reconnectSuccesses: number }}
+   * @returns {{ active: number, pending: number, maxTunnels: number, circuitsOpen: number, created: number, evicted: number, swept: number, connectFailures: number, portRetries: number, circuitOpens: number, reconnectAttempts: number, reconnectSuccesses: number, wsSlots: number, wsSlotsMax: number, wsRejected: number }}
    */
   stats() {
     // circuitsOpen is a live GAUGE (unlike the cumulative counters spread in
@@ -860,6 +937,13 @@ class TunnelManager {
       maxTunnels: this.config.MAX_TUNNELS,
       circuitsOpen,
       unhealthy,
+      // Security audit S3: wsSlots is a live GAUGE (like circuitsOpen/
+      // unhealthy above), NOT a cumulative counter -- it must reflect how
+      // many tunnel slots are ws-pinned RIGHT NOW. wsRejected (spread in via
+      // ...this.counters below) IS cumulative, same as the rest of
+      // this.counters.
+      wsSlots: this._wsSlotCount,
+      wsSlotsMax: this.config.WS_MAX_SLOTS,
       ...this.counters,
     }
   }
@@ -889,6 +973,24 @@ class TunnelManager {
   async destroyTunnel(keyHash) {
     const record = this.tunnels.get(keyHash)
     if (!record) return
+    // Security audit S3: a tunnel can be destroyed while still ws-pinned
+    // (e.g. an operator kill via the admin API, or a probe-failure-streak
+    // eviction) -- the websocket(s) themselves don't get a chance to run
+    // `releaseWs` first, so without this the global `_wsSlotCount` would
+    // leak a slot forever. Decrement it here, once, before the record is
+    // dropped. Deliberately does NOT touch `inFlight` -- that's a separate
+    // concern already handled by the existing release()/sweeper machinery.
+    if (record.wsCount > 0) {
+      this._wsSlotCount--
+      // Zero it too: this same record object is still referenced by the
+      // ws upgrade handler's `close` -> release() -> releaseWs(record)
+      // closure in server.js. Left non-zero, that later releaseWs would see
+      // wsCount > 0 and decrement `_wsSlotCount` a SECOND time, drifting the
+      // gauge negative and eventually defeating the WS_MAX_SLOTS cap
+      // (canAcceptWs compares _wsSlotCount < WS_MAX_SLOTS). Zeroing here
+      // makes that later releaseWs a no-op (it guards on wsCount <= 0).
+      record.wsCount = 0
+    }
     this.tunnels.delete(keyHash)
     try {
       await record.client.destroy()

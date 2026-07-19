@@ -43,6 +43,14 @@ const COOKIE_NAME = 'janus_auth'
 const LOGIN_PATH = '/__janus_login'
 const LOGIN_BODY_MAX_BYTES = 4096
 
+// Security audit S3: per-IP count of currently-live websocket upgrades,
+// independent of TunnelManager's per-tunnel-slot accounting (WS_MAX_SLOTS)
+// below -- bounds a single client IP from using up the entire ws slot
+// budget by itself. Reserved eagerly (before the cold-create rate limit and
+// ensureTunnel) and released exactly once via releaseIp() in the upgrade
+// handler, however the upgrade attempt ends.
+const wsByIp = new Map()
+
 const manager = new TunnelManager(config, store)
 manager.startSweeper()
 manager.startHealthProbing()
@@ -638,10 +646,35 @@ server.on('upgrade', async (req, socket, head) => {
     }
   }
 
+  // Security audit S3: enforce the ws slot cap (manager.canAcceptWs --
+  // websockets must never be able to pin every tunnel slot, starving HTTP)
+  // and the per-IP ws cap BEFORE the cold-create rate limit / ensureTunnel,
+  // so a client that's already at either cap never even reaches the
+  // expensive path. The slot cap only applies when keyHash is known -- an
+  // unparseable key falls through to ensureTunnel's KeyError as today.
+  const perIp = wsByIp.get(ip) || 0
+  if (perIp >= config.WS_MAX_PER_IP || (keyHash && !manager.canAcceptWs(keyHash))) {
+    manager.noteWsRejected()
+    socket.destroy()
+    return
+  }
+  // Reserve the per-IP slot now (also bounds concurrent cold-creates per IP
+  // for the same reason -- a burst of upgrades from one IP can't all race
+  // past the check above before any of them finishes ensureTunnel).
+  wsByIp.set(ip, perIp + 1)
+  let ipReleased = false
+  const releaseIp = () => {
+    if (ipReleased) return
+    ipReleased = true
+    const n = (wsByIp.get(ip) || 1) - 1
+    if (n <= 0) wsByIp.delete(ip); else wsByIp.set(ip, n)
+  }
+
   const cold = !manager.isCached(rawKey)
   if (cold) {
     const t = limiter.allowNewTunnel(ip)
     if (!t.ok) {
+      releaseIp()
       socket.destroy()
       return
     }
@@ -652,6 +685,7 @@ server.on('upgrade', async (req, socket, head) => {
     tunnel = await manager.ensureTunnel(rawKey)
   } catch (err) {
     console.error(`${err.name || 'Error'} handling websocket upgrade: ${err.message}`)
+    releaseIp()
     socket.destroy()
     return
   }
@@ -661,12 +695,21 @@ server.on('upgrade', async (req, socket, head) => {
   // tunnel too (there is no 'proxyRes' equivalent on the ws path).
   req._janusTunnel = tunnel
 
+  // Security audit S3: register this websocket against its tunnel's ws slot
+  // accounting -- see tunnel-manager.js's acquireWs doc comment for why this
+  // only consumes a NEW global slot the first time this record goes from
+  // zero to one live websocket.
+  manager.acquireWs(tunnel)
+
+  // The single release below must undo ALL THREE reservations made above
+  // (inFlight, ws slot, per-IP count) exactly once, however the socket ends.
   let released = false
   const release = () => {
-    if (!released) {
-      released = true
-      manager.release(tunnel)
-    }
+    if (released) return
+    released = true
+    manager.release(tunnel)     // existing inFlight--
+    manager.releaseWs(tunnel)   // S3: ws slot refcount
+    releaseIp()                 // S3: per-IP counter
   }
   socket.on('close', release)
 
@@ -674,6 +717,21 @@ server.on('upgrade', async (req, socket, head) => {
     target: `http://127.0.0.1:${tunnel.port}`,
     changeOrigin: false,
   })
+
+  // S3: reclaim a genuinely-idle websocket. socket.setTimeout refreshes on
+  // read AND write, so an actively heartbeating or server-pushing socket is
+  // never cut; only a truly silent one times out. Destroying the socket
+  // fires 'close' -> release() above, dropping inFlight and the ws slot so
+  // the sweeper/_pickEvictable can reclaim the tunnel. 0 disables (operator
+  // opt-out for legitimately silent long-lived ws).
+  //
+  // MUST be set AFTER proxy.ws(): http-proxy's setupSocket() (common.js)
+  // synchronously calls socket.setTimeout(0) inside proxy.ws(), which would
+  // otherwise cancel a timeout set beforehand. Applying it here, after that
+  // pass has run, makes it stick.
+  if (config.WS_IDLE_TIMEOUT_MS > 0) {
+    socket.setTimeout(config.WS_IDLE_TIMEOUT_MS, () => socket.destroy())
+  }
 })
 
 let shuttingDown = false
