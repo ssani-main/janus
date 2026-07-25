@@ -286,3 +286,88 @@ test('health probe: stops firing once shutdown() is called', async (t) => {
     manager.stopSweeper()
   }
 })
+
+// --- HEALTH_PROBE_UNHEALTHY_STREAK is operator-tunable ----------------------
+//
+// The streak used to be a hardcoded module constant, which made the
+// "how twitchy is probe-driven eviction" trade-off unreachable to operators
+// in a codebase where far less consequential values are configurable. These
+// tests pin both ends of the range against the same dead-backend topology
+// the default-streak test at the top of this file uses.
+
+test('HEALTH_PROBE_UNHEALTHY_STREAK: 1 evicts on the very first failed probe', async () => {
+  const manager = new TunnelManager(
+    baseConfig({ HEALTH_PROBE_UNHEALTHY_STREAK: 1 }),
+    undefined,
+    () => new FakeHolesailClient()
+  )
+  const record = await manager.ensureTunnel(KEY_A)
+  manager.release(record)
+  await closeServer(record.client._server) // kill the backing listener
+
+  await manager._probeTunnels()
+  assert.equal(record.healthy, false, 'a streak of 1 must flip healthy on the first failure')
+  assert.equal(
+    manager.tunnels.has(record.keyHash),
+    false,
+    'reaching the streak destroys the tunnel outright, same as the default path'
+  )
+})
+
+test('HEALTH_PROBE_UNHEALTHY_STREAK: a higher value tolerates more consecutive misses before evicting', async () => {
+  const manager = new TunnelManager(
+    baseConfig({ HEALTH_PROBE_UNHEALTHY_STREAK: 3 }),
+    undefined,
+    () => new FakeHolesailClient()
+  )
+  const record = await manager.ensureTunnel(KEY_A)
+  manager.release(record)
+  await closeServer(record.client._server)
+
+  await manager._probeTunnels()
+  await manager._probeTunnels()
+  assert.equal(record.healthy, true, 'two failures is still under a streak of 3')
+  assert.equal(manager.tunnels.has(record.keyHash), true, 'and the tunnel must still be cached')
+
+  await manager._probeTunnels()
+  assert.equal(record.healthy, false, 'the third consecutive failure reaches the streak')
+  assert.equal(manager.tunnels.has(record.keyHash), false)
+})
+
+test('HEALTH_PROBE_UNHEALTHY_STREAK: a single success still resets the streak (recovery stays asymmetric)', async () => {
+  // The knob only tunes how many failures it takes to give up -- it must not
+  // change the other half of the open-by-default trade-off, where ONE good
+  // probe immediately clears the streak.
+  const manager = new TunnelManager(
+    baseConfig({ HEALTH_PROBE_UNHEALTHY_STREAK: 3 }),
+    undefined,
+    () => new FakeHolesailClient()
+  )
+  const record = await manager.ensureTunnel(KEY_A)
+  manager.release(record)
+
+  const deadListener = record.client._server
+  await closeServer(deadListener)
+  await manager._probeTunnels()
+  await manager._probeTunnels()
+  assert.equal(record._probeFailStreak, 2)
+
+  // Bring the port back up, then probe once -- the streak must reset to 0,
+  // so the next two failures alone can no longer reach the limit.
+  const revived = net.createServer()
+  await new Promise((resolve) => revived.listen(record.port, '127.0.0.1', resolve))
+  try {
+    await manager._probeTunnels()
+    assert.equal(record._probeFailStreak, 0, 'one success must clear the whole streak')
+    assert.equal(record.healthy, true)
+  } finally {
+    await closeServer(revived)
+  }
+
+  await manager._probeTunnels()
+  await manager._probeTunnels()
+  assert.equal(record.healthy, true, 'two post-reset failures are still under the streak of 3')
+  assert.equal(manager.tunnels.has(record.keyHash), true)
+
+  await manager.destroyTunnel(record.keyHash)
+})

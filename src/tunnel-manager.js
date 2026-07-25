@@ -80,7 +80,14 @@ function _inMemoryStoreShim() {
 // create before giving up and surfacing a ConnectError. Bounds the retry
 // loop below so a badly-fragmented pool can't turn one request into an
 // unbounded scan.
-const MAX_PORT_ATTEMPTS = 5
+//
+// Now operator-tunable via config.MAX_PORT_ATTEMPTS (see src/config.js) --
+// this is the fallback used when `config` doesn't define it at all, same
+// rationale as the DEFAULT_* constants below: several hand-rolled unit-test
+// configs predate the knob, and `attempt < undefined` is always false, which
+// would turn the port-collision loop into an immediate no-op that never
+// tries a single port.
+const DEFAULT_MAX_PORT_ATTEMPTS = 5
 
 // Milestone 2c: fallback defaults used ONLY when `config` doesn't define
 // these fields at all (`undefined`, not merely falsy/0). src/config.js
@@ -124,7 +131,12 @@ const DEFAULT_ENSURE_TUNNEL_TIMEOUT_MS = 45000
 // after the backend has recovered is the costlier mistake (it would keep
 // serving the friendlier-but-still-an-error offline page to real, working
 // traffic).
-const HEALTH_PROBE_UNHEALTHY_STREAK = 2
+// Now operator-tunable via config.HEALTH_PROBE_UNHEALTHY_STREAK (see
+// src/config.js) -- this is the fallback for configs that don't define it,
+// same rationale as the other DEFAULT_* constants here. It is effectively
+// the "how twitchy is probe-driven eviction" dial: 1 evicts on any single
+// blip, higher values tolerate more consecutive misses before acting.
+const DEFAULT_HEALTH_PROBE_UNHEALTHY_STREAK = 2
 
 /**
  * Cheap pre-flight check: bind a throwaway net.Server on host:port and
@@ -540,6 +552,19 @@ class TunnelManager {
     // stores in `this.pending` for this keyHash, so concurrent callers for
     // the same key share this one retry/backoff chain instead of each
     // kicking off their own.
+    //
+    // Circuit accounting: `recordFailure` fires EXACTLY ONCE per rejected
+    // `_createTunnel` call -- at each of the three throw sites below, never
+    // once per reconnect attempt. It used to be per-attempt, which silently
+    // coupled two independent knobs: with the shipped defaults
+    // (RECONNECT_MAX_ATTEMPTS=3 -> 4 attempts, CIRCUIT_FAILURE_THRESHOLD=5)
+    // ONE failed request contributed 4 failures, so the circuit opened
+    // partway through the SECOND failed request rather than the fifth, and
+    // raising RECONNECT_MAX_ATTEMPTS silently made the breaker more
+    // trigger-happy. The reconnect loop is this method's internal retry
+    // policy; the breaker's job is to count how many times a *request* to
+    // this backend has failed. One cold create = one failure, so
+    // CIRCUIT_FAILURE_THRESHOLD now means what its name and docs say.
     let lastErr
     for (let attempt = 0; ; attempt++) {
       // FIX 2: check the overall deadline before every attempt, including
@@ -547,6 +572,7 @@ class TunnelManager {
       // request was queued behind `this.pending` (dedupe) must fail fast,
       // not pay for one more full connect attempt.
       if (Date.now() >= deadlineAt) {
+        this.recordFailure(parsed.keyHash)
         throw new ConnectError(
           `failed to connect tunnel for key: ensureTunnel exceeded its ${this.config.ENSURE_TUNNEL_TIMEOUT_MS ?? DEFAULT_ENSURE_TUNNEL_TIMEOUT_MS}ms deadline`,
           lastErr
@@ -559,9 +585,9 @@ class TunnelManager {
         return record
       } catch (err) {
         lastErr = err
-        this.recordFailure(parsed.keyHash)
         const maxAttempts = this.config.RECONNECT_MAX_ATTEMPTS ?? DEFAULT_RECONNECT_MAX_ATTEMPTS
         if (attempt >= maxAttempts) {
+          this.recordFailure(parsed.keyHash)
           throw lastErr
         }
         // FIX 2: don't bother backing off (or retrying at all) once the
@@ -570,6 +596,7 @@ class TunnelManager {
         // caller already has a concrete failure reason from this attempt.
         const remainingMs = deadlineAt - Date.now()
         if (remainingMs <= 0) {
+          this.recordFailure(parsed.keyHash)
           throw lastErr
         }
         this.counters.reconnectAttempts++
@@ -603,8 +630,9 @@ class TunnelManager {
    *   timeout is shrunk to never itself extend past this deadline.
    */
   async _attemptPortConnect(parsed, deadlineAt) {
+    const maxPortAttempts = this.config.MAX_PORT_ATTEMPTS ?? DEFAULT_MAX_PORT_ATTEMPTS
     let lastErr
-    for (let attempt = 0; attempt < MAX_PORT_ATTEMPTS; attempt++) {
+    for (let attempt = 0; attempt < maxPortAttempts; attempt++) {
       // FIX 2: the reconnect loop above already checks the deadline before
       // calling us, but the port-collision loop here can burn its own time
       // across multiple ports within a single `_createTunnel` attempt --
@@ -652,7 +680,7 @@ class TunnelManager {
         this.portPool.release(port)
         lastErr = err
 
-        if (isPortCollisionError(err) && attempt < MAX_PORT_ATTEMPTS - 1) {
+        if (isPortCollisionError(err) && attempt < maxPortAttempts - 1) {
           // Try the next port from the pool. Do NOT evict another tunnel to
           // free one up -- that causes eviction thrash; just move on.
           this.counters.portRetries++
@@ -677,8 +705,9 @@ class TunnelManager {
         lastProbeAt: null,
         // Internal-only bookkeeping (not part of the sanitized `list()`
         // shape below) -- consecutive failed-probe streak used to decide
-        // when `healthy` actually flips false; see
-        // HEALTH_PROBE_UNHEALTHY_STREAK above.
+        // when `healthy` actually flips false; compared against
+        // config.HEALTH_PROBE_UNHEALTHY_STREAK (see
+        // DEFAULT_HEALTH_PROBE_UNHEALTHY_STREAK above for the fallback).
         _probeFailStreak: 0,
         // Security audit S3: number of LIVE websocket connections currently
         // pinning this slot. Tracked per-record (not just a manager-level
@@ -696,7 +725,7 @@ class TunnelManager {
     // Unreachable in practice (the loop above always either returns or
     // throws), but keeps the function's return type honest for tooling.
     throw new ConnectError(
-      `failed to connect tunnel for key: exhausted ${MAX_PORT_ATTEMPTS} port attempts`,
+      `failed to connect tunnel for key: exhausted ${maxPortAttempts} port attempts`,
       lastErr
     )
   }
@@ -709,8 +738,9 @@ class TunnelManager {
    * again right after its cooldown expires re-opens the circuit instead of
    * silently falling back to "closed" forever.
    *
-   * Callers, by design: a cold-create ConnectError (`_createTunnel`'s
-   * reconnect loop, below) and a real proxied-request error
+   * Callers, by design: a cold-create ConnectError (`_createTunnel`, once
+   * per rejected call -- NOT once per reconnect attempt; see its reconnect
+   * loop's "Circuit accounting" note) and a real proxied-request error
    * (proxy.on('error') in server.js). Both are strong signals -- an actual
    * attempt to reach the real backend failed. The periodic health probe
    * (Milestone 2d, `_probeOne` below) is deliberately NOT a caller: a
@@ -760,11 +790,25 @@ class TunnelManager {
    * Pick the least-recently-used tunnel that has no in-flight work (i.e. is
    * safe to evict without cutting off an active request/websocket). Returns
    * null if every cached tunnel is currently active.
+   *
+   * Records whose keyHash is still in `this.pending` are skipped even though
+   * their `inFlight` is 0. `_attemptPortConnect` publishes a brand-new record
+   * into `this.tunnels` with `inFlight: 0`, and the caller that asked for it
+   * only increments `inFlight` after `ensureTunnel`'s `await p` resumes --
+   * so there is a window where a freshly-created, not-yet-claimed record
+   * looks idle. At MAX_TUNNELS with every OTHER tunnel busy, that record is
+   * the only evictable one, so a concurrent cold create for a DIFFERENT key
+   * would destroy it out from under the caller who is about to use it (which
+   * then proxies through an already-destroyed client and 502s). `this.pending`
+   * is deleted in `ensureTunnel`'s `finally` and the claiming `inFlight++`
+   * runs in the same synchronous continuation, so "still pending" exactly
+   * covers the unclaimed window with no gap for another task to interleave.
    */
   _pickEvictable() {
     let victim = null
     for (const record of this.tunnels.values()) {
       if (record.inFlight > 0) continue
+      if (this.pending.has(record.keyHash)) continue
       if (!victim || record.lastRequestAt < victim.lastRequestAt) {
         victim = record
       }
@@ -1109,7 +1153,8 @@ class TunnelManager {
    * real traffic. See `recordFailure`'s doc comment for which signals are
    * strong enough to do that.
    *
-   * Instead, a probe failure streak reaching HEALTH_PROBE_UNHEALTHY_STREAK
+   * Instead, a probe failure streak reaching
+   * config.HEALTH_PROBE_UNHEALTHY_STREAK
    * destroys the tunnel outright (see destroyTunnel below) rather than just
    * flipping `healthy` and leaving the dead record cached indefinitely --
    * that is precisely what used to pin a dead backend's tunnel forever (no
@@ -1150,8 +1195,11 @@ class TunnelManager {
       record._probeFailStreak = (record._probeFailStreak || 0) + 1
       // "Open by default": a single failed probe must never be enough to
       // mark a tunnel unhealthy and start gating traffic away from a
-      // working backend -- see HEALTH_PROBE_UNHEALTHY_STREAK's doc comment.
-      if (record._probeFailStreak >= HEALTH_PROBE_UNHEALTHY_STREAK) {
+      // working backend -- see DEFAULT_HEALTH_PROBE_UNHEALTHY_STREAK's doc
+      // comment.
+      const streakLimit =
+        this.config.HEALTH_PROBE_UNHEALTHY_STREAK ?? DEFAULT_HEALTH_PROBE_UNHEALTHY_STREAK
+      if (record._probeFailStreak >= streakLimit) {
         record.healthy = false
         // Re-check inFlight (and that this exact record is still the one
         // cached for its keyHash) immediately before destroying -- a

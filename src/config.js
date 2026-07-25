@@ -89,6 +89,18 @@ const config = {
   TUNNEL_PORT_MAX: readInt('TUNNEL_PORT_MAX', 20999),
   CONNECT_TIMEOUT_MS: readInt('CONNECT_TIMEOUT_MS', 8000),
   IDLE_TTL_MS: readInt('IDLE_TTL_MS', 900000),
+  // How many DISTINCT local ports a single cold create will try before
+  // giving up with ConnectError. A port handed out by PortPool is only
+  // reserved in-process, so anything else on the box already bound to it
+  // makes the real listen() fail with EADDRINUSE; the tunnel manager then
+  // retries immediately onto the next pool port (no backoff -- bind
+  // contention is not a dead backend). Bounds that loop so a badly
+  // fragmented / heavily contended pool can't turn one request into an
+  // unbounded scan. Raise it only if the port range genuinely overlaps other
+  // software on the box; the real fix for that is a dedicated range. Note
+  // this multiplies into the cold-create worst case bounded by
+  // ENSURE_TUNNEL_TIMEOUT_MS below. Default 5.
+  MAX_PORT_ATTEMPTS: readInt('MAX_PORT_ATTEMPTS', 5),
   MAX_TUNNELS,
   OPERATOR_NAME,
   OPERATOR_ADDRESS,
@@ -165,6 +177,17 @@ const config = {
   // (enforced below) -- a probe that can outlive its own interval would
   // stack up behind the next tick instead of settling first. Default 2s.
   HEALTH_PROBE_TIMEOUT_MS: readInt('HEALTH_PROBE_TIMEOUT_MS', 2000),
+  // Milestone 2d: how many CONSECUTIVE failed liveness probes it takes before
+  // a cached tunnel is marked unhealthy and destroyed (letting the next
+  // request cold-create through the normal backoff + circuit machinery).
+  // Effectively the "how twitchy is probe-driven eviction" dial, and the
+  // asymmetric half of the open-by-default trade-off: N consecutive failures
+  // to flip unhealthy, but a SINGLE success flips back immediately, because
+  // staying falsely unhealthy after a backend recovers is the costlier
+  // mistake. 1 evicts on any single blip (a momentary GC pause in the
+  // backend is enough); higher values tolerate more consecutive misses at
+  // the cost of serving a dead tunnel for longer. Default 2.
+  HEALTH_PROBE_UNHEALTHY_STREAK: readInt('HEALTH_PROBE_UNHEALTHY_STREAK', 2),
   // Milestone 2d (bug fix): how long proxy.web() waits for the upstream
   // (tunneled backend) to respond before http-proxy aborts the outgoing
   // request and emits 'error' on the shared proxy instance -- see
@@ -230,6 +253,16 @@ if (config.TUNNEL_PORT_MIN >= config.TUNNEL_PORT_MAX) {
   )
 }
 
+// Fail fast on a nonsensical port-attempt cap, same rationale as the range
+// check above. Must be >= 1: 0 (or negative) would make the port-collision
+// loop exit before trying a single port, so every cold create would fail.
+if (!Number.isInteger(config.MAX_PORT_ATTEMPTS) || config.MAX_PORT_ATTEMPTS < 1) {
+  throw new Error(
+    `Invalid config: MAX_PORT_ATTEMPTS (${config.MAX_PORT_ATTEMPTS}) must be a finite integer >= 1 -- ` +
+    `a cold create must be allowed to try at least one port`
+  )
+}
+
 // Milestone 2c: fail fast on nonsensical circuit-breaker/reconnect config,
 // same rationale as the port-range check above.
 if (config.CIRCUIT_FAILURE_THRESHOLD <= 0) {
@@ -281,6 +314,13 @@ if (config.HEALTH_PROBE_TIMEOUT_MS >= config.HEALTH_PROBE_INTERVAL_MS) {
     `Invalid config: HEALTH_PROBE_TIMEOUT_MS (${config.HEALTH_PROBE_TIMEOUT_MS}) must be well under ` +
     `HEALTH_PROBE_INTERVAL_MS (${config.HEALTH_PROBE_INTERVAL_MS}) -- a probe that can outlive its own ` +
     `interval would stack up behind the next tick instead of settling first`
+  )
+}
+if (!Number.isInteger(config.HEALTH_PROBE_UNHEALTHY_STREAK) || config.HEALTH_PROBE_UNHEALTHY_STREAK < 1) {
+  throw new Error(
+    `Invalid config: HEALTH_PROBE_UNHEALTHY_STREAK (${config.HEALTH_PROBE_UNHEALTHY_STREAK}) must be a ` +
+    `finite integer >= 1 -- 0 (or negative) would mark every tunnel unhealthy and destroy it before a ` +
+    `single probe had a chance to fail`
   )
 }
 

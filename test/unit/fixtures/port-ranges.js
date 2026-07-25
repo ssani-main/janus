@@ -28,6 +28,9 @@ const PORT_RANGES = [
       [20100, 20105],
       [20120, 20122],
       [20130, 20132],
+      [20160, 20163],
+      [20165, 20168],
+      [20170, 20173],
     ],
   },
   { file: 'fixtures/port-guard-toctou.js', ranges: [[20110, 20115]] },
@@ -46,6 +49,7 @@ const PORT_RANGES = [
       [20500, 20520],
       [20550, 20560],
       [20570, 20580],
+      [20585, 20589],
       [20590, 20595],
     ],
   },
@@ -54,6 +58,7 @@ const PORT_RANGES = [
   { file: 'tunnel-manager-ensure-tunnel-deadline.test.js', ranges: [[20800, 20810]] },
   { file: 'server-error-page-leak.test.js', ranges: [[20900, 20910]] },
   { file: 'tunnel-manager-ws-slots.test.js', ranges: [[20960, 20965]] },
+  { file: 'tunnel-manager-eviction-race.test.js', ranges: [[20970, 20980]] },
 ]
 
 /** Returns every overlap found across all declared ranges, as human-readable strings. */

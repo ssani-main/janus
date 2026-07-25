@@ -66,7 +66,8 @@ class FakeHolesailClient {
   }
 }
 
-// Port ranges 20100-20105, 20120-20122, 20130-20132 -- see
+// Port ranges 20100-20105, 20120-20122, 20130-20132, 20160-20163,
+// 20165-20168, 20170-20173 -- see
 // test/unit/fixtures/port-ranges.js for the full cross-file allocation map
 // (test files run in parallel, so ranges must stay disjoint).
 test('_createTunnel: port occupied by a foreign listener retries onto the next pool port and succeeds', async () => {
@@ -192,6 +193,95 @@ test('_createTunnel: port pool has no leak after every attempt fails', async () 
     const port = manager.portPool.acquire()
     assert.ok(port >= 20130 && port <= 20132)
     manager.portPool.release(port)
+  } finally {
+    await Promise.all(foreigns.map(closeServer))
+  }
+})
+
+// --- MAX_PORT_ATTEMPTS is operator-tunable ---------------------------------
+//
+// The three tests below share one topology -- the first two ports of the
+// range occupied by foreign listeners, the third free -- and differ only in
+// config.MAX_PORT_ATTEMPTS. That isolates the knob: whether the cold create
+// ever reaches the free third port is decided purely by how many ports it is
+// allowed to try. Each test owns its own disjoint range per this file's
+// convention (ranges 20160-20163, 20165-20168, 20170-20173).
+
+async function occupyFirstTwo(min) {
+  const servers = []
+  for (const port of [min, min + 1]) {
+    const server = net.createServer()
+    await listen(server, port, '127.0.0.1')
+    servers.push(server)
+  }
+  return servers
+}
+
+test('MAX_PORT_ATTEMPTS: a low cap gives up before reaching a free port further down the pool', async () => {
+  const config = {
+    MAX_TUNNELS: 5,
+    TUNNEL_PORT_MIN: 20160,
+    TUNNEL_PORT_MAX: 20163,
+    IDLE_TTL_MS: 1e9,
+    CONNECT_TIMEOUT_MS: 2000,
+    MAX_PORT_ATTEMPTS: 2, // only 20160 + 20161 get tried; 20162 is free but never reached
+  }
+
+  const foreigns = await occupyFirstTwo(20160)
+  const manager = new TunnelManager(config, undefined, () => new FakeHolesailClient())
+
+  try {
+    await assert.rejects(() => manager.ensureTunnel(KEY_A), ConnectError)
+    assert.equal(manager.counters.portRetries, 1, 'exactly one retry between the two allowed attempts')
+    assert.equal(manager.portPool.used.size, 0, 'both attempted ports must be released back to the pool')
+  } finally {
+    await Promise.all(foreigns.map(closeServer))
+  }
+})
+
+test('MAX_PORT_ATTEMPTS: raising the cap lets the same cold create reach the free port and succeed', async () => {
+  const config = {
+    MAX_TUNNELS: 5,
+    TUNNEL_PORT_MIN: 20165,
+    TUNNEL_PORT_MAX: 20168,
+    IDLE_TTL_MS: 1e9,
+    CONNECT_TIMEOUT_MS: 2000,
+    MAX_PORT_ATTEMPTS: 3, // one more attempt than above -- now the free port is reachable
+  }
+
+  const foreigns = await occupyFirstTwo(20165)
+  const manager = new TunnelManager(config, undefined, () => new FakeHolesailClient())
+
+  try {
+    const record = await manager.ensureTunnel(KEY_A)
+    assert.equal(record.port, 20167, 'should have landed on the first free port')
+    assert.equal(manager.counters.portRetries, 2)
+    await manager.destroyTunnel(record.keyHash)
+  } finally {
+    await Promise.all(foreigns.map(closeServer))
+  }
+})
+
+test('MAX_PORT_ATTEMPTS: absent from config, the built-in default (5) still applies', async () => {
+  // Guards the DEFAULT_MAX_PORT_ATTEMPTS fallback: `attempt < undefined` is
+  // always false, so without it this hand-rolled config (which predates the
+  // knob, like several others in this suite) would exit the port loop before
+  // trying a single port and fail every cold create.
+  const config = {
+    MAX_TUNNELS: 5,
+    TUNNEL_PORT_MIN: 20170,
+    TUNNEL_PORT_MAX: 20173,
+    IDLE_TTL_MS: 1e9,
+    CONNECT_TIMEOUT_MS: 2000,
+  }
+
+  const foreigns = await occupyFirstTwo(20170)
+  const manager = new TunnelManager(config, undefined, () => new FakeHolesailClient())
+
+  try {
+    const record = await manager.ensureTunnel(KEY_A)
+    assert.equal(record.port, 20172)
+    await manager.destroyTunnel(record.keyHash)
   } finally {
     await Promise.all(foreigns.map(closeServer))
   }

@@ -38,7 +38,8 @@ class FakeHolesailClient {
   }
 }
 
-// Port ranges 20500-20520, 20550-20560, 20570-20580, 20590-20595 -- see
+// Port ranges 20500-20520, 20550-20560, 20570-20580, 20585-20589,
+// 20590-20595 -- see
 // test/unit/fixtures/port-ranges.js for the full cross-file allocation map
 // (test files run in parallel, so ranges must stay disjoint).
 function baseConfig(overrides) {
@@ -278,44 +279,95 @@ test('reconnect: retries with backoff and eventually succeeds, sharing one chain
   }
 })
 
-test('reconnect: exhausting RECONNECT_MAX_ATTEMPTS surfaces ConnectError and opens the circuit', async (t) => {
+/** Always "connects" but never binds -> the liveness probe always fails. */
+class AlwaysFailingClient {
+  async connect(_options, callback) {
+    callback()
+  }
+  async destroy() {}
+}
+
+/**
+ * Drive one ensureTunnel() call all the way to rejection under mocked
+ * setTimeout, flushing real microtasks/IO between ticks so the reconnect
+ * backoff chain can make progress.
+ *
+ * The rejection assertion is attached BEFORE the flush loop deliberately --
+ * otherwise the promise can reject during the loop with nothing awaiting it,
+ * which node:test's runner reports as an unhandled rejection and fails the
+ * test even though we do handle it a moment later.
+ */
+async function driveToRejection(t, manager, key, errType) {
+  const p = manager.ensureTunnel(key)
+  const assertion = assert.rejects(() => p, errType)
+  for (let i = 0; i < 30; i++) {
+    await new Promise((resolve) => setImmediate(resolve))
+    t.mock.timers.tick(100000)
+  }
+  await assertion
+}
+
+test('reconnect: exhausting RECONNECT_MAX_ATTEMPTS surfaces ConnectError but records exactly ONE circuit failure', async (t) => {
   const config = baseConfig({
     TUNNEL_PORT_MIN: 20570,
     TUNNEL_PORT_MAX: 20580,
     RECONNECT_MAX_ATTEMPTS: 2,
     RECONNECT_BASE_DELAY_MS: 5,
     RECONNECT_MAX_DELAY_MS: 20,
-    CIRCUIT_FAILURE_THRESHOLD: 3, // exactly 1 initial + 2 reconnects = 3 failures
+    CIRCUIT_FAILURE_THRESHOLD: 3,
   })
 
-  class AlwaysFailingClient {
-    async connect(_options, callback) {
-      callback() // "connects" but never binds -> liveness probe always fails
-    }
-    async destroy() {}
-  }
-
   const manager = new TunnelManager(config, undefined, () => new AlwaysFailingClient())
+  const { keyHash } = parseKey(KEY_A)
 
   t.mock.timers.enable({ apis: ['setTimeout'] })
   try {
-    const p = manager.ensureTunnel(KEY_A)
-    // Attach the rejection assertion BEFORE flushing timers/microtasks below
-    // -- otherwise `p` can reject during the flush loop before anything is
-    // awaiting/attached to it, which node:test's runner treats as an
-    // unhandled rejection and fails the test even though we do handle it a
-    // moment later.
-    const assertion = assert.rejects(() => p, ConnectError)
-    for (let i = 0; i < 30; i++) {
-      await new Promise((resolve) => setImmediate(resolve))
-      t.mock.timers.tick(100000)
-    }
-    await assertion
+    await driveToRejection(t, manager, KEY_A, ConnectError)
 
     const stats = manager.stats()
-    assert.equal(stats.reconnectAttempts, 2)
+    assert.equal(stats.reconnectAttempts, 2, 'the reconnect loop should still have retried twice')
     assert.equal(stats.reconnectSuccesses, 0)
-    assert.equal(stats.circuitsOpen, 1, 'three consecutive failures should have opened the circuit')
+    // The whole point of the fix: 3 connect ATTEMPTS (1 initial + 2
+    // reconnects) inside a single cold create is still only ONE failed
+    // request as far as the breaker is concerned. Counting per-attempt used
+    // to open the circuit here, silently coupling CIRCUIT_FAILURE_THRESHOLD
+    // to RECONNECT_MAX_ATTEMPTS.
+    assert.equal(manager.circuits.get(keyHash).failures, 1, 'one cold create must record exactly one failure')
+    assert.equal(stats.circuitsOpen, 0, 'a single failed request must not reach a threshold of 3')
+    assert.equal(stats.circuitOpens, 0)
+  } finally {
+    manager.stopSweeper()
+  }
+})
+
+test('reconnect: CIRCUIT_FAILURE_THRESHOLD counts failed REQUESTS -- three of them open the circuit', async (t) => {
+  const config = baseConfig({
+    TUNNEL_PORT_MIN: 20585,
+    TUNNEL_PORT_MAX: 20589,
+    RECONNECT_MAX_ATTEMPTS: 2,
+    RECONNECT_BASE_DELAY_MS: 5,
+    RECONNECT_MAX_DELAY_MS: 20,
+    CIRCUIT_FAILURE_THRESHOLD: 3,
+  })
+
+  const manager = new TunnelManager(config, undefined, () => new AlwaysFailingClient())
+  const { keyHash } = parseKey(KEY_A)
+
+  t.mock.timers.enable({ apis: ['setTimeout'] })
+  try {
+    await driveToRejection(t, manager, KEY_A, ConnectError)
+    assert.equal(manager.stats().circuitsOpen, 0, 'after 1 failed request')
+
+    await driveToRejection(t, manager, KEY_A, ConnectError)
+    assert.equal(manager.stats().circuitsOpen, 0, 'after 2 failed requests')
+
+    await driveToRejection(t, manager, KEY_A, ConnectError)
+    assert.equal(manager.circuits.get(keyHash).failures, 3)
+    assert.equal(manager.stats().circuitsOpen, 1, 'the 3rd failed request hits the threshold')
+    assert.equal(manager.stats().circuitOpens, 1)
+
+    // And now the breaker actually does its job: no further connect attempt.
+    await assert.rejects(() => manager.ensureTunnel(KEY_A), CircuitOpenError)
   } finally {
     manager.stopSweeper()
   }
