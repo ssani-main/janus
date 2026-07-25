@@ -204,7 +204,9 @@ filters outbound UDP, and DNS-provider API access that is off). In short:
 │   └── backup-store.sh   store backup: JSON validation, GPG, rotation
 ├── Caddyfile.example     wildcard TLS (DNS-01) template; copy to Caddyfile
 ├── .env.example          all config knobs
+├── CLAUDE.md             orientation + conventions for Claude Code sessions
 ├── DEPLOY.md             operator runbook
+├── THIRD_PARTY.md        upstream licences and attribution
 ├── GATEWAY_DESIGN.md     full design document
 ├── ROADMAP.md            feature roadmap & handoff notes
 └── TEST_REPORT.md        end-to-end verification report

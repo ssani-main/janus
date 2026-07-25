@@ -118,10 +118,19 @@ if command -v node >/dev/null 2>&1; then
   dns_out=$(BASE_DOMAIN="$BASE_DOMAIN" node -e '
 const dns = require("node:dns").promises;
 const base = process.env.BASE_DOMAIN;
-const look = async (n) => { try { return (await dns.resolve4(n))[0] || ""; } catch { return ""; } };
+// Bounded explicitly: dns.resolve4 inherits the system resolver+c-ares retry
+// schedule, which on a box with a broken or unreachable resolver can stall far
+// longer than a preflight check should. A timeout resolves to undefined, which
+// reads the same as "no record" -- the honest answer when we could not find out.
+const timeout = (ms) => new Promise((r) => { setTimeout(r, ms).unref(); });
+const look = async (n) => {
+  try { return (await Promise.race([dns.resolve4(n), timeout(5000)]))?.[0] || ""; }
+  catch { return ""; }
+};
 (async () => {
   const [apex, wild] = await Promise.all([look(base), look("probe-preflight." + base)]);
   console.log(apex + "|" + wild);
+  process.exit(0);
 })();
 ' 2>/dev/null)
   apex="${dns_out%%|*}"; wild="${dns_out##*|}"
@@ -141,8 +150,15 @@ elif ! command -v curl >/dev/null 2>&1; then
   sk "curl not installed"
 else
   body=$(printf '{"apikey":"%s","secretapikey":"%s"}' "$PB_KEY" "$PB_SECRET")
-  ping_st=$(curl -sS -m 20 -X POST https://api.porkbun.com/api/json/v3/ping \
-    -H 'Content-Type: application/json' -d "$body" 2>/dev/null \
+  # The payload goes to curl on STDIN (`--data @-`), never as an argument.
+  # Command-line arguments land in /proc/<pid>/cmdline, which is world-readable
+  # on Linux -- `curl -d "$body"` would expose the API key and secret to any
+  # other local user for the duration of the request. `printf` is a shell
+  # BUILTIN, so the pipe forks no process carrying the secret in its argv
+  # either; a here-string (<<<) was avoided because bash may stage it through
+  # a temporary file, briefly putting the credentials on disk.
+  ping_st=$(printf '%s' "$body" | curl -sS -m 20 -X POST https://api.porkbun.com/api/json/v3/ping \
+    -H 'Content-Type: application/json' --data @- 2>/dev/null \
     | grep -o '"status":"[A-Z]*"' | head -1)
   case "$ping_st" in
     *SUCCESS*) ok "credentials valid" ;;
@@ -150,8 +166,8 @@ else
   esac
 
   zone="${BASE_DOMAIN#*.}"   # janus.ssani.dev -> ssani.dev
-  dom_st=$(curl -sS -m 20 -X POST "https://api.porkbun.com/api/json/v3/dns/retrieve/$zone" \
-    -H 'Content-Type: application/json' -d "$body" 2>/dev/null \
+  dom_st=$(printf '%s' "$body" | curl -sS -m 20 -X POST "https://api.porkbun.com/api/json/v3/dns/retrieve/$zone" \
+    -H 'Content-Type: application/json' --data @- 2>/dev/null \
     | grep -o '"status":"[A-Z]*"' | head -1)
   case "$dom_st" in
     *SUCCESS*) ok "API access is enabled for $zone" ;;
