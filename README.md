@@ -6,7 +6,7 @@
 
 One small always-on VPS with a single wildcard domain becomes the public front door for an arbitrary number of backend projects. Each backend runs anywhere (home PC, laptop, Pi, VPS) with **no domain, no port forwarding, no public IP**, reachable only over Holesail's [HyperDHT](https://github.com/holepunchto/hyperdht) tunnel. The gateway runs the Holesail *client* on the visitor's behalf and reverse-proxies plain HTTPS to it, so visitors just open a link.
 
-> **Status:** ✅ Built and verified end-to-end against live Holesail tunnels — Phase 0 (10/10) · Phase 1 (13/13) · Phase 2 (9/9) · Phase 3 (19/19). **Milestone 1** adds a persistent store, named aliases, optional per-key passwords, and an HTML admin dashboard. **Milestone 2** adds observability (`/healthz`, `/metrics`, structured request logging) and resilience (exponential-backoff reconnect, circuit breaker, periodic health probes, friendly offline page). **Security:** all 13 findings from the 2026-07 audit are fixed — cross-tenant cookie isolation, X-Forwarded-For hardening, websocket-DoS bounds, `0600` store with fsync durability, credential purge on clear, and admin login lockout + per-session CSRF. **209 unit tests + 7 live-DHT e2e tests pass.** See [`GATEWAY_DESIGN.md`](./GATEWAY_DESIGN.md) for the full design, [`ROADMAP.md`](./ROADMAP.md) for the audit backlog and what's next, and [`TEST_REPORT.md`](./TEST_REPORT.md) for the verification report.
+> **Status:** ✅ Built and verified end-to-end against live Holesail tunnels — Phase 0 (10/10) · Phase 1 (13/13) · Phase 2 (9/9) · Phase 3 (19/19). **Milestone 1** adds a persistent store, named aliases, optional per-key passwords, and an HTML admin dashboard. **Milestone 2** adds observability (`/healthz`, `/metrics`, structured request logging) and resilience (exponential-backoff reconnect, circuit breaker, periodic health probes, friendly offline page). **Security:** all 13 findings from the 2026-07 audit are fixed — cross-tenant cookie isolation, X-Forwarded-For hardening, websocket-DoS bounds, `0600` store with fsync durability, credential purge on clear, and admin login lockout + per-session CSRF. **218 unit tests + 7 live-DHT e2e tests pass.** See [`GATEWAY_DESIGN.md`](./GATEWAY_DESIGN.md) for the full design, [`ROADMAP.md`](./ROADMAP.md) for the audit backlog and what's next, and [`TEST_REPORT.md`](./TEST_REPORT.md) for the verification report.
 
 ---
 
@@ -89,6 +89,7 @@ All via environment variables (see [`.env.example`](./.env.example)).
 | `BIND_HOST` | `127.0.0.1` | interface to bind |
 | `MAX_TUNNELS` | `50` | max concurrent live tunnels; LRU-evicts idle ones at capacity |
 | `TUNNEL_PORT_MIN` / `TUNNEL_PORT_MAX` | `20000` / `20999` | local port pool for tunnels (must be a range) |
+| `MAX_PORT_ATTEMPTS` | `5` | how many distinct local ports one cold create may try before giving up. Pool ports are only reserved in-process, so a port held by other software fails to bind (`EADDRINUSE`) and the manager retries immediately onto the next one. Bounds that loop; multiplies into the worst case capped by `ENSURE_TUNNEL_TIMEOUT_MS`. |
 | `CONNECT_TIMEOUT_MS` | `8000` | cold-connect timeout before giving up on a backend |
 | `IDLE_TTL_MS` | `900000` | tear down a tunnel after this long with no requests (15 min) |
 | `OPERATOR_NAME` / `OPERATOR_ADDRESS` / `OPERATOR_EMAIL` | `''` | Impressum fields; pages warn until set |
@@ -107,13 +108,14 @@ All via environment variables (see [`.env.example`](./.env.example)).
 | `ADMIN_LOGIN_MAX_FAILS` | `5` | consecutive failed `/_admin/login` attempts (per IP) before lockout begins (S8). |
 | `ADMIN_LOGIN_LOCKOUT_MS` | `60000` | base lockout duration once the failure threshold is hit, in milliseconds; each further failure doubles it (capped at 2⁶×) (S8). |
 | `LOG_REQUESTS` | `false` | whether to emit a JSON line per request to stdout (Milestone 2a). High volume; opt in explicitly. Set to `true` or `"1"` to enable. |
-| `CIRCUIT_FAILURE_THRESHOLD` | `5` | consecutive cold-create failures before a keyHash's circuit opens (Milestone 2c). Once open, further cold creates fast-fail with 503 instead of attempting a DHT round trip. |
+| `CIRCUIT_FAILURE_THRESHOLD` | `5` | consecutive **failed requests** before a keyHash's circuit opens (Milestone 2c). Once open, further cold creates fast-fail with 503 instead of attempting a DHT round trip. Counted per failed cold create, not per connect attempt — one request that exhausts its whole `RECONNECT_MAX_ATTEMPTS` chain still counts once, so the two knobs stay independent. |
 | `CIRCUIT_COOLDOWN_MS` | `30000` | how long a circuit stays open once it trips, in milliseconds (Milestone 2c). |
 | `RECONNECT_MAX_ATTEMPTS` | `3` | extra reconnect-with-backoff attempts after the first cold-create fails, before giving up and returning 502 (Milestone 2c). Default 3 = up to 4 total attempts. |
 | `RECONNECT_BASE_DELAY_MS` | `250` | base delay for reconnect backoff, in milliseconds; actual delay is exponential with jitter (Milestone 2c). |
 | `RECONNECT_MAX_DELAY_MS` | `5000` | cap on reconnect backoff delay, in milliseconds (Milestone 2c). |
 | `HEALTH_PROBE_INTERVAL_MS` | `30000` | how often the periodic health probe checks each cached tunnel's liveness, in milliseconds (Milestone 2d). Independent of the 60s idle sweeper. |
 | `HEALTH_PROBE_TIMEOUT_MS` | `2000` | per-probe connect timeout, in milliseconds (Milestone 2d). Must be well under `HEALTH_PROBE_INTERVAL_MS` so probes never stack up. |
+| `HEALTH_PROBE_UNHEALTHY_STREAK` | `2` | consecutive failed probes before a tunnel is marked unhealthy and destroyed (Milestone 2d) — the "how twitchy is probe-driven eviction" dial. Recovery stays asymmetric: a single successful probe resets the streak immediately. |
 | `PROXY_TIMEOUT_MS` | `30000` | http-proxy idle-socket timeout for tunneled requests, in milliseconds (Milestone 2d). Detects hung backends; does NOT apply to WebSocket upgrades. |
 | `ENSURE_TUNNEL_TIMEOUT_MS` | `45000` | overall wall-clock deadline on a single `ensureTunnel` cold create, in milliseconds. Bounds the reconnect loop, port-collision retry loop, and all associated timeouts and sleeps; must exceed `CONNECT_TIMEOUT_MS`. |
 | `WS_MAX_SLOTS` | `30` (~60% of `MAX_TUNNELS`) | max distinct tunnel slots websockets may pin at once; must be `< MAX_TUNNELS` so HTTP always keeps headroom (S3). A new ws to an already-ws-pinned key is free. |
@@ -155,10 +157,13 @@ Dashboard sessions use CSRF protection and SameSite=Strict cookies (TTL: `ADMIN_
 See [`DEPLOY.md`](./DEPLOY.md) for the full runbook. In short:
 
 1. **Wildcard DNS** — `gw.yourdomain.com` and `*.gw.yourdomain.com` → the VPS.
-2. **Caddy** — terminates TLS with a wildcard cert via **DNS-01** (one cert, no per-subdomain issuance), preserves `Host`, proxies to the Node gateway. See [`Caddyfile`](./Caddyfile).
-3. **systemd** — run the gateway as a non-root service with `Restart=always` and `EnvironmentFile=.env`.
-4. **Firewall** — UFW allow only 22/80/443.
-5. **Health check** — `GET https://gw.yourdomain.com/` returns 200 (apex page), no key required.
+2. **Caddy** — terminates TLS with a wildcard cert via **DNS-01** (one cert, no per-subdomain issuance), preserves `Host`, proxies to the Node gateway. Needs a Caddy built with your DNS provider's plugin (`xcaddy build --with github.com/caddy-dns/<provider>`). See [`Caddyfile`](./Caddyfile).
+3. **systemd** — run as a non-root service. [`deploy/janus.service`](./deploy/janus.service) is a hardened unit with privilege confinement, `MemoryMax`/`TasksMax`, and a raised journald rate limit.
+4. **Firewall** — UFW allow only 22/80/443. The tunnel port pool is loopback-only; Holesail's DHT traffic is outbound UDP (confirm your provider doesn't filter it).
+5. **Backups** — [`deploy/backup-store.sh`](./deploy/backup-store.sh) snapshots `STORE_PATH` with JSON validation, optional GPG encryption, and rotation. The store is the only copy of your aliases and their raw keys.
+6. **Monitoring** — `GET https://gw.yourdomain.com/` returns 200 (apex page), no key required. Pair it with a **synthetic canary** through a known always-on key: only that exercises the actual tunnel path.
+
+**Run exactly one instance** — the tunnel pool, port pool, rate limiter, and store are all per-process.
 
 ---
 
@@ -190,6 +195,9 @@ See [`DEPLOY.md`](./DEPLOY.md) for the full runbook. In short:
 │   ├── pages.js          apex / Impressum / ToS / 429 / login / admin pages / offline page
 │   ├── admin.js          admin JSON API + HTML dashboard (aliases, passwords, blocks, health status)
 │   └── server.js         HTTP + WebSocket entrypoint, alias + password gate, /healthz + /metrics
+├── deploy/
+│   ├── janus.service     hardened systemd unit (confinement + resource caps)
+│   └── backup-store.sh   store backup: JSON validation, GPG, rotation
 ├── Caddyfile             wildcard TLS (DNS-01)
 ├── .env.example          all config knobs
 ├── DEPLOY.md             operator runbook

@@ -98,6 +98,34 @@ dependencies (Node built-ins only).
 
 ## Milestone 2 — Known gaps & follow-ups
 
+### RESOLVED (post-M2 hardening pass)
+
+- **Unclaimed-tunnel eviction race.** `_pickEvictable` only required
+  `inFlight === 0`, but `_attemptPortConnect` publishes a new record into
+  `this.tunnels` with `inFlight: 0` and the caller only claims it after
+  `ensureTunnel`'s `await` resumes. At `MAX_TUNNELS` with every other tunnel
+  busy, that unclaimed record was the sole eviction candidate, so a concurrent
+  cold create for a different key could destroy it out from under its caller
+  (which then proxied through a destroyed client → 502). **Fixed:**
+  `_pickEvictable` now also skips records whose keyHash is still in
+  `this.pending`, which exactly covers the unclaimed window. Regression tests
+  in `test/unit/tunnel-manager-eviction-race.test.js`.
+- **Circuit threshold silently coupled to reconnect attempts.**
+  `recordFailure` fired once per reconnect *attempt*, so with shipped defaults
+  (`RECONNECT_MAX_ATTEMPTS=3` → 4 attempts, `CIRCUIT_FAILURE_THRESHOLD=5`) a
+  single failed request contributed 4 failures — the circuit opened partway
+  through the *second* failed request, and raising `RECONNECT_MAX_ATTEMPTS`
+  silently made the breaker more trigger-happy. **Fixed:** exactly one
+  `recordFailure` per rejected `_createTunnel`, so the threshold counts failed
+  requests as its name and docs claim. The two knobs are now independent.
+- **Hardcoded tuning constants promoted to config.** `MAX_PORT_ATTEMPTS` and
+  `HEALTH_PROBE_UNHEALTHY_STREAK` were module constants in a codebase where 25+
+  less consequential values are env-driven; the latter is the "how twitchy is
+  probe-driven eviction" dial. Both are now in `src/config.js` with fail-fast
+  validation, keeping their previous values as defaults.
+
+### Still open
+
 Improvements deferred intentionally (low impact, addressed if reported in production):
 
 ### Port-recycling probe race (low probability, narrow window)
