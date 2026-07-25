@@ -1,0 +1,77 @@
+# Janus - Caddy front door (TEMPLATE)
+#
+# Copy to `Caddyfile`, replace the placeholders, and deploy that copy. The
+# real `Caddyfile` is gitignored so a live host's domain and provider config
+# never land in version control:
+#
+#   cp Caddyfile.example Caddyfile
+#   $EDITOR Caddyfile
+#   sudo cp Caddyfile /etc/caddy/Caddyfile
+#
+# This terminates TLS ONLY. All routing / tunnel logic lives in the Node
+# process at 127.0.0.1:3000 (see src/server.js).
+#
+# Prerequisites:
+#   1. A wildcard cert for *.gw.example.com needs DNS-01 issuance (HTTP-01
+#      cannot prove ownership of a wildcard name). Stock Caddy ships with NO
+#      DNS provider plugins -- they are compiled in, not loaded at runtime --
+#      so build one that has yours:
+#        xcaddy build --with github.com/caddy-dns/<provider>
+#      See https://github.com/caddy-dns for the full list (cloudflare,
+#      route53, digitalocean, porkbun, desec, ...).
+#   2. Wildcard DNS records pointed at this VPS:
+#        gw.example.com     A/AAAA  <vps-ip>
+#        *.gw.example.com   A/AAAA  <vps-ip>
+#   3. An API token for your DNS provider with permission to create the
+#      DNS-01 TXT challenge record, in an env var Caddy can read. Prefer a
+#      systemd drop-in (`systemctl edit caddy`) over a world-readable file.
+#
+# Provider gotcha worth knowing: some registrars gate API access PER DOMAIN.
+# Porkbun, for one, ships it OFF by default -- the domain must have "API
+# ACCESS" switched on in its control panel or every DNS-01 challenge fails
+# with an error that looks nothing like a permissions problem. Check your
+# provider's equivalent before debugging Caddy.
+#
+# TLD gotcha: .dev and .app are HSTS-preloaded in full, so browsers refuse
+# plain HTTP for those names with NO click-through override. Under such a
+# TLD, a failed cert issuance makes the gateway unreachable rather than
+# merely insecure -- watch `journalctl -u caddy -f` until certs actually
+# issue before sharing any link.
+
+# These two domains must match BASE_DOMAIN in .env (gw.example.com) and its
+# "www." + wildcard subdomain forms -- src/routing.js treats BASE_DOMAIN and
+# www.<BASE_DOMAIN> as the apex, and everything else under *.gw.example.com
+# as a tenant key subdomain.
+gw.example.com, *.gw.example.com {
+	tls {
+		# Configure the DNS-01 provider + API token env for whichever plugin
+		# you built Caddy with. Examples:
+		#
+		#   dns cloudflare {env.CF_API_TOKEN}
+		#
+		#   dns route53
+		#
+		#   dns porkbun {
+		#     api_key {env.PORKBUN_API_KEY}
+		#     api_secret_key {env.PORKBUN_API_SECRET_KEY}
+		#   }
+		#
+		# See the provider plugin's README for its exact directive/env vars.
+		dns <PROVIDER>
+	}
+
+	# header_up Host {host} is required: Node's Phase 1 routing
+	# (src/routing.js) derives the tenant key from this Host header, so it
+	# must reach 127.0.0.1:3000 unmodified (the real public subdomain, not
+	# an internal name).
+	reverse_proxy 127.0.0.1:3000 {
+		header_up Host {host}
+		header_up X-Forwarded-Proto {scheme}
+		# Security audit S2: OVERWRITE X-Forwarded-For with the real remote
+		# host instead of appending to whatever the client sent. Without this,
+		# a client-supplied X-Forwarded-For survives to Node, and since
+		# src/server.js's clientIp() (with TRUST_PROXY) trusts it, a client
+		# could prepend a fake entry to dodge/frame another IP's rate limit.
+		header_up X-Forwarded-For {remote_host}
+	}
+}

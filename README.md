@@ -157,7 +157,7 @@ Dashboard sessions use CSRF protection and SameSite=Strict cookies (TTL: `ADMIN_
 See [`DEPLOY.md`](./DEPLOY.md) for the full runbook. In short:
 
 1. **Wildcard DNS** — `gw.yourdomain.com` and `*.gw.yourdomain.com` → the VPS.
-2. **Caddy** — terminates TLS with a wildcard cert via **DNS-01** (one cert, no per-subdomain issuance), preserves `Host`, proxies to the Node gateway. Needs a Caddy built with your DNS provider's plugin (`xcaddy build --with github.com/caddy-dns/<provider>`). See [`Caddyfile`](./Caddyfile).
+2. **Caddy** — terminates TLS with a wildcard cert via **DNS-01** (one cert, no per-subdomain issuance), preserves `Host`, proxies to the Node gateway. Needs a Caddy built with your DNS provider's plugin (`xcaddy build --with github.com/caddy-dns/<provider>`). Copy [`Caddyfile.example`](./Caddyfile.example) to `Caddyfile` and fill it in — the real one is gitignored.
 3. **systemd** — run as a non-root service. [`deploy/janus.service`](./deploy/janus.service) is a hardened unit with privilege confinement, `MemoryMax`/`TasksMax`, and a raised journald rate limit.
 4. **Firewall** — UFW allow only 22/80/443. The tunnel port pool is loopback-only; Holesail's DHT traffic is outbound UDP (confirm your provider doesn't filter it).
 5. **Backups** — [`deploy/backup-store.sh`](./deploy/backup-store.sh) snapshots `STORE_PATH` with JSON validation, optional GPG encryption, and rotation. The store is the only copy of your aliases and their raw keys.
@@ -198,7 +198,7 @@ See [`DEPLOY.md`](./DEPLOY.md) for the full runbook. In short:
 ├── deploy/
 │   ├── janus.service     hardened systemd unit (confinement + resource caps)
 │   └── backup-store.sh   store backup: JSON validation, GPG, rotation
-├── Caddyfile             wildcard TLS (DNS-01)
+├── Caddyfile.example     wildcard TLS (DNS-01) template; copy to Caddyfile
 ├── .env.example          all config knobs
 ├── DEPLOY.md             operator runbook
 ├── GATEWAY_DESIGN.md     full design document

@@ -11,3 +11,7 @@ Thumbs.db
 # Janus runtime store (contains raw keys + password hashes)
 janus-data.json
 *.json.tmp.*
+
+# Real Caddy config -- names a live host's domain and DNS provider setup.
+# Ship changes via Caddyfile.example instead.
+/Caddyfile

@@ -59,9 +59,27 @@ Account → API Access.
 
 ## 2. Caddy in front
 
-Caddy terminates TLS and reverse-proxies to `127.0.0.1:$PORT`. See the
-[`Caddyfile`](./Caddyfile) in this repo — it is already written for
-`janus.ssani.dev` + Porkbun.
+Caddy terminates TLS and reverse-proxies to `127.0.0.1:$PORT`. The repo ships
+[`Caddyfile.example`](./Caddyfile.example) as a provider-agnostic template; the
+real `Caddyfile` is gitignored so a live host's domain and DNS credentials
+setup never land in version control.
+
+```sh
+cp Caddyfile.example Caddyfile
+```
+
+Then edit your copy: replace both `gw.example.com` hostnames with
+`janus.ssani.dev` and `*.janus.ssani.dev`, and swap the `dns <PROVIDER>` line
+for the Porkbun block already shown in the template's comments:
+
+```
+	tls {
+		dns porkbun {
+			api_key {env.PORKBUN_API_KEY}
+			api_secret_key {env.PORKBUN_API_SECRET_KEY}
+		}
+	}
+```
 
 **Stock Caddy will not work.** Wildcard certs require a DNS-01 challenge, and
 DNS provider plugins are compiled in, not loaded at runtime:
@@ -87,7 +105,7 @@ Environment=PORKBUN_API_SECRET_KEY=sk1_xxxxxxxx
 Then:
 
 ```sh
-sudo cp Caddyfile /etc/caddy/Caddyfile
+sudo cp Caddyfile /etc/caddy/Caddyfile   # your edited copy, not the .example
 sudo systemctl enable --now caddy
 sudo journalctl -u caddy -f     # WATCH THIS until certs actually issue
 ```
