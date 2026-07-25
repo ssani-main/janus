@@ -129,7 +129,7 @@ dependencies (Node built-ins only).
 
 Improvements deferred intentionally (low impact, addressed if reported in production):
 
-### Port-recycling probe race (low probability, narrow window)
+#### Port-recycling probe race (low probability, narrow window)
 When `_probeTunnels()` snapshots records then probes them asynchronously,
 `destroyTunnel()` can release a port mid-probe and `PortPool.acquire()` can
 immediately reissue that exact port to a different key. A stale probe's result
@@ -138,7 +138,7 @@ to detect reuse. **Mitigation:** probe failure streaks destroy tunnels
 immediately, so most stale results are irrelevant; risk is only if a port is
 recycled *and* a stale probe succeeds wrongly. Not observed in testing.
 
-### Dual keyHash for `0000<X>` and `s000<X>` keys (operator awareness only)
+#### Dual keyHash for `0000<X>` and `s000<X>` keys (operator awareness only)
 `parseKey()` hashes only the 52-char key suffix, stripping the 4-char mode
 prefix. Two keys with identical material — one public (`0000…`), one secure
 (`s000…`) — collide to the same keyHash. An operator setting a password on a

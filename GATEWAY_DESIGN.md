@@ -10,7 +10,7 @@
 - **Phase 2** — LRU eviction + reference-counting + concurrent-create dedup ✅ verified live
 - **Phase 3** — Impressum/ToS pages + per-IP rate limiting + token-auth admin kill-switch ✅ verified live
 
-**Remaining before public deployment (off-code):** fill operator legal details in `.env` + review the ToS template in `src/pages.js`, set `ADMIN_TOKEN`, configure the Caddyfile DNS-01 provider (see `DEPLOY.md`), and run the **two-machine field test** (cross-NAT holepunch reliability + real-link throughput) — the one thing a single-host lab can't confirm.
+**Remaining before public deployment (off-code):** fill operator legal details in `.env` + review the ToS template in `src/pages.js`, set `ADMIN_TOKEN`, copy `Caddyfile.example` to `Caddyfile` and configure its DNS-01 provider (see `DEPLOY.md`), and run the **two-machine field test** (cross-NAT holepunch reliability + real-link throughput) — the one thing a single-host lab can't confirm.
 
 > **v2 → v3 (the big change):** v2 still routed by cookie on a single shared origin, which is a cross-tenant isolation hole and breaks apps that build absolute URLs. v3 **encodes the Holesail key into the subdomain**, giving every project its own origin, a stable public hostname, and stateless routing — and turning a shared project into a plain clickable HTTPS link. This deletes cookie-pinning entirely. See §11 for the full delta.
 
