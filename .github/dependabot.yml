@@ -1,0 +1,35 @@
+version: 2
+
+# Keeps the SHA-pinned actions in .github/workflows/ci.yml current.
+#
+# Pinning to a commit SHA (see that file's header) buys immutability at the
+# cost of automatic patch pickup -- a security fix upstream never reaches us
+# until someone bumps the pin. This is the thing that does the bumping:
+# Dependabot understands SHA-pinned actions specifically, and rewrites both
+# the SHA *and* its trailing `# vX.Y.Z` comment together, so the two can't
+# drift apart.
+#
+# Scope is deliberately github-actions only. The npm side is left manual --
+# the 2-runtime-dependency footprint (holesail-client, http-proxy) is a
+# deliberate design constraint, and those two are the whole point of the
+# project rather than incidental deps, so their upgrades warrant a human
+# reading the changelog rather than an auto-opened PR.
+updates:
+  - package-ecosystem: github-actions
+    # "/" means the repo root; Dependabot always looks under
+    # .github/workflows from there, not for a manifest at that path.
+    directory: /
+    schedule:
+      interval: weekly
+    # Both actions land in ONE pull request instead of one PR each. With only
+    # two actions in play, separate PRs are pure review overhead, and they
+    # almost always want reviewing together anyway.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
+    # Match the repo's Conventional Commits style (`ci: ...`), so Dependabot's
+    # PRs don't stand out from hand-written history.
+    commit-message:
+      prefix: ci
+    open-pull-requests-limit: 3
