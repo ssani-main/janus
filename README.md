@@ -154,7 +154,10 @@ Dashboard sessions use CSRF protection and SameSite=Strict cookies (TTL: `ADMIN_
 
 ## Deployment
 
-See [`DEPLOY.md`](./DEPLOY.md) for the full runbook. In short:
+See [`DEPLOY.md`](./DEPLOY.md) for the full runbook, and start with
+[`deploy/preflight.sh`](./deploy/preflight.sh) — a read-only check for the two
+environmental failures that cost the most to diagnose late (a provider that
+filters outbound UDP, and DNS-provider API access that is off). In short:
 
 1. **Wildcard DNS** — `gw.yourdomain.com` and `*.gw.yourdomain.com` → the VPS.
 2. **Caddy** — terminates TLS with a wildcard cert via **DNS-01** (one cert, no per-subdomain issuance), preserves `Host`, proxies to the Node gateway. Needs a Caddy built with your DNS provider's plugin (`xcaddy build --with github.com/caddy-dns/<provider>`). Copy [`Caddyfile.example`](./Caddyfile.example) to `Caddyfile` and fill it in — the real one is gitignored.
@@ -196,6 +199,7 @@ See [`DEPLOY.md`](./DEPLOY.md) for the full runbook. In short:
 │   ├── admin.js          admin JSON API + HTML dashboard (aliases, passwords, blocks, health status)
 │   └── server.js         HTTP + WebSocket entrypoint, alias + password gate, /healthz + /metrics
 ├── deploy/
+│   ├── preflight.sh      read-only pre-deploy environment checks
 │   ├── janus.service     hardened systemd unit (confinement + resource caps)
 │   └── backup-store.sh   store backup: JSON validation, GPG, rotation
 ├── Caddyfile.example     wildcard TLS (DNS-01) template; copy to Caddyfile

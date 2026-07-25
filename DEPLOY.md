@@ -15,8 +15,27 @@ that name except the DNS-01 plugin choice in section 2.
 
 ## 0. Before you touch the VPS
 
-Two things to confirm up front, because both are cheap to check and expensive
-to debug later:
+**Run the preflight first.** [`deploy/preflight.sh`](./deploy/preflight.sh)
+checks everything in this section mechanically and is read-only — it installs
+nothing, creates no DNS records, writes no files, and never prints the
+credentials you give it. Safe to re-run at any point.
+
+```sh
+# on the VPS, from the repo root
+deploy/preflight.sh
+
+# to include the Porkbun checks, export credentials first --
+# with a LEADING SPACE so they stay out of shell history
+ export PB_KEY='pk1_...'
+ export PB_SECRET='sk1_...'
+deploy/preflight.sh
+```
+
+It exits non-zero if anything FAILED. Resolve those before continuing; each
+one blocks the deploy. Warnings and skips are tolerated.
+
+The two things it is really there to catch, because both are cheap to check
+now and expensive to debug later:
 
 **Outbound UDP must work.** Holesail's holepunching is outbound UDP from this
 box to arbitrary peers. No inbound port is needed for it, but a few budget
@@ -116,8 +135,32 @@ Renewal is automatic; Caddy's built-in loop handles it, no cron needed.
 
 ## 3. The gateway service
 
-Create a dedicated non-root user, deploy to `/opt/janus`, and keep secrets
-owner-only:
+### Node.js
+
+`package.json` requires **Node >= 20**. Ubuntu's `apt` package is older than
+that on every LTS you are likely to be running, so install from NodeSource:
+
+```sh
+curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
+sudo apt install -y nodejs
+node -v      # must be >= v20
+```
+
+### Deploy the code
+
+```sh
+sudo apt install -y git
+sudo git clone https://github.com/ssani-main/janus.git /opt/janus
+cd /opt/janus
+sudo npm ci --omit=dev
+```
+
+`--omit=dev` skips `holesail-server` and `ws`, which exist only for the e2e
+suite. Install them too if you intend to run `npm run test:e2e` on the box.
+
+### User, permissions, service
+
+Create a dedicated non-root user, and keep secrets owner-only:
 
 ```sh
 sudo useradd --system --no-create-home holesail
