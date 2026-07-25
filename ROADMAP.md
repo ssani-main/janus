@@ -112,7 +112,8 @@ dependencies (Node built-ins only).
   in `test/unit/tunnel-manager-eviction-race.test.js`.
 - **Circuit threshold silently coupled to reconnect attempts.**
   `recordFailure` fired once per reconnect *attempt*, so with shipped defaults
-  (`RECONNECT_MAX_ATTEMPTS=3` → 4 attempts, `CIRCUIT_FAILURE_THRESHOLD=5`) a
+  (`RECONNECT_MAX_ATTEMPTS=3` → 4 attempts, then-default
+  `CIRCUIT_FAILURE_THRESHOLD=5`) a
   single failed request contributed 4 failures — the circuit opened partway
   through the *second* failed request, and raising `RECONNECT_MAX_ATTEMPTS`
   silently made the breaker more trigger-happy. **Fixed:** exactly one
@@ -288,6 +289,15 @@ distinct key per request). The circuit breaker gives zero mitigation: one
 `ensureTunnel` calls `recordFailure` at most 4 times (attempts 0..3) but
 `CIRCUIT_FAILURE_THRESHOLD` is 5 — **4 < 5, so a single-use fake key's circuit
 never opens**, and its stale entry is swept after the cooldown.
+
+> **Arithmetic updated (post-M2 hardening):** `recordFailure` now fires once
+> per failed `ensureTunnel`, not once per attempt, and the default threshold
+> is 2. The numbers above are the state at audit time. **The conclusion is
+> unchanged and if anything stronger:** 1 < 2, so a single-use fake key —
+> each request using a distinct key — still never opens its own circuit. A
+> per-keyHash breaker cannot mitigate an attack whose whole shape is one key
+> per request; the mitigation is the per-IP new-tunnel limiter, as stated
+> below.
 
 Victim experience: a legitimate tenant's cold create hits
 `portPool.acquire()` throwing "port pool exhausted", wrapped into

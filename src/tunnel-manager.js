@@ -557,7 +557,8 @@ class TunnelManager {
     // `_createTunnel` call -- at each of the three throw sites below, never
     // once per reconnect attempt. It used to be per-attempt, which silently
     // coupled two independent knobs: with the shipped defaults
-    // (RECONNECT_MAX_ATTEMPTS=3 -> 4 attempts, CIRCUIT_FAILURE_THRESHOLD=5)
+    // (RECONNECT_MAX_ATTEMPTS=3 -> 4 attempts, then-default
+    // CIRCUIT_FAILURE_THRESHOLD=5)
     // ONE failed request contributed 4 failures, so the circuit opened
     // partway through the SECOND failed request rather than the fifth, and
     // raising RECONNECT_MAX_ATTEMPTS silently made the breaker more

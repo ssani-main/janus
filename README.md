@@ -108,7 +108,7 @@ All via environment variables (see [`.env.example`](./.env.example)).
 | `ADMIN_LOGIN_MAX_FAILS` | `5` | consecutive failed `/_admin/login` attempts (per IP) before lockout begins (S8). |
 | `ADMIN_LOGIN_LOCKOUT_MS` | `60000` | base lockout duration once the failure threshold is hit, in milliseconds; each further failure doubles it (capped at 2⁶×) (S8). |
 | `LOG_REQUESTS` | `false` | whether to emit a JSON line per request to stdout (Milestone 2a). High volume; opt in explicitly. Set to `true` or `"1"` to enable. |
-| `CIRCUIT_FAILURE_THRESHOLD` | `5` | consecutive **failed requests** before a keyHash's circuit opens (Milestone 2c). Once open, further cold creates fast-fail with 503 instead of attempting a DHT round trip. Counted per failed cold create, not per connect attempt — one request that exhausts its whole `RECONNECT_MAX_ATTEMPTS` chain still counts once, so the two knobs stay independent. |
+| `CIRCUIT_FAILURE_THRESHOLD` | `2` | consecutive **failed requests** before a keyHash's circuit opens (Milestone 2c). Once open, further cold creates fast-fail with 503 instead of attempting a DHT round trip. Counted per failed cold create, not per connect attempt — one request that exhausts its whole `RECONNECT_MAX_ATTEMPTS` chain still counts once, so the two knobs stay independent. |
 | `CIRCUIT_COOLDOWN_MS` | `30000` | how long a circuit stays open once it trips, in milliseconds (Milestone 2c). |
 | `RECONNECT_MAX_ATTEMPTS` | `3` | extra reconnect-with-backoff attempts after the first cold-create fails, before giving up and returning 502 (Milestone 2c). Default 3 = up to 4 total attempts. |
 | `RECONNECT_BASE_DELAY_MS` | `250` | base delay for reconnect backoff, in milliseconds; actual delay is exponential with jitter (Milestone 2c). |

@@ -155,7 +155,17 @@ const config = {
   // (or reactive proxy-error) failures for a keyHash before its circuit
   // opens and further cold creates fast-fail (503 + Retry-After) instead of
   // paying for a DHT round trip against a backend we already know is down.
-  CIRCUIT_FAILURE_THRESHOLD: readInt('CIRCUIT_FAILURE_THRESHOLD', 5),
+  //
+  // Counted per FAILED REQUEST. This used to be per connect ATTEMPT, so with
+  // the old default of 5 and RECONNECT_MAX_ATTEMPTS=3 (4 attempts) a single
+  // failed request contributed 4 failures and the circuit effectively opened
+  // on the 2nd one. Now that a whole cold-create chain counts once, a
+  // threshold of 5 would let a dead backend absorb five full chains -- each
+  // up to ENSURE_TUNNEL_TIMEOUT_MS of DHT work -- before the breaker
+  // protected anything. 2 preserves roughly the old effective aggressiveness
+  // under the corrected semantics, which is the behavior this default was
+  // always meant to express.
+  CIRCUIT_FAILURE_THRESHOLD: readInt('CIRCUIT_FAILURE_THRESHOLD', 2),
   // How long a circuit stays open once it trips, in milliseconds. Default
   // 30 seconds.
   CIRCUIT_COOLDOWN_MS: readInt('CIRCUIT_COOLDOWN_MS', 30000),
