@@ -1,73 +1,169 @@
-# Deploy runbook (Phase 3)
+# Deploy runbook
 
 Concise operator checklist for running the gateway on a real box. Not a
 substitute for reading `src/config.js` / `.env.example`.
 
-## 1. systemd unit
+Worked example throughout: **`BASE_DOMAIN=janus.ssani.dev`, DNS on Porkbun**.
+Substitute your own domain/provider as needed — nothing here is specific to
+that name except the DNS-01 plugin choice in section 2.
 
-```ini
-# /etc/systemd/system/janus.service
-[Unit]
-Description=Janus
-After=network-online.target
-Wants=network-online.target
+> **Run exactly one instance.** The tunnel pool, the local port pool, the rate
+> limiter and the JSON store are all per-process (in-memory or single-file).
+> Do not template the systemd unit, do not use a cluster manager, do not run
+> two boxes against one store file. Two instances fight over tunnel ports and
+> interleave writes to the store.
 
-[Service]
-Type=simple
-User=holesail
-Group=holesail
-WorkingDirectory=/opt/janus
-EnvironmentFile=/opt/janus/.env
-ExecStart=/usr/bin/node src/server.js
-Restart=always
-RestartSec=2
-NoNewPrivileges=true
-ProtectSystem=strict
-ReadWritePaths=/opt/janus
-# S5: belt-and-braces -- any file the process creates (store, tmp files)
-# comes out owner-only even if a future code change forgets to pass an
-# explicit mode.
-UMask=0077
+## 0. Before you touch the VPS
 
-[Install]
-WantedBy=multi-user.target
+Two things to confirm up front, because both are cheap to check and expensive
+to debug later:
+
+**Outbound UDP must work.** Holesail's holepunching is outbound UDP from this
+box to arbitrary peers. No inbound port is needed for it, but a few budget
+providers filter or aggressively rate-limit outbound UDP. If they do, the apex
+page will look perfectly healthy while *every tunnel* fails — you will spend
+the afternoon debugging the wrong layer. Check with your provider, then
+confirm empirically in section 6.
+
+**`.dev` is HSTS-preloaded.** The entire `.dev` TLD ships in the browser
+preload list, so Chrome/Firefox/Safari refuse plain HTTP for these names with
+**no click-through override**. Consequences:
+
+- If the wildcard cert fails to issue, the gateway is not "insecure", it is
+  **unreachable**, with no bypass. Get section 2 working before sharing links.
+- You cannot smoke-test over plain HTTP in a browser. Use curl on the box:
+  `curl -H "Host: 0000<key>.janus.ssani.dev" http://127.0.0.1:3000/`
+- `COOKIE_SECURE` must stay `true` (the default). Don't flip it "just to test".
+
+## 1. DNS (Porkbun)
+
+Two records in the `ssani.dev` zone, both pointing at the VPS:
+
+```
+janus.ssani.dev      A     <vps-ipv4>      (and AAAA if you have IPv6)
+*.janus.ssani.dev    A     <vps-ipv4>
 ```
 
-Create a dedicated non-root user first (`useradd --system --no-create-home
-holesail`), `chown` the deploy directory to it, and keep `.env` readable
-only by that user (`chmod 600 .env`).
+The wildcard covers exactly one label, which is exactly what the design needs:
+`0000<52-char-key>.janus.ssani.dev` is one level below the base. A key label is
+56 characters, comfortably under the 63-char DNS limit.
 
-`janus-data.json` (the runtime store) also holds plaintext raw Holesail
-keys, so it needs the same treatment (S5). The code now creates it -- and
-its tmp files -- at `0600` itself, and an atomic rename means an existing
-`0644` store self-heals to `0600` the next time anything writes to it. On
-an already-deployed box, don't wait for that: run `chmod 600
-janus-data.json` immediately after upgrading.
+If you already have a broader `*.ssani.dev` record pointing elsewhere, the more
+specific `*.janus.ssani.dev` wins — no conflict.
+
+**Enable API access on the domain.** Porkbun disables its API *per domain* by
+default. In the Porkbun panel: `ssani.dev` → Details → toggle **API ACCESS**
+on. Skipping this makes every DNS-01 challenge fail with an error that does not
+look like a permissions problem. Then generate an API key + secret under
+Account → API Access.
+
+## 2. Caddy in front
+
+Caddy terminates TLS and reverse-proxies to `127.0.0.1:$PORT`. See the
+[`Caddyfile`](./Caddyfile) in this repo — it is already written for
+`janus.ssani.dev` + Porkbun.
+
+**Stock Caddy will not work.** Wildcard certs require a DNS-01 challenge, and
+DNS provider plugins are compiled in, not loaded at runtime:
 
 ```sh
+# build a Caddy with the Porkbun DNS plugin
+xcaddy build --with github.com/caddy-dns/porkbun
+sudo install -m 0755 ./caddy /usr/bin/caddy
+```
+
+Give Caddy the credentials via a systemd drop-in (not a world-readable env
+file):
+
+```sh
+sudo systemctl edit caddy
+```
+```ini
+[Service]
+Environment=PORKBUN_API_KEY=pk1_xxxxxxxx
+Environment=PORKBUN_API_SECRET_KEY=sk1_xxxxxxxx
+```
+
+Then:
+
+```sh
+sudo cp Caddyfile /etc/caddy/Caddyfile
+sudo systemctl enable --now caddy
+sudo journalctl -u caddy -f     # WATCH THIS until certs actually issue
+```
+
+First issuance can take a few minutes (DNS propagation). Do not move on until
+you see the wildcard cert obtained — see the HSTS note in section 0 for why.
+Renewal is automatic; Caddy's built-in loop handles it, no cron needed.
+
+## 3. The gateway service
+
+Create a dedicated non-root user, deploy to `/opt/janus`, and keep secrets
+owner-only:
+
+```sh
+sudo useradd --system --no-create-home holesail
+sudo chown -R holesail:holesail /opt/janus
+sudo chmod 600 /opt/janus/.env
+```
+
+`janus-data.json` (the runtime store) holds plaintext raw Holesail keys, so it
+needs the same treatment. The code creates it — and its tmp files — at `0600`
+itself, and an atomic rename means an existing `0644` store self-heals to
+`0600` the next time anything writes to it. On an already-deployed box, don't
+wait for that: run `chmod 600 janus-data.json` immediately after upgrading.
+
+A hardened unit is provided at [`deploy/janus.service`](./deploy/janus.service)
+— filesystem/privilege confinement, `MemoryMax`/`TasksMax` so a leak restarts
+one service instead of OOMing the box, and a raised journald rate limit so
+`LOG_REQUESTS=true` doesn't silently drop lines under load.
+
+```sh
+sudo cp deploy/janus.service /etc/systemd/system/janus.service
 sudo systemctl daemon-reload
 sudo systemctl enable --now janus
 sudo journalctl -u janus -f
 ```
 
-## 2. Caddy in front
+### Minimum viable `.env`
 
-Caddy terminates TLS and reverse-proxies to `127.0.0.1:$PORT` (see the
-existing `Caddyfile` in this directory for the wildcard vhost). With a
-DNS-01 challenge configured for your DNS provider, wildcard certs
-(`*.<BASE_DOMAIN>` + `<BASE_DOMAIN>`) auto-renew -- no cron job needed,
-Caddy's built-in renewal loop handles it. Just make sure:
+`BASE_DOMAIN` is the only strictly required variable, but a real deploy wants
+these. Full annotated reference in [`.env.example`](./.env.example).
 
-- The DNS-01 plugin/API token Caddy needs is present in its environment.
-- `systemctl enable --now caddy` so it survives reboots.
-- `sudo journalctl -u caddy -f` to confirm certs actually issue on first
-  boot (DNS propagation can take a few minutes).
+```sh
+BASE_DOMAIN=janus.ssani.dev
 
-## 3. Firewall
+# Sessions won't survive a restart without this (a random per-process secret
+# is generated otherwise). >= 32 chars.
+SESSION_SECRET=$(openssl rand -hex 32)
 
-Only the ports Caddy and SSH need are open; the Node process stays on
-loopback (`BIND_HOST=127.0.0.1`, already the default) and is never exposed
-directly.
+# Enables the admin API + dashboard. Unset disables the admin surface
+# entirely. >= 16 chars, enforced at startup; use a real random value.
+ADMIN_TOKEN=$(openssl rand -hex 24)
+
+# Impressum / abuse contact. Pages render a "NOT CONFIGURED" warning until set.
+OPERATOR_NAME="..."
+OPERATOR_ADDRESS="..."
+OPERATOR_EMAIL="..."
+ABUSE_EMAIL="..."
+
+STORE_PATH=/opt/janus/janus-data.json
+
+# Behind Caddy, which overwrites XFF with the real remote host (see Caddyfile).
+TRUST_PROXY=true
+TRUSTED_PROXY_HOPS=1
+```
+
+Sizing note: `MAX_TUNNELS` defaults to 50, and each live tunnel is a
+holesail-client with its own DHT state. On a 1 GB VPS start at the default,
+watch `janus_tunnels_active` against memory, and tune `MemoryMax` in the unit
+file alongside any increase.
+
+## 4. Firewall
+
+Only what Caddy and SSH need. The Node process stays on loopback
+(`BIND_HOST=127.0.0.1`, already the default) and is never exposed directly. The
+tunnel port pool (20000–20999) is loopback-only — do not open it.
 
 ```sh
 sudo ufw default deny incoming
@@ -77,52 +173,106 @@ sudo ufw allow 443/tcp
 sudo ufw enable
 ```
 
-Holesail's own P2P/HyperDHT traffic is outbound UDP from the gateway box to
-peers -- no additional inbound port needs opening for that.
+Holesail's own P2P/HyperDHT traffic is **outbound** UDP from this box to peers.
+`ufw default deny incoming` does not block it (outbound is allowed by default,
+and replies are conntracked). No additional inbound port is needed.
 
-## 4. fail2ban (optional, realistic expectations)
+## 5. Backups
 
-The gateway logs rate-limit rejections (429) and admin auth failures (401)
-to stdout, which systemd/journald captures. There is no built-in
-fail2ban-ready log file out of the box -- if you want IP bans on top of the
-in-process rate limiter, the simplest realistic option is:
+The store is the only copy of every alias, password hash, blocklist entry and
+aliased raw key. Raw-key URLs are stateless and survive anything; **aliases do
+not**. [`deploy/backup-store.sh`](./deploy/backup-store.sh) snapshots it,
+validates the JSON parses before keeping it, encrypts to a GPG recipient if you
+give it one, and rotates.
 
-- Point fail2ban at `journalctl -u janus` output (via a small
-  filter matching `RateLimiter` 429 lines or `unauthorized` 401 lines) and
-  have it `ufw deny` repeat offenders. This is a defense-in-depth nice-to-have,
-  not a requirement -- the per-IP `RateLimiter` in `src/rate-limit.js` already
-  bounds abuse per window without any external tooling.
-- Alternatively, let Caddy's `rate_limit` (via a plugin) or a CDN in front
-  handle L7 abuse instead of fail2ban -- often less brittle than parsing
-  journald.
-
-Don't over-invest here on day one; the in-process rate limiter is the
-primary control.
-
-## 5. Uptime monitoring
-
-Point your monitor (e.g. UptimeRobot, Healthchecks, a cron+curl) at:
-
+```sh
+sudo install -d -o holesail -g holesail /var/backups/janus
+sudo -u holesail crontab -e
 ```
-GET https://<BASE_DOMAIN>/
+```cron
+17 3 * * * STORE_PATH=/opt/janus/janus-data.json BACKUP_DIR=/var/backups/janus \
+  JANUS_BACKUP_GPG_RECIPIENT=you@example.com \
+  /opt/janus/deploy/backup-store.sh >> /var/log/janus-backup.log 2>&1
 ```
 
-Expect `200` (the apex paste-a-key page). This is a good health check
-because it needs no Holesail key and exercises the full path: DNS -> TLS
-(Caddy) -> Node -> routing -> response. A `502`/`503`/timeout here means
-the Node process is down or Caddy can't reach it.
+Without `JANUS_BACKUP_GPG_RECIPIENT` the script still runs but warns loudly:
+the backup is then a second plaintext copy of every backend's bearer
+credential. **A local-only backup does not survive the failure it exists for**
+— sync `/var/backups/janus` offsite (restic/rclone/borg to object storage).
 
-## 6. Two-machine field test reminder
+## 6. Monitoring
+
+**Liveness.** Point your monitor (UptimeRobot, Healthchecks, cron+curl) at:
+
+```
+GET https://janus.ssani.dev/
+```
+
+Expect `200` (the apex paste-a-key page). Good check because it needs no key
+and exercises DNS → TLS (Caddy) → Node → routing → response. A `502`/`503`/
+timeout means Node is down or Caddy can't reach it. `/healthz` is the cheaper
+machine-readable equivalent and is exempt from rate limiting.
+
+**Correctness.** Liveness only proves the apex page renders — it says nothing
+about whether *tunnels* work, which is the thing that actually breaks. The
+single highest-value monitor for this architecture is a **synthetic canary**:
+keep one always-on backend with a known key and have an external check fetch
+`https://0000<canary-key>.janus.ssani.dev/` every few minutes. That is the only
+signal that covers the whole path including the DHT.
+
+**Metrics.** `/metrics` (Prometheus text format, admin-authenticated) already
+exposes the signals worth alerting on:
+
+| Signal | Alert when |
+|---|---|
+| `janus_tunnels_unhealthy` | `> 0` sustained — backends failing liveness probes |
+| `janus_circuit_opens_total` | rate increases — repeated cold-create failures |
+| `janus_connect_failures_total` | rate spike — DHT/holepunch trouble (see section 0) |
+| `janus_ws_rejected_total` | `> 0` — hitting `WS_MAX_SLOTS`/`WS_MAX_PER_IP` caps |
+| `janus_tunnels_active` vs `MAX_TUNNELS` | approaching the cap |
+
+## 7. Logs
+
+`LOG_REQUESTS=true` emits one JSON line per request to stdout, captured by
+journald. The provided unit raises journald's per-service rate limit so lines
+aren't silently dropped under load. Cap total disk use system-wide:
+
+```sh
+sudo mkdir -p /etc/systemd/journald.conf.d
+printf '[Journal]\nSystemMaxUse=500M\nMaxRetentionSec=30day\n' \
+  | sudo tee /etc/systemd/journald.conf.d/janus.conf
+sudo systemctl restart systemd-journald
+```
+
+## 8. fail2ban (optional, realistic expectations)
+
+The gateway logs rate-limit rejections (429) and admin auth failures (401) to
+stdout, which journald captures. There is no built-in fail2ban-ready log file —
+if you want IP bans on top of the in-process limiter:
+
+- Point fail2ban at `journalctl -u janus` (a small filter matching
+  `RateLimiter` 429 lines or `unauthorized` 401 lines) and have it `ufw deny`
+  repeat offenders. Defense in depth, not a requirement — `src/rate-limit.js`
+  already bounds abuse per window with no external tooling.
+- Alternatively let Caddy's `rate_limit` plugin or a CDN handle L7 abuse —
+  often less brittle than parsing journald.
+
+Don't over-invest here on day one. Note the admin login surface already has its
+own lockout (`ADMIN_LOGIN_MAX_FAILS` / `ADMIN_LOGIN_LOCKOUT_MS`, S8).
+
+## 9. Two-machine field test
 
 Before calling a deploy done, run the real cross-NAT test from
 `TEST_REPORT.md` / `GATEWAY_DESIGN.md`: one machine behind a real
-consumer/mobile NAT running `holesail --live <port>` (or the
-`holesail-server` snippet in the README), a *different* network reaching
-the resulting `https://0000<key>.<BASE_DOMAIN>/` URL through this gateway.
-Confirm:
+consumer/mobile NAT running `holesail --live <port>` (or the `holesail-server`
+snippet in the README), and a *different* network reaching the resulting
+`https://0000<key>.janus.ssani.dev/` URL through this gateway. Confirm:
 
-- The HTTP holepunch actually completes (not just loopback-to-loopback on
-  the same box, which hides NAT traversal failures).
-- Throughput is sane for your use case (a quick file download or a
-  `curl -o /dev/null -w '%{speed_download}\n'` against a large-ish
-  response is enough of a smoke test).
+- The holepunch actually completes (not just loopback-to-loopback on the same
+  box, which hides NAT traversal failures *and* the outbound-UDP problem from
+  section 0).
+- Throughput is sane for your use case (`curl -o /dev/null -w '%{speed_download}\n'`
+  against a large-ish response is enough of a smoke test).
+
+The `field-test/` kit automates both halves — see
+[`field-test/README.md`](./field-test/README.md).

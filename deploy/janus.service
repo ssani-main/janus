@@ -1,0 +1,75 @@
+# Janus gateway -- systemd unit.
+#
+#   sudo cp deploy/janus.service /etc/systemd/system/janus.service
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now janus
+#
+# Assumes the layout in DEPLOY.md: code at /opt/janus, owned by a dedicated
+# non-root `holesail` user, with /opt/janus/.env at mode 0600.
+#
+# RUN EXACTLY ONE INSTANCE. Do not template this unit to N copies and do not
+# put the process behind a cluster manager: the tunnel pool, the local port
+# pool, the rate limiter and the JSON store are all per-process (in-memory or
+# single-file). Two instances would fight over the same tunnel ports and
+# interleave writes to the same store file.
+
+[Unit]
+Description=Janus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=holesail
+Group=holesail
+WorkingDirectory=/opt/janus
+EnvironmentFile=/opt/janus/.env
+ExecStart=/usr/bin/node src/server.js
+Restart=always
+RestartSec=2
+
+# --- filesystem / privilege hardening --------------------------------------
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictRealtime=true
+LockPersonality=true
+ReadWritePaths=/opt/janus
+# S5: belt-and-braces -- any file the process creates (store, tmp files)
+# comes out owner-only even if a future code change forgets to pass an
+# explicit mode.
+UMask=0077
+
+# The gateway listens on loopback and makes outbound TCP + UDP (HyperDHT).
+# Everything else -- raw packet sockets, netlink, unix-domain oddities -- it
+# has no business using.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# --- resource limits -------------------------------------------------------
+# MAX_TUNNELS bounds how many tunnels exist, but nothing bounds how much
+# memory each one's DHT state and buffered proxy traffic consumes. Without a
+# ceiling, a leak or a traffic spike OOMs the whole box instead of restarting
+# one service. Tune MemoryMax to the VPS: roughly (RAM - 512M headroom), and
+# raise it if you raise MAX_TUNNELS substantially.
+MemoryMax=768M
+MemoryHigh=640M
+TasksMax=512
+LimitNOFILE=16384
+
+# --- logging ---------------------------------------------------------------
+# LOG_REQUESTS=true emits one JSON line per request. journald's per-service
+# rate limiter silently DROPS messages past its threshold, which turns an
+# audit log into an unreliable one exactly when traffic is highest -- so raise
+# it here rather than discovering the gap later. See also DEPLOY.md section 7
+# for capping total journal disk usage.
+LogRateLimitIntervalSec=30
+LogRateLimitBurst=20000
+
+[Install]
+WantedBy=multi-user.target
