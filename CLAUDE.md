@@ -41,7 +41,7 @@ fight over tunnel ports and interleave writes to the store.
 
 ```sh
 npm run check      # node --check every src module (no build step exists)
-npm test           # 218 unit tests, no network
+npm test           # 226 unit tests, no network
 npm run test:e2e   # 7 tests against real Holesail tunnels; needs devDependencies
 ```
 
@@ -71,6 +71,12 @@ holepunch is flaky on hosted runners.
 
 ## Things that look like bugs but are not
 
+- **A key from `holesail --live <port>` gets a 400 — that is correct.** The CLI
+  defaults to a *private* connection string and prints an `s000…` key, which
+  `key.js:assertPublic` rejects on purpose (it is the serve credential). You
+  must pass `--public` to get the `0000…` key the gateway accepts. This looks
+  exactly like a broken gateway and is not; `/guide` and `/llms.txt` exist
+  largely to stop visitors falling into it.
 - `src/tunnel-manager.js` installs a process-wide `uncaughtException` handler.
   It is a deliberate workaround: `HolesailClient` is not an EventEmitter and
   never forwards `EADDRINUSE` from the `net.Server` it creates internally, so

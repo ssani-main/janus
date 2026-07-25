@@ -6,7 +6,7 @@
 
 One small always-on VPS with a single wildcard domain becomes the public front door for an arbitrary number of backend projects. Each backend runs anywhere (home PC, laptop, Pi, VPS) with **no domain, no port forwarding, no public IP**, reachable only over Holesail's [HyperDHT](https://github.com/holepunchto/hyperdht) tunnel. The gateway runs the Holesail *client* on the visitor's behalf and reverse-proxies plain HTTPS to it, so visitors just open a link.
 
-> **Status:** ✅ Built and verified end-to-end against live Holesail tunnels — Phase 0 (10/10) · Phase 1 (13/13) · Phase 2 (9/9) · Phase 3 (19/19). **Milestone 1** adds a persistent store, named aliases, optional per-key passwords, and an HTML admin dashboard. **Milestone 2** adds observability (`/healthz`, `/metrics`, structured request logging) and resilience (exponential-backoff reconnect, circuit breaker, periodic health probes, friendly offline page). **Security:** all 13 findings from the 2026-07 audit are fixed — cross-tenant cookie isolation, X-Forwarded-For hardening, websocket-DoS bounds, `0600` store with fsync durability, credential purge on clear, and admin login lockout + per-session CSRF. A **post-M2 hardening pass** then closed an unclaimed-tunnel eviction race, corrected circuit-breaker accounting to count failed requests rather than connect attempts, and made two previously hardcoded tuning constants operator-configurable. **218 unit tests + 7 live-DHT e2e tests pass.** See [`GATEWAY_DESIGN.md`](./GATEWAY_DESIGN.md) for the full design, [`ROADMAP.md`](./ROADMAP.md) for the audit backlog and what's next, and [`TEST_REPORT.md`](./TEST_REPORT.md) for the verification report.
+> **Status:** ✅ Built and verified end-to-end against live Holesail tunnels — Phase 0 (10/10) · Phase 1 (13/13) · Phase 2 (9/9) · Phase 3 (19/19). **Milestone 1** adds a persistent store, named aliases, optional per-key passwords, and an HTML admin dashboard. **Milestone 2** adds observability (`/healthz`, `/metrics`, structured request logging) and resilience (exponential-backoff reconnect, circuit breaker, periodic health probes, friendly offline page). **Security:** all 13 findings from the 2026-07 audit are fixed — cross-tenant cookie isolation, X-Forwarded-For hardening, websocket-DoS bounds, `0600` store with fsync durability, credential purge on clear, and admin login lockout + per-session CSRF. A **post-M2 hardening pass** then closed an unclaimed-tunnel eviction race, corrected circuit-breaker accounting to count failed requests rather than connect attempts, and made two previously hardcoded tuning constants operator-configurable. The apex now also serves a `/guide` walkthrough for publishing a local app, and a plain-text `/llms.txt` of the same content for AI assistants. **226 unit tests + 7 live-DHT e2e tests pass.** See [`GATEWAY_DESIGN.md`](./GATEWAY_DESIGN.md) for the full design, [`ROADMAP.md`](./ROADMAP.md) for the audit backlog and what's next, and [`TEST_REPORT.md`](./TEST_REPORT.md) for the verification report.
 
 ---
 
@@ -46,10 +46,12 @@ Built on the official Holesail libraries:
 On the machine hosting your app (say it listens on `127.0.0.1:8080`):
 
 ```bash
-npx holesail --live 8080          # prints a public connection key
+npx holesail --live 8080 --public    # prints a public connection key
 ```
 
-Use the **public** key (the `0000…` / secure-off form). The gateway **rejects secure-mode `s000…` keys** on purpose — that form is the seed, and putting it in a URL/TLS-SNI would leak serving capability (see [Security](#security)).
+`--public` is **required**. Without it the CLI defaults to a *private* connection string and prints an `s000…` key. The gateway **rejects secure-mode `s000…` keys** on purpose — that form is the seed, and putting it in a URL/TLS-SNI would leak serving capability (see [Security](#security)) — so omitting the flag gets you a `400` with no other explanation.
+
+Everything after `hs://` is the subdomain, `0000` prefix included. There is a walkthrough of this at `/guide` on a running gateway, and a plain-text version at `/llms.txt` for pasting into an AI assistant.
 
 ### 2. Configure and run the gateway
 On the gateway box:
@@ -195,7 +197,7 @@ filters outbound UDP, and DNS-provider API access that is off). In short:
 │   ├── logger.js         JSON-lines request logger (Milestone 2a)
 │   ├── metrics.js        Prometheus text-format metrics renderer (Milestone 2a)
 │   ├── fonts.js          self-hosted OFL typefaces as base64 data URIs
-│   ├── pages.js          apex / Impressum / ToS / 429 / login / admin pages / offline page
+│   ├── pages.js          apex / guide / llms.txt / Impressum / ToS / 429 / login / admin pages / offline page
 │   ├── admin.js          admin JSON API + HTML dashboard (aliases, passwords, blocks, health status)
 │   └── server.js         HTTP + WebSocket entrypoint, alias + password gate, /healthz + /metrics
 ├── deploy/

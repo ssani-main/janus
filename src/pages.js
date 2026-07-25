@@ -106,7 +106,12 @@ const STYLE = `
 
 function footer(config) {
   const abuseContact = configuredOrPlaceholder(config.ABUSE_EMAIL, 'ABUSE_EMAIL (or OPERATOR_EMAIL)')
+  // Absolute-path links, so they still resolve to the apex from a tenant
+  // subdomain's error page -- which is exactly where a visitor staring at a
+  // 400 needs the guide most.
+  const apex = `https://${escapeHtml(config.BASE_DOMAIN)}`
   return `<footer>
+    <a href="${apex}/guide">Guide</a> &middot;
     <a href="/impressum">Impressum</a> &middot; <a href="/terms">Terms of Service</a><br>
     Abuse contact: ${abuseContact}
   </footer>`
@@ -134,6 +139,9 @@ function apexPage(config) {
       <input id="key" type="text" placeholder="hs://0000... or bare key" autofocus>
       <button type="submit">Go</button>
     </form>
+    <p>Don't have a key? <a href="/guide">Publish a local app in three
+      commands</a> &mdash; or hand <a href="/llms.txt">/llms.txt</a> to an AI
+      assistant and let it walk you through it.</p>
     ${footer(config)}
   </div>
   <script>
@@ -214,6 +222,180 @@ function termsPage(config) {
   </div>
 </body>
 </html>`
+}
+
+// The apex page hands out a key box but never says where a key comes from.
+// This is that missing half: how to put a locally-running app behind the
+// gateway. Two representations of the same content -- guidePage() for
+// humans, llmsTxt() for an AI assistant the visitor is pasting into.
+//
+// The `--public` flag is the single most important detail on this page.
+// `holesail --live <port>` WITHOUT it emits an `s000` secure-mode key,
+// which key.js:assertPublic deliberately rejects with a 400. Anyone
+// following the bare command lands on an error page with no clue why.
+function guidePage(config) {
+  const safeDomain = escapeHtml(config.BASE_DOMAIN)
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Guide - Janus</title>
+<style>${STYLE}</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Publish a local app</h1>
+    <p class="tagline">from localhost to https, in three commands</p>
+
+    <p>Janus turns a <a href="https://holesail.io">Holesail</a> public key into
+      a public HTTPS site. Your app keeps running on your own machine; nothing
+      is uploaded, and visitors install nothing.</p>
+
+    <h2>1. Run your app</h2>
+    <p>Start it however you normally would and note the port. Binding to
+      <code>127.0.0.1</code> is fine &mdash; you do <em>not</em> need to expose
+      it on <code>0.0.0.0</code>.</p>
+
+    <h2>2. Publish the port</h2>
+    <p><code>npx holesail --live 3000 --public</code></p>
+    <p><strong>The <code>--public</code> flag is required.</strong> Without it
+      Holesail prints an <code>s000</code> private key, which is the
+      <em>serve</em> credential &mdash; it lets the holder impersonate your
+      backend. This gateway refuses those on purpose, so a key without
+      <code>--public</code> gets you a <code>400</code> and nothing else.</p>
+
+    <h2>3. Open the link</h2>
+    <p>Holesail prints <code>hs://0000&hellip;</code>. Everything after
+      <code>hs://</code> is your subdomain:</p>
+    <p><code>https://0000&lt;your-key&gt;.${safeDomain}/</code></p>
+
+    <h2>The key is the password</h2>
+    <p>There is no other access control. Anyone holding that URL reaches your
+      app exactly as you left it &mdash; and a local dev server usually has no
+      login at all, so &ldquo;anyone&rdquo; means full access to whatever it
+      can read, write, or spend.</p>
+    <ul>
+      <li>The key travels in the TLS SNI field, which is <strong>not</strong>
+        encrypted, and lands in browser history, bookmarks and
+        <code>Referer</code> headers sent to third-party sites.</li>
+      <li>Treat the URL as a bearer token. Don't post it anywhere public.</li>
+      <li>Stopping the local process revokes it. The key changes on the next
+        start unless you pass a fixed seed.</li>
+    </ul>
+
+    <h2>When something breaks</h2>
+    <ul>
+      <li><code>400</code> &mdash; the key is malformed, or it's an
+        <code>s000</code> secure key. Re-run step 2 with <code>--public</code>.</li>
+      <li><code>502</code> &mdash; the gateway found your key on the DHT but
+        your app didn't answer. Check the local process is still up and that
+        you published the right port.</li>
+      <li><code>503</code> &mdash; the gateway is at tunnel capacity, or it has
+        recently failed to reach this backend and is backing off. Retry.</li>
+      <li><code>429</code> &mdash; you're being rate limited. Slow down.</li>
+      <li><strong>Nothing happens at all</strong> &mdash; holepunching needs
+        outbound UDP. Symmetric NAT and CGNAT (common on mobile carriers, some
+        ISPs, and locked-down office networks) can block it. This is a network
+        condition, not a fault in your app; try another connection.</li>
+    </ul>
+
+    <h2>Framework notes</h2>
+    <ul>
+      <li>Requests arrive with <code>Host: 0000&lt;key&gt;.${safeDomain}</code>.
+        Dev servers that allowlist hostnames will reject that until you add it
+        &mdash; <code>server.allowedHosts</code> in Vite,
+        <code>allowedHosts</code> in webpack-dev-server,
+        <code>ALLOWED_HOSTS</code> in Django.</li>
+      <li><code>X-Forwarded-Proto</code> arrives as <code>https,http</code>,
+        because two proxies each append a value. Read the <em>leftmost</em>
+        entry; an exact comparison against <code>"https"</code> will fail and
+        can send a framework into a redirect loop.</li>
+      <li>WebSockets work. Connect to <code>wss://</code> on the same
+        hostname.</li>
+    </ul>
+
+    <p>Machine-readable version for an AI assistant:
+      <a href="/llms.txt">/llms.txt</a></p>
+
+    ${footer(config)}
+  </div>
+</body>
+</html>`
+}
+
+// Same content as guidePage(), as plain text, for pasting into an AI
+// assistant. Served as text/plain, so no escaping applies -- BASE_DOMAIN is
+// operator config rather than request-derived, and nothing else here is
+// dynamic.
+function llmsTxt(config) {
+  return `# Janus
+
+Janus publishes an app running on your own machine as a public HTTPS site.
+It does this by encoding a Holesail P2P public key into a subdomain, so
+routing needs no database and no account. The app is never uploaded; the
+gateway holds a peer-to-peer tunnel to your machine for as long as your
+process is running.
+
+Base domain: ${config.BASE_DOMAIN}
+URL shape:   https://0000<52-char-key>.${config.BASE_DOMAIN}/
+
+## Quickstart
+
+1. Start the app locally and note its port. Binding to 127.0.0.1 is fine;
+   binding to 0.0.0.0 is NOT required.
+2. Publish that port:
+       npx holesail --live <port> --public
+3. Copy the printed key. It looks like: hs://0000<52 chars>
+4. Open https://0000<52 chars>.${config.BASE_DOMAIN}/ -- everything after
+   "hs://" is the subdomain, the "0000" prefix included.
+
+## The --public flag is mandatory
+
+"holesail --live <port>" without --public prints an s000-prefixed key. That
+is the SECURE-mode key: it is the serve credential and lets whoever holds it
+impersonate the backend. This gateway rejects s000 keys by design and answers
+400. If you got a 400, this is almost certainly why.
+
+## Security model
+
+The key is the only credential. Anyone with the URL reaches the app with
+whatever privileges it already grants, and a local development server
+typically has no authentication at all.
+
+- The key is visible in the TLS SNI field, which is sent unencrypted.
+- It is retained in browser history and sent in Referer headers to
+  third-party origins the page links to or loads from.
+- Treat the URL as a bearer token; do not publish it.
+- Killing the local process revokes access. Restarting mints a new key
+  unless a fixed seed is supplied.
+
+## Status codes
+
+400  Key malformed, or an s000 secure key. Re-run with --public.
+502  Key resolved on the DHT, but the backend did not answer. The local
+     process is probably stopped, or a different port was published.
+503  Gateway at tunnel capacity, or backing off after repeated failures to
+     reach this backend. Retry.
+429  Rate limited.
+404  Unknown host -- the subdomain is not a well-formed key for this domain.
+
+If nothing resolves at all, holepunching is failing. It needs outbound UDP,
+and symmetric NAT or CGNAT (mobile carriers, some ISPs, restrictive office
+networks) can prevent it. That is a network condition, not an application
+bug. Retry from a different network.
+
+## Notes for frameworks
+
+- The Host header is 0000<key>.${config.BASE_DOMAIN}. Dev servers that
+  allowlist hostnames must be told about it: server.allowedHosts (Vite),
+  allowedHosts (webpack-dev-server), ALLOWED_HOSTS (Django).
+- X-Forwarded-Proto arrives as "https,http" because two proxies each append
+  a value. Parse the leftmost entry. An exact match against "https" fails
+  and can cause an HTTPS-redirect loop.
+- X-Forwarded-For is a list; the client is the leftmost entry.
+- WebSockets are proxied. Use wss:// on the same hostname.
+`
 }
 
 // Milestone 1, Feature 3: served in place of a passworded key's normal
@@ -524,6 +706,8 @@ function adminDashboardPage({ rows, csrf, config, error }) {
 module.exports = {
   escapeHtml,
   apexPage,
+  guidePage,
+  llmsTxt,
   impressumPage,
   termsPage,
   errorPage,

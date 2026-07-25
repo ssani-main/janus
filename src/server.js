@@ -9,7 +9,7 @@ const { parseKey } = require('./key')
 const { load: loadStore } = require('./store')
 const { TunnelManager, CapacityError, ConnectError, KeyError, BlockedError, CircuitOpenError } = require('./tunnel-manager')
 const { RateLimiter } = require('./rate-limit')
-const { apexPage, impressumPage, termsPage, errorPage, offlinePage, rateLimitPage, loginPage } = require('./pages')
+const { apexPage, guidePage, llmsTxt, impressumPage, termsPage, errorPage, offlinePage, rateLimitPage, loginPage } = require('./pages')
 const { handleAdmin } = require('./admin')
 const { hashPassword, verifyPassword, signSession, verifySession, parseCookies, timingSafeEqualStr } = require('./auth')
 const { renderMetrics } = require('./metrics')
@@ -495,6 +495,16 @@ const server = http.createServer(async (req, res) => {
       // already computed above (clientIp(req)) for the request logger/rate
       // limiter, so reuse it here instead of recomputing.
       await handleAdmin(req, res, { manager, config, store, sessionSecret, ip })
+      return
+    }
+    if (url.pathname === '/guide') {
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(guidePage(config))
+      return
+    }
+    if (url.pathname === '/llms.txt') {
+      res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' })
+      res.end(llmsTxt(config))
       return
     }
     if (url.pathname === '/impressum') {
