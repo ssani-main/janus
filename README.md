@@ -2,11 +2,43 @@
 
 [![CI](https://github.com/ssani-main/janus/actions/workflows/ci.yml/badge.svg)](https://github.com/ssani-main/janus/actions/workflows/ci.yml)
 
-**Janus** is a gateway that turns any Holesail P2P key into a normal, clickable HTTPS website — no domain, no open ports, and no software for your visitors. *(Named for the Roman god of gates and doorways.)*
+**Turn any Holesail P2P key into a normal, clickable HTTPS website.**
+No domain, no open ports, no public IP — and nothing for your visitors to install.
 
-One small always-on VPS with a single wildcard domain becomes the public front door for an arbitrary number of backend projects. Each backend runs anywhere (home PC, laptop, Pi, VPS) with **no domain, no port forwarding, no public IP**, reachable only over Holesail's [HyperDHT](https://github.com/holepunchto/hyperdht) tunnel. The gateway runs the Holesail *client* on the visitor's behalf and reverse-proxies plain HTTPS to it, so visitors just open a link.
+```
+npx holesail --live 8080 --public          # on your laptop
+→ https://0000<key>.gw.yourdomain.com/     # public, HTTPS, works everywhere
+```
 
-> **Status:** ✅ Built and verified end-to-end against live Holesail tunnels — Phase 0 (10/10) · Phase 1 (13/13) · Phase 2 (9/9) · Phase 3 (19/19). **Milestone 1** adds a persistent store, named aliases, optional per-key passwords, and an HTML admin dashboard. **Milestone 2** adds observability (`/healthz`, `/metrics`, structured request logging) and resilience (exponential-backoff reconnect, circuit breaker, periodic health probes, friendly offline page). **Security:** all 13 findings from the 2026-07 audit are fixed — cross-tenant cookie isolation, X-Forwarded-For hardening, websocket-DoS bounds, `0600` store with fsync durability, credential purge on clear, and admin login lockout + per-session CSRF. A **post-M2 hardening pass** then closed an unclaimed-tunnel eviction race, corrected circuit-breaker accounting to count failed requests rather than connect attempts, and made two previously hardcoded tuning constants operator-configurable. The apex now also serves a `/guide` walkthrough for publishing a local app, and a plain-text `/llms.txt` of the same content for AI assistants. **226 unit tests + 7 live-DHT e2e tests pass.** See [`GATEWAY_DESIGN.md`](./GATEWAY_DESIGN.md) for the full design, [`ROADMAP.md`](./ROADMAP.md) for the audit backlog and what's next, and [`TEST_REPORT.md`](./TEST_REPORT.md) for the verification report.
+One small always-on VPS with a single wildcard domain becomes the front door for any number of backends. Each backend runs wherever you like — home PC, laptop, Pi — reachable only over Holesail's [HyperDHT](https://github.com/holepunchto/hyperdht) tunnel. The gateway runs the Holesail *client* on the visitor's behalf and reverse-proxies HTTPS to it.
+
+*(Named for the Roman god of gates and doorways.)*
+
+### Why it's built this way
+
+| | |
+|---|---|
+| **Stateless routing** | The key lives in the subdomain, so raw-key links need no stored state and survive restarts |
+| **Origin isolation** | Every project gets its own browser origin — cookies, localStorage and CORS separate automatically |
+| **Open by default** | Share a key and it just works. Passwords, aliases and blocks are opt-in operator metadata, never required |
+| **Two dependencies** | `holesail-client` and `http-proxy`. Everything else is Node built-ins, deliberately |
+
+### Status
+
+✅ **Production**, running at [janus.ssani.dev](https://janus.ssani.dev). **239 unit tests + 7 live-DHT e2e tests pass.**
+
+<details>
+<summary>What's shipped</summary>
+
+- **Core** — host-based routing, per-key tunnel pool with LRU eviction, rate limiting, operator kill-switch
+- **Milestone 1** — persistent store, named aliases, optional per-key passwords, HTML admin dashboard
+- **Milestone 2** — `/healthz`, `/metrics`, structured request logging, backoff reconnect, circuit breaker, health probes, offline page
+- **Security** — all 13 findings from the 2026-07 audit fixed: cross-tenant cookie isolation, `X-Forwarded-For` hardening, websocket-DoS bounds, `0600` store with fsync durability, credential purge on clear, admin login lockout, per-session CSRF
+- **Scale review** — cold-create concurrency cap, egress-amplification fix on error pages, off-event-loop password hashing, port quarantine against late-bind crashes
+
+</details>
+
+**Docs:** [`GATEWAY_DESIGN.md`](./GATEWAY_DESIGN.md) design · [`DEPLOY.md`](./DEPLOY.md) deployment · [`ROADMAP.md`](./ROADMAP.md) open work · [`TEST_REPORT.md`](./TEST_REPORT.md) verification
 
 ---
 
@@ -89,7 +121,10 @@ All via environment variables (see [`.env.example`](./.env.example)).
 | `BASE_DOMAIN` | *(required)* | wildcard base, e.g. `gw.yourdomain.com`; the tenant key is the leftmost subdomain label |
 | `PORT` | `3000` | port the Node gateway listens on (Caddy proxies here) |
 | `BIND_HOST` | `127.0.0.1` | interface to bind |
-| `MAX_TUNNELS` | `50` | max concurrent live tunnels; LRU-evicts idle ones at capacity |
+| `MAX_TUNNELS` | `50` | max concurrent live tunnels; LRU-evicts idle ones at capacity. Bounds *finished* tunnels only — see `MAX_CONCURRENT_CREATES` for the in-flight bound |
+| `MAX_CONCURRENT_CREATES` | `8` | max cold creates running **concurrently**, process-wide. `MAX_TUNNELS` is checked against completed tunnels, so it places no bound on in-flight creates; without this the only throttle was the per-IP `RATE_MAX_NEW_TUNNELS`, i.e. 10 × (number of client IPs). Each in-flight create holds a HyperDHT node for up to `ENSURE_TUNNEL_TIMEOUT_MS`. Watch `janus_creates_queued` |
+| `MAX_CREATE_QUEUE` | `64` | max cold creates that may wait for a slot before new ones are rejected with 503 + `Retry-After`. `0` disables queueing (excess creates fail immediately) |
+| `PORT_QUARANTINE_MS` | `15000` | how long a port abandoned by a **timed-out** connect is held out of the pool. holesail-client may `listen()` after our timeout fired; if that late bind hits a reissued port, the `EADDRINUSE` has no pending attempt to claim it and the uncaught-exception guard lets it kill the process. `0` disables. Should be ≥ `CONNECT_TIMEOUT_MS` (a shorter value warns at startup) |
 | `TUNNEL_PORT_MIN` / `TUNNEL_PORT_MAX` | `20000` / `20999` | local port pool for tunnels (must be a range) |
 | `MAX_PORT_ATTEMPTS` | `5` | how many distinct local ports one cold create may try before giving up. Pool ports are only reserved in-process, so a port held by other software fails to bind (`EADDRINUSE`) and the manager retries immediately onto the next one. Bounds that loop; multiplies into the worst case capped by `ENSURE_TUNNEL_TIMEOUT_MS`. |
 | `CONNECT_TIMEOUT_MS` | `8000` | cold-connect timeout before giving up on a backend |

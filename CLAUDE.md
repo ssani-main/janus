@@ -41,7 +41,7 @@ fight over tunnel ports and interleave writes to the store.
 
 ```sh
 npm run check      # node --check every src module (no build step exists)
-npm test           # 226 unit tests, no network
+npm test           # 239 unit tests, no network
 npm run test:e2e   # 7 tests against real Holesail tunnels; needs devDependencies
 ```
 
@@ -87,3 +87,33 @@ holepunch is flaky on hosted runners.
 - `console.log` in `src/server.js` is graceful-shutdown logging, and in
   `test/unit/fixtures/port-guard-*.js` it is subprocess pass/fail signalling.
   Neither is a debug leftover.
+- **`errorPage`/`offlinePage`/`rateLimitPage` use font-free styles on purpose.**
+  `pages.js` splits `STYLE` into `FONT_FACES + BASE_STYLE`; those three use
+  `LEAN_STYLE`/`MINIMAL_STYLE` instead. It looks like an inconsistency and is
+  not: the fonts are ~33KB of base64, and a 116-byte request to any
+  nonexistent subdomain used to return 37,280 bytes — a 321x egress amplifier
+  needing no key and no auth. Caddy's gzip does **not** mitigate it (the
+  caller picks the encoding; `Accept-Encoding: identity` gets the full body).
+  The 429 page matters most: it is the only response with no per-IP cap on how
+  often it can be elicited. Do not "restore consistency" here.
+- **Never put an `await` between `ensureTunnel`'s `pending.has()` check and its
+  `pending.set()`.** That window must stay synchronous or two concurrent
+  callers for the same key each start their own cold create, defeating the
+  dedupe. This is why the cold-create semaphore is acquired inside
+  `_createGated` (whose body runs synchronously up to its first internal
+  await) rather than in `ensureTunnel` itself. Regression test:
+  `tunnel-manager-create-concurrency.test.js`.
+- **`MAX_TUNNELS` does not bound in-flight cold creates.** It is checked
+  against `this.tunnels.size`, and a record only lands there after a connect
+  succeeds. `MAX_CONCURRENT_CREATES` is the knob that bounds concurrency;
+  measured cost is ~4MB RSS per live tunnel (`deploy/measure-tunnel-memory.js`),
+  so unbounded creates walk the process into its systemd `MemoryMax` and
+  restart it, dropping every tenant.
+- **A timed-out connect's port is quarantined, not released.** holesail-client
+  may `listen()` after our timeout fired; if that late bind hits a reissued
+  port, the `EADDRINUSE` has no pending attempt to claim it and
+  `onUncaughtPortGuard` correctly treats it as a real bug and crashes. The
+  quarantine keeps the port out of circulation and absorbs a late collision on
+  it. The absorption is deliberately narrow — an `EADDRINUSE` on any
+  non-quarantined port must still crash, or genuine bind bugs get hidden.
+  Both halves have regression tests, including subprocess fixtures.

@@ -96,6 +96,28 @@ dependencies (Node built-ins only).
 
 ---
 
+## Scale review (2026-07-26) — DONE ✅
+
+Driven by the question "what happens if a lot of people use this, and is it
+safe for the VPS?". 239/239 unit tests pass. Zero new npm dependencies.
+
+| Finding | Fix | Key files |
+|---|---|---|
+| **Egress amplification, 321x.** Every page embedded ~33KB of base64 font, error pages included. A 116-byte request to any nonexistent subdomain returned 37,280 bytes, needing no key and no auth. Caddy's gzip does not mitigate it — the caller picks the encoding. Worst of all, the **429 page was itself 37KB**, and it is the one response with no per-IP cap on how often it can be elicited, so rate limiting *increased* egress instead of shedding it. | Split `STYLE` into `FONT_FACES + BASE_STYLE`. `errorPage`/`offlinePage` use `LEAN_STYLE` (~4.1KB, 9x smaller); `rateLimitPage` gets a bespoke `MINIMAL_STYLE` (837 bytes, 44x smaller). Pages a visitor deliberately navigates to keep their fonts. | `src/pages.js` |
+| **`scryptSync` stalled the whole gateway.** Measured ~30ms per call on the single Node thread, so every password verification froze all tenants' traffic. At `RATE_MAX_REQUESTS=120` one IP could buy ~3.7s of event-loop stall per minute against any password-protected key. | Converted `hashPassword`/`verifyPassword` to async `crypto.scrypt` (libuv threadpool). Max event-loop lag under 8 concurrent verifies: 30ms → **0.8ms**. | `src/auth.js`, `src/server.js`, `src/admin.js` |
+| **No bound on concurrent cold creates.** `MAX_TUNNELS` counts *finished* tunnels; `pending` dedupes only same-key creates. The real ceiling was `RATE_MAX_NEW_TUNNELS` × (number of IPs) — unbounded. At a measured ~4MB RSS per tunnel, a distributed burst walks the process into `MemoryMax=768M` and turns a flood into an OOM restart loop. | `MAX_CONCURRENT_CREATES=8` / `MAX_CREATE_QUEUE=64` semaphore in `_createGated`, plus `janus_creates_*` gauges. Queue-full fast-fails 503 + `Retry-After` instead of admitting an unbounded backlog. | `src/tunnel-manager.js`, `src/config.js`, `src/metrics.js` |
+| **Late-bind crash after a connect timeout.** `connectWithPortGuard` drops its `pendingPorts` entry on timeout, but holesail-client may still `listen()` afterwards. A late `EADDRINUSE` on a reissued port has no pending attempt to claim it, so the guard classifies it as a real bug and kills the gateway — triggered precisely by the filtered-outbound-UDP condition DEPLOY.md warns about. | `PORT_QUARANTINE_MS=15000` holds timed-out ports out of the pool and absorbs a late collision on them. Scoped narrowly: an `EADDRINUSE` on any non-quarantined port still crashes. Both halves covered by subprocess fixtures. | `src/tunnel-manager.js` |
+| **Per-tunnel memory was an unknown.** `deploy/janus.service` shipped `MemoryMax=768M` with the note "nothing bounds how much memory each one's DHT state consumes". | `deploy/measure-tunnel-memory.js` measures it against real backends. **~4.1MB per idle tunnel**, 87.7MB baseline → ~294MB projected at `MAX_TUNNELS=50`, comfortable against 768M. Re-run on the VPS; DHT behaviour is network-dependent. | `deploy/measure-tunnel-memory.js` |
+| **Caddy had no compression or slowloris guard.** | `encode zstd gzip`, `read_header 10s`. `read_body`/`write`/`idle` deliberately left unset — they would cut off large uploads, SSE, and the long-lived websockets this gateway supports on purpose. Optional `rate_limit` block documented (needs an xcaddy plugin). | `Caddyfile.example` |
+
+**New env vars** (see `.env.example`): `MAX_CONCURRENT_CREATES`,
+`MAX_CREATE_QUEUE`, `PORT_QUARANTINE_MS`.
+
+**Still open from this review:** the Public Suffix List submission — see
+"Still open" above. It is the one item that cannot be fixed in code.
+
+---
+
 ## Milestone 2 — Known gaps & follow-ups
 
 ### RESOLVED (post-M2 hardening pass)
@@ -128,6 +150,71 @@ dependencies (Node built-ins only).
 ### Still open
 
 Improvements deferred intentionally (low impact, addressed if reported in production):
+
+#### Public Suffix List submission for `BASE_DOMAIN` — ACTION REQUIRED, long lead time
+
+**Status: not started. Needs the operator (GitHub account + a DNS record on the
+domain); cannot be done from inside the codebase.**
+
+Every tenant is a subdomain of one registrable domain. Browsers therefore treat
+them as *related* sites unless the PSL says otherwise, and the gateway cannot
+override that from the server side.
+
+`cookieDomainRewrite: ''` (src/server.js) already strips `Domain=` from
+backend `Set-Cookie` **headers**, which closes the header-based half. It cannot
+touch cookies a tenant's own JavaScript sets:
+
+```js
+document.cookie = 'x=…; domain=.janus.ssani.dev'   // visible to apex + every sibling tenant
+```
+
+Tenants are untrusted by design ("anyone can run one and share their key"), so
+this is reachable. Consequences, in severity order:
+
+- **Cookie-bombing → cross-tenant DoS.** A tenant writes many large cookies on
+  the parent domain; every sibling tenant *and the apex* then send them on
+  every request and get rejected with oversized request headers. One tenant can
+  deny service to all of them.
+- **Admin cookie clobbering → operator lockout.** A tenant can overwrite
+  `janus_admin` on the parent domain. `parseCookies` is last-write-wins, and
+  browsers do not guarantee host-only cookies are sent before domain cookies.
+  **Not privilege escalation** — the session HMAC still fails, and the cookie is
+  `HttpOnly` + `SameSite=Strict` + `Path=/_admin`, so it can be neither read nor
+  forged — but the operator can be forced out of the dashboard.
+
+**The fix is the PSL.** This is exactly what its private section exists for and
+what `*.github.io`, `*.vercel.app` etc. rely on. Once listed, browsers refuse
+to set cookies on the parent domain and each tenant becomes a true site
+boundary.
+
+Steps (allow **weeks to months** — it must ship in a browser release before it
+takes effect anywhere, which is why this should be started early, not when it
+is needed):
+
+1. Fork `https://github.com/publicsuffix/list`.
+2. Add to the **PRIVATE DOMAINS** section of `public_suffix_list.dat`, in the
+   correct alphabetical position:
+
+   ```
+   // Janus : https://janus.ssani.dev
+   // Submitted by <your name> <ssani.main@gmail.com>
+   janus.ssani.dev
+   ```
+
+3. Open the PR, then add the `_psl` TXT record they require to prove control:
+
+   ```
+   _psl.janus.ssani.dev.  TXT  "https://github.com/publicsuffix/list/pull/<PR-NUMBER>"
+   ```
+
+   (Porkbun DNS panel; the record must exist before maintainers will merge.)
+4. After merge, rollout is on browser vendors' schedules. Track it at
+   `https://publicsuffix.org/list/public_suffix_list.dat`.
+
+**Until it lands**, treat the apex admin dashboard as reachable-but-spammable by
+any tenant and prefer the bearer-token JSON API (`Authorization: Bearer
+$ADMIN_TOKEN`) over the cookie dashboard for anything important — the bearer
+path does not depend on a cookie a tenant can clobber.
 
 #### Port-recycling probe race (low probability, narrow window)
 When `_probeTunnels()` snapshots records then probes them asynchronously,

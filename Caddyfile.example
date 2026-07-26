@@ -38,11 +38,52 @@
 # merely insecure -- watch `journalctl -u caddy -f` until certs actually
 # issue before sharing any link.
 
+# Global options.
+{
+	servers {
+		timeouts {
+			# Slowloris guard: a client that opens a connection and dribbles
+			# request headers forever costs a connection slot on both Caddy and
+			# Node for as long as it likes. Headers have no legitimate reason to
+			# take more than a few seconds, so this is safe to bound tightly.
+			read_header 10s
+		}
+	}
+
+	# DELIBERATELY NOT SET, and worth understanding before you add them:
+	#
+	#   read_body  -- would also cap slow request BODIES, but a tenant backend
+	#                 may legitimately receive a large upload over a slow link.
+	#   write      -- caps how long a response may take to write. A tenant
+	#                 serving big files, SSE, or a long-poll would be cut off
+	#                 mid-response.
+	#   idle       -- affects keep-alive connections; too low interacts badly
+	#                 with the long-lived websockets this gateway supports on
+	#                 purpose (see WS_IDLE_TIMEOUT_MS in .env.example, which is
+	#                 the right knob for that job -- it refreshes on read AND
+	#                 write, so it only reaps genuinely silent sockets).
+	#
+	# Tenant traffic is arbitrary third-party traffic. Prefer bounding it in
+	# Node, where the limits are tenant-aware, over blunt proxy-wide timeouts.
+}
+
 # These two domains must match BASE_DOMAIN in .env (gw.example.com) and its
 # "www." + wildcard subdomain forms -- src/routing.js treats BASE_DOMAIN and
 # www.<BASE_DOMAIN> as the apex, and everything else under *.gw.example.com
 # as a tenant key subdomain.
 gw.example.com, *.gw.example.com {
+	# Compress responses. Saves real bandwidth for real visitors on the apex,
+	# guide and login pages, which embed ~33KB of base64 font each.
+	#
+	# IMPORTANT -- this is NOT a defence against egress amplification, and must
+	# not be mistaken for one: the CALLER chooses the encoding. Anyone sending
+	# `Accept-Encoding: identity` gets the full uncompressed body regardless of
+	# what is configured here. The actual mitigation is that src/pages.js
+	# serves errorPage/offlinePage/rateLimitPage WITHOUT the embedded fonts, so
+	# the responses an anonymous caller can force us to emit in bulk are small
+	# at the source. Keep it that way; see the LEAN_STYLE comment there.
+	encode zstd gzip
+
 	tls {
 		# Configure the DNS-01 provider + API token env for whichever plugin
 		# you built Caddy with. Examples:
@@ -74,4 +115,40 @@ gw.example.com, *.gw.example.com {
 		# could prepend a fake entry to dodge/frame another IP's rate limit.
 		header_up X-Forwarded-For {remote_host}
 	}
+
+	# OPTIONAL: shed abusive traffic at the proxy, before it reaches Node.
+	#
+	# Node already rate-limits per IP (RATE_WINDOW_MS / RATE_MAX_REQUESTS /
+	# RATE_MAX_NEW_TUNNELS in .env), and that limiter is the tenant-aware one
+	# -- it distinguishes a cheap cached-tunnel request from an expensive cold
+	# create, which Caddy cannot. This block is purely defence in depth: it
+	# stops a flood from costing Node an event-loop turn at all.
+	#
+	# Requires a PLUGIN -- rate_limit is not built into stock Caddy. You are
+	# already building with xcaddy for the DNS provider, so add it there:
+	#
+	#   xcaddy build \
+	#     --with github.com/caddy-dns/<provider> \
+	#     --with github.com/mholt/caddy-ratelimit
+	#
+	# Verify the directive syntax against that plugin's current README before
+	# deploying (https://github.com/mholt/caddy-ratelimit) -- it is a
+	# third-party module and its config shape is not covered by Caddy's
+	# compatibility promise. Then `caddy validate --config /etc/caddy/Caddyfile`
+	# before reloading; a Caddyfile that fails to parse takes the whole site
+	# down, and under an HSTS-preloaded TLD that means unreachable, not
+	# degraded.
+	#
+	# rate_limit {
+	# 	zone per_ip {
+	# 		key    {remote_host}
+	# 		events 300
+	# 		window 1m
+	# 	}
+	# }
+
+	# NOT SET, deliberately: `request_body { max_size ... }`. It would bound
+	# upload size, but tenant backends are arbitrary third-party apps and some
+	# legitimately accept large uploads. Set it only if you know every tenant
+	# you host can live with the cap.
 }
