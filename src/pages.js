@@ -24,7 +24,10 @@ function configuredOrPlaceholder(value, fieldName) {
   return `<span class="warn">&#9888; NOT CONFIGURED &mdash; operator must set ${escapeHtml(fieldName)}</span>`
 }
 
-const STYLE = `
+// The two self-hosted fonts, as data URIs. ~33KB of base64 -- by far the
+// bulk of any page that includes them, so which pages DO include them is a
+// bandwidth decision, not just a styling one. See LEAN_STYLE below.
+const FONT_FACES = `
   @font-face {
     font-family: 'Instrument Serif';
     font-style: normal;
@@ -39,7 +42,14 @@ const STYLE = `
     font-display: swap;
     src: url('${GEIST_MONO_WOFF2}') format('woff2');
   }
+`
 
+// Everything except the @font-face blocks. The --font-display/--font-mono
+// custom properties below already declare full fallback stacks ('Instrument
+// Serif', ui-serif, Georgia, serif), so a page that ships BASE_STYLE without
+// FONT_FACES degrades to the platform serif/mono automatically -- no separate
+// stylesheet and no layout change beyond the typeface itself.
+const BASE_STYLE = `
   :root {
     color-scheme: light dark;
     --bg: light-dark(#f6f1e7, #14120f);
@@ -102,6 +112,42 @@ const STYLE = `
   .tagline { font-family: var(--font-mono); color: var(--muted); font-size: 0.85rem; letter-spacing: 0.02em; margin-top: -0.5rem; margin-bottom: 2rem; }
   footer { margin-top: 1.5rem; padding-top: 1rem; border-top: 1px solid var(--rule); font-size: 0.8rem; color: var(--muted); font-family: var(--font-mono); }
   footer a { color: var(--muted); text-decoration: underline; text-underline-offset: 0.2em; }
+`
+
+// Full style, fonts included -- for pages a real visitor deliberately
+// navigates to and looks at for more than a second.
+const STYLE = FONT_FACES + BASE_STYLE
+
+// Fonts omitted. Used by every page an ANONYMOUS, UNAUTHENTICATED caller can
+// force us to emit in bulk: errorPage (400/404/502/503), offlinePage, and
+// rateLimitPage.
+//
+// This is a bandwidth control, not a styling preference. Every page here
+// embeds ~33KB of base64 font, and a 116-byte request to any nonexistent
+// subdomain used to return 37,280 bytes -- a 321x egress amplifier reachable
+// with no key, no auth, and no valid subdomain. Caddy's gzip does not help:
+// the CALLER chooses the encoding, and `Accept-Encoding: identity` gets the
+// full uncompressed body. Dropping FONT_FACES takes these responses to
+// roughly 4KB.
+//
+// Do NOT "restore consistency" by putting STYLE back on these three pages.
+// The typeface fallback is deliberate; see BASE_STYLE above.
+const LEAN_STYLE = BASE_STYLE
+
+// The 429 page is the one response with NO upper bound on how many times a
+// single IP can elicit it: every request past RATE_MAX_REQUESTS gets one, at
+// whatever rate the client can dial. Every other page is capped at
+// RATE_MAX_REQUESTS per window per IP. So this page alone gets a bespoke
+// minimal style rather than LEAN_STYLE -- it must stay cheaper than the cost
+// of asking for it, or rate limiting increases egress instead of shedding it.
+const MINIMAL_STYLE = `
+  :root { color-scheme: light dark; }
+  body { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; line-height: 1.6;
+    background: light-dark(#f6f1e7, #14120f); color: light-dark(#191612, #efe9dd);
+    margin: 0; padding: 3rem 1.5rem; }
+  .card { max-width: 40rem; margin: 0 auto; }
+  h1 { font-family: ui-serif, Georgia, serif; font-weight: 400; font-size: 2rem; margin: 0 0 1rem; }
+  p { color: light-dark(#6c6558, #8b8375); margin: 0 0 0.75rem; }
 `
 
 function footer(config) {
@@ -442,7 +488,7 @@ function errorPage(code, title, msg, config) {
 <head>
 <meta charset="utf-8">
 <title>${code} ${safeTitle} - Janus</title>
-<style>${STYLE}</style>
+<style>${LEAN_STYLE}</style>
 </head>
 <body>
   <div class="card">
@@ -481,7 +527,7 @@ function offlinePage({ config, retryAfterSec }) {
 <head>
 <meta charset="utf-8">
 <title>Backend Unavailable - Janus</title>
-<style>${STYLE}</style>
+<style>${LEAN_STYLE}</style>
 </head>
 <body>
   <div class="card">
@@ -503,7 +549,7 @@ function rateLimitPage() {
 <head>
 <meta charset="utf-8">
 <title>429 Too Many Requests - Janus</title>
-<style>${STYLE}</style>
+<style>${MINIMAL_STYLE}</style>
 </head>
 <body>
   <div class="card">
