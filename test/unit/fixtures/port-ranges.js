@@ -59,6 +59,10 @@ const PORT_RANGES = [
   { file: 'server-error-page-leak.test.js', ranges: [[20900, 20910]] },
   { file: 'tunnel-manager-ws-slots.test.js', ranges: [[20960, 20965]] },
   { file: 'tunnel-manager-eviction-race.test.js', ranges: [[20970, 20980]] },
+  { file: 'tunnel-manager-create-concurrency.test.js', ranges: [[21000, 21040]] },
+  { file: 'tunnel-manager-port-quarantine.test.js', ranges: [[21050, 21055]] },
+  { file: 'fixtures/port-guard-late-bind-absorbed.js', ranges: [[21070, 21075]] },
+  { file: 'fixtures/port-guard-unquarantined-still-crashes.js', ranges: [[21080, 21085]] },
 ]
 
 /** Returns every overlap found across all declared ranges, as human-readable strings. */

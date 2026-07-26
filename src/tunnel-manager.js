@@ -121,6 +121,84 @@ const DEFAULT_HEALTH_PROBE_TIMEOUT_MS = 2000
 // during a normal, fast-mocked test's cold-create path).
 const DEFAULT_ENSURE_TUNNEL_TIMEOUT_MS = 45000
 
+// Scale review: cap on cold creates running CONCURRENTLY across the whole
+// process, and on how many may queue behind that cap. Same fallback rationale
+// as the DEFAULT_* constants above -- Infinity/Infinity reproduces the
+// pre-cap behavior exactly for any hand-rolled test config that doesn't
+// mention these knobs. src/config.js ships real values.
+const DEFAULT_MAX_CONCURRENT_CREATES = Infinity
+const DEFAULT_MAX_CREATE_QUEUE = Infinity
+
+// How long a port abandoned by a TIMED-OUT connect is held out of the pool
+// (and its late EADDRINUSE absorbed rather than fatal) -- see
+// quarantinedPorts. 0 disables quarantining entirely, which is the fallback
+// for hand-rolled test configs that predate the knob: several of them drive
+// deliberate connect timeouts against port ranges only ~10 wide, and holding
+// each timed-out port for seconds would exhaust those pools and change what
+// those tests exercise. src/config.js ships the real default.
+const DEFAULT_PORT_QUARANTINE_MS = 0
+
+/**
+ * Minimal counting semaphore with FIFO waiters.
+ *
+ * Why TunnelManager needs one: `MAX_TUNNELS` bounds tunnels that have
+ * FINISHED being created -- it is checked against `this.tunnels.size`, and a
+ * record only lands in `this.tunnels` once `_attemptPortConnect` succeeds. So
+ * it places no bound whatsoever on how many cold creates may be in flight at
+ * the same moment. `ensureTunnel`'s `this.pending` map dedupes concurrent
+ * creates for the SAME key, but does nothing across DISTINCT keys.
+ *
+ * That left the only throttle on the expensive path as RATE_MAX_NEW_TUNNELS,
+ * which is per-IP: the real ceiling was 10 x (number of distinct client IPs),
+ * i.e. unbounded in practice. Each in-flight create constructs a
+ * HolesailClient, and each of those is a HyperDHT node holding a UDP socket
+ * and routing state, for up to ENSURE_TUNNEL_TIMEOUT_MS (45s) each. A few
+ * dozen IPs asking for distinct new keys at once could therefore spin up
+ * hundreds of concurrent DHT nodes and walk the process into its systemd
+ * MemoryMax, which restarts it and drops every live tenant -- a flood turns
+ * into an OOM restart loop rather than into backpressure.
+ *
+ * Releasing hands the slot DIRECTLY to the next waiter (rather than
+ * decrementing and letting it race) so a steady stream of arrivals can't
+ * starve an already-queued waiter.
+ */
+class Semaphore {
+  constructor(max, maxQueue) {
+    this.max = max
+    this.maxQueue = maxQueue
+    this.active = 0
+    /** @type {Array<() => void>} */
+    this.waiters = []
+  }
+
+  get queued() {
+    return this.waiters.length
+  }
+
+  /**
+   * @returns {?Promise<void>} null if the queue is full (caller should
+   *   fast-fail rather than wait); otherwise a promise resolving once a slot
+   *   is held. Every resolved acquire() MUST be paired with exactly one
+   *   release().
+   */
+  acquire() {
+    if (this.active < this.max) {
+      this.active++
+      return Promise.resolve()
+    }
+    if (this.waiters.length >= this.maxQueue) return null
+    return new Promise((resolve) => this.waiters.push(resolve))
+  }
+
+  release() {
+    const next = this.waiters.shift()
+    // Hand the slot straight over: `active` deliberately stays put, since the
+    // waiter we just woke is taking the slot we were holding.
+    if (next) next()
+    else this.active--
+  }
+}
+
 // Milestone 2d: "open by default" -- a single flaky/failed liveness probe
 // must never be enough to gate traffic away from an otherwise-working
 // backend (a one-off blip, a momentary GC pause in the backend process,
@@ -217,6 +295,52 @@ function reconnectDelayMs(attempt, baseDelayMs, maxDelayMs) {
 const pendingPorts = new Map()
 
 /**
+ * Ports abandoned by an attempt that TIMED OUT, mapped to the epoch-ms moment
+ * they stop being quarantined.
+ *
+ * The crash this closes: `connectWithPortGuard` removes its `pendingPorts`
+ * entry as soon as its attempt settles -- including on timeout. But a timeout
+ * means holesail-client is still mid-connect, and its internal net.Server has
+ * NOT necessarily called listen() yet (per this file's connectWithPortGuard
+ * doc: the server reference is only set after an internal DHT round trip). If
+ * that listen() lands after our timeout and the port has since been handed to
+ * another attempt, the resulting EADDRINUSE arrives with no `pendingPorts`
+ * entry to claim it -- so `onUncaughtPortGuard` classifies it as a real
+ * unhandled bug, removes itself, and re-throws, killing the gateway.
+ *
+ * systemd's Restart=always brings it back in ~2s, but every live tunnel dies
+ * with it. And the trigger is precisely the condition DEPLOY.md warns about:
+ * filtered outbound UDP makes HyperDHT connects time out en masse, so the
+ * failure mode compounds exactly when the box is already unhappy.
+ *
+ * Two mitigations, both needed. This registry is the second one -- a late
+ * EADDRINUSE for a still-quarantined port is absorbed rather than fatal. The
+ * first is that `_attemptPortConnect` does not return a timed-out port to the
+ * PortPool until its quarantine expires, so a late bind usually has nothing
+ * to collide with in the first place.
+ * @type {Map<number, number>}
+ */
+const quarantinedPorts = new Map()
+
+/** Cumulative count of late binds absorbed, surfaced via TunnelManager.stats(). */
+let lateBindsAbsorbed = 0
+
+function quarantinePort(port, untilMs) {
+  const existing = quarantinedPorts.get(port) || 0
+  if (untilMs > existing) quarantinedPorts.set(port, untilMs)
+}
+
+function isQuarantined(port) {
+  const until = quarantinedPorts.get(port)
+  if (until === undefined) return false
+  if (Date.now() >= until) {
+    quarantinedPorts.delete(port)
+    return false
+  }
+  return true
+}
+
+/**
  * The one and only 'uncaughtException' listener installed for the lifetime
  * of this process (added once at module load, never removed while a real,
  * unhandled bug is in flight -- see below). Installing it once here, rather
@@ -230,6 +354,21 @@ function onUncaughtPortGuard(err) {
     const reject = pendingPorts.get(err.port)
     pendingPorts.delete(err.port)
     reject(err)
+    return
+  }
+  // A LATE bind from an attempt we already gave up on (see quarantinedPorts).
+  // There is no promise left to reject -- the request that started this
+  // attempt was answered long ago -- so the only correct action is to absorb
+  // it. Absorbing is safe precisely because it is scoped to ports we know we
+  // abandoned within the quarantine window; anything else still crashes.
+  if (isPortCollisionError(err) && isQuarantined(err.port)) {
+    lateBindsAbsorbed++
+    console.error(
+      `absorbed late EADDRINUSE on quarantined tunnel port ${err.port} ` +
+      '(a timed-out holesail connect bound its port after we gave up); ' +
+      'not fatal, but a burst of these means DHT connects are timing out -- ' +
+      'check outbound UDP.'
+    )
     return
   }
   // Not a failure mode any pending attempt is guarding against -- this is a
@@ -293,7 +432,16 @@ function connectWithPortGuard(client, options, timeoutMs) {
     }
 
     const timer = setTimeout(() => {
-      cleanupAndSettle(reject, new Error(`connect timed out after ${timeoutMs}ms`))
+      // Tagged so _attemptPortConnect can tell this apart from every other
+      // failure. A timeout is the ONE case where holesail-client may still
+      // bind this port after we walk away, so it is the one case whose port
+      // must be quarantined rather than returned to the pool -- see
+      // quarantinedPorts. An EADDRINUSE, by contrast, means its listen()
+      // already failed, so nothing late can arrive and the port is safe to
+      // release immediately.
+      const err = new Error(`connect timed out after ${timeoutMs}ms`)
+      err.code = 'JANUS_CONNECT_TIMEOUT'
+      cleanupAndSettle(reject, err)
     }, timeoutMs)
 
     pendingPorts.set(port, onPortError)
@@ -397,6 +545,12 @@ class TunnelManager {
     // in-memory-only shim with the same isBlocked/setBlocked surface.
     this.store = store || _inMemoryStoreShim()
     this.clientFactory = clientFactory || ((opts) => new HolesailClient(opts))
+    // Scale review: process-wide cap on CONCURRENT cold creates -- see the
+    // Semaphore class doc comment for why MAX_TUNNELS does not bound this.
+    this._createSemaphore = new Semaphore(
+      config.MAX_CONCURRENT_CREATES ?? DEFAULT_MAX_CONCURRENT_CREATES,
+      config.MAX_CREATE_QUEUE ?? DEFAULT_MAX_CREATE_QUEUE
+    )
     // Security audit S3: manager-level count of DISTINCT tunnel records
     // currently pinned by at least one live websocket (i.e. the number of
     // records with wsCount > 0), NOT a count of websocket connections
@@ -424,7 +578,38 @@ class TunnelManager {
       // Security audit S3: cumulative count of websocket upgrades rejected
       // by the WS_MAX_SLOTS / WS_MAX_PER_IP caps (see noteWsRejected below).
       wsRejected: 0,
+      // Scale review: cumulative count of cold creates rejected because the
+      // create QUEUE was already full (distinct from CapacityError raised by
+      // MAX_TUNNELS with nothing evictable -- this one means we were still
+      // busy connecting, not that every slot was occupied).
+      createQueueRejected: 0,
+      // Cumulative count of ports held out of the pool after a connect
+      // timeout -- see quarantinedPorts. A steady climb here means DHT
+      // connects are timing out, which is the same signal DEPLOY.md's
+      // outbound-UDP check exists to catch.
+      portsQuarantined: 0,
     }
+    /**
+     * Timers returning quarantined ports to the pool. Tracked so shutdown()
+     * can clear them; each is unref'd so a pending quarantine never holds the
+     * process open on its own.
+     * @type {Set<NodeJS.Timeout>}
+     */
+    this._quarantineTimers = new Set()
+    /**
+     * Ports THIS manager is currently holding out of ITS pool.
+     *
+     * Deliberately separate from the module-level `quarantinedPorts` map.
+     * That one must stay process-global because the uncaughtException guard
+     * that consults it has no instance context -- it only ever sees an error
+     * object with a port number. But a per-instance PortPool is what actually
+     * loses capacity to a quarantine, so the gauge an operator reads has to
+     * describe this instance, not every instance that ever existed in the
+     * process. (A running gateway has exactly one TunnelManager; the two
+     * differ only under tests, where the global map leaks across cases.)
+     * @type {Set<number>}
+     */
+    this._quarantinedPorts = new Set()
   }
 
   /**
@@ -497,7 +682,22 @@ class TunnelManager {
     // every nested loop can shrink its own remaining budget consistently,
     // rather than each layer re-deriving "now" independently.
     const deadlineAt = Date.now() + (this.config.ENSURE_TUNNEL_TIMEOUT_MS ?? DEFAULT_ENSURE_TUNNEL_TIMEOUT_MS)
-    const p = this._createTunnel(parsed, deadlineAt)
+
+    // Scale review: `_createGated` wraps `_createTunnel` in the process-wide
+    // cold-create semaphore (see the Semaphore class doc for why MAX_TUNNELS
+    // does not already bound this).
+    //
+    // The gate MUST be acquired inside the promise we store in `this.pending`,
+    // never before it. Everything from the `this.pending.has(keyHash)` check
+    // above to the `this.pending.set(keyHash, p)` below has to stay in ONE
+    // synchronous block: an `await` in that window lets two concurrent callers
+    // for the SAME key both observe an empty `pending`, both start a create,
+    // and both take a semaphore slot -- defeating the dedupe entirely.
+    // Calling an async method runs its body only up to its first internal
+    // await and hands back a promise synchronously, so the window is
+    // preserved and concurrent callers for one key still share a single
+    // chain AND a single slot.
+    const p = this._createGated(parsed, deadlineAt)
     this.pending.set(keyHash, p)
     let record
     try {
@@ -508,6 +708,42 @@ class TunnelManager {
     record.lastRequestAt = Date.now()
     record.inFlight++
     return record
+  }
+
+  /**
+   * Scale review: `_createTunnel` behind the process-wide cold-create
+   * semaphore. Split out as its own async method (rather than inlined into
+   * `ensureTunnel`) specifically so `ensureTunnel` can keep its
+   * pending-check -> pending-set window synchronous -- see the comment at its
+   * call site for why an `await` there would break same-key dedupe.
+   *
+   * Time spent queueing counts against `deadlineAt`, deliberately: the
+   * visitor is waiting either way, and `_createTunnel` already fast-fails on
+   * entry when the deadline expired while queued (the same property FIX 2
+   * relies on for callers queued behind `this.pending`).
+   *
+   * @param {{ key: string, keyHash: string }} parsed
+   * @param {number} deadlineAt epoch ms
+   */
+  async _createGated(parsed, deadlineAt) {
+    const gate = this._createSemaphore.acquire()
+    if (gate === null) {
+      // Queue is full -- fast-fail rather than admit an unbounded backlog of
+      // visitors who would each sit out the whole deadline before finding
+      // out. Surfaces as 503 + Retry-After via server.js's statusForError.
+      this.counters.createQueueRejected++
+      throw new CapacityError(
+        'gateway is saturated with new-tunnel requests (create queue full); try again shortly'
+      )
+    }
+    await gate
+    try {
+      return await this._createTunnel(parsed, deadlineAt)
+    } finally {
+      // Paired 1:1 with the acquire above, in a finally so no throw anywhere
+      // in the create chain can leak a slot and permanently shrink the gate.
+      this._createSemaphore.release()
+    }
   }
 
   /**
@@ -678,7 +914,30 @@ class TunnelManager {
         } catch {
           // best-effort cleanup; ignore secondary errors
         }
-        this.portPool.release(port)
+        // A timed-out connect may still be on its way to binding this port
+        // (see quarantinedPorts). Handing it straight back to the pool is
+        // what turns that late bind into a collision -- and a collision with
+        // no pending attempt to claim it is a process-killing uncaught
+        // EADDRINUSE. Hold the port out of circulation until the quarantine
+        // expires instead; the sweeper returns it afterwards.
+        //
+        // Deliberately narrow: only connect TIMEOUTS quarantine. Every other
+        // failure (EADDRINUSE, liveness-probe failure, a synchronous throw)
+        // either already failed its bind or completed it, so the port is safe
+        // to reuse at once. Quarantining those too would churn the pool for
+        // no benefit -- and could exhaust a small one.
+        if (err && err.code === 'JANUS_CONNECT_TIMEOUT') {
+          const quarantineMs = this.config.PORT_QUARANTINE_MS ?? DEFAULT_PORT_QUARANTINE_MS
+          if (quarantineMs > 0) {
+            quarantinePort(port, Date.now() + quarantineMs)
+            this.counters.portsQuarantined++
+            this._scheduleQuarantineRelease(port, quarantineMs)
+          } else {
+            this.portPool.release(port)
+          }
+        } else {
+          this.portPool.release(port)
+        }
         lastErr = err
 
         if (isPortCollisionError(err) && attempt < maxPortAttempts - 1) {
@@ -729,6 +988,30 @@ class TunnelManager {
       `failed to connect tunnel for key: exhausted ${maxPortAttempts} port attempts`,
       lastErr
     )
+  }
+
+  /**
+   * Return a quarantined port to the pool once its window expires.
+   *
+   * The quarantine registry is module-level (shared, like `pendingPorts`) but
+   * PortPool is per-instance, so the release has to be scheduled by the
+   * instance that owns the port rather than swept from a shared place.
+   * Unref'd: a pending quarantine must never be the reason the process stays
+   * alive.
+   *
+   * @param {number} port
+   * @param {number} quarantineMs
+   */
+  _scheduleQuarantineRelease(port, quarantineMs) {
+    this._quarantinedPorts.add(port)
+    const timer = setTimeout(() => {
+      this._quarantineTimers.delete(timer)
+      this._quarantinedPorts.delete(port)
+      quarantinedPorts.delete(port)
+      this.portPool.release(port)
+    }, quarantineMs)
+    if (timer.unref) timer.unref()
+    this._quarantineTimers.add(timer)
   }
 
   /**
@@ -989,6 +1272,24 @@ class TunnelManager {
       // this.counters.
       wsSlots: this._wsSlotCount,
       wsSlotsMax: this.config.WS_MAX_SLOTS,
+      // Scale review: live GAUGES (like circuitsOpen/unhealthy/wsSlots
+      // above), not cumulative counters. `createsQueued` climbing above zero
+      // for any sustained period is the signal that MAX_CONCURRENT_CREATES is
+      // the current bottleneck -- watch it before raising MAX_TUNNELS, since
+      // raising the latter while creates are queueing helps nothing.
+      createsActive: this._createSemaphore.active,
+      createsQueued: this._createSemaphore.queued,
+      createsMax: this._createSemaphore.max,
+      // Ports currently held out of the pool after a timed-out connect, and
+      // the process-lifetime count of late binds absorbed instead of
+      // crashing. Both are module-level (the guard they belong to is), so
+      // these are process-wide rather than per-instance -- there is only ever
+      // one TunnelManager in a running gateway.
+      portsInQuarantine: this._quarantinedPorts.size,
+      // Process-wide, unlike everything above it: the guard that increments
+      // this is a single module-level uncaughtException listener with no
+      // instance context. Accurate for a running gateway (one manager).
+      lateBindsAbsorbed,
       ...this.counters,
     }
   }
@@ -1222,6 +1523,8 @@ class TunnelManager {
   async shutdown() {
     this.stopSweeper()
     this.stopHealthProbing()
+    for (const timer of this._quarantineTimers) clearTimeout(timer)
+    this._quarantineTimers.clear()
     const keyHashes = [...this.tunnels.keys()]
     await Promise.all(keyHashes.map((keyHash) => this.destroyTunnel(keyHash)))
   }

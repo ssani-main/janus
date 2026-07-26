@@ -61,6 +61,13 @@ function renderMetrics({ manager, limiter, startedAt }) {
   // same "never label with a keyHash" rationale as the module-level comment.
   body += gauge('janus_ws_slots', 'Number of tunnel slots currently pinned by at least one live websocket.', num(m.wsSlots))
   body += gauge('janus_ws_slots_max', 'Configured maximum number of tunnel slots websockets may pin at once (WS_MAX_SLOTS).', num(m.wsSlotsMax))
+  // Scale review: cold-create concurrency. janus_creates_queued sitting above
+  // zero is the signal that MAX_CONCURRENT_CREATES is the live bottleneck --
+  // raising MAX_TUNNELS while this is nonzero accomplishes nothing.
+  body += gauge('janus_creates_active', 'Number of cold tunnel creates running concurrently right now.', num(m.createsActive))
+  body += gauge('janus_creates_queued', 'Number of cold tunnel creates waiting for a concurrency slot.', num(m.createsQueued))
+  body += gauge('janus_creates_max', 'Configured maximum concurrent cold creates (MAX_CONCURRENT_CREATES).', num(m.createsMax))
+  body += gauge('janus_ports_in_quarantine', 'Tunnel ports currently held out of the pool after a connect timeout (PORT_QUARANTINE_MS).', num(m.portsInQuarantine))
 
   body += counter('janus_tunnels_created_total', 'Total number of tunnels created since process start.', num(m.created))
   body += counter('janus_tunnels_evicted_total', 'Total number of tunnels evicted to make room for a new one.', num(m.evicted))
@@ -76,6 +83,14 @@ function renderMetrics({ manager, limiter, startedAt }) {
   // the WS_MAX_SLOTS / WS_MAX_PER_IP caps -- see tunnel-manager.js's
   // noteWsRejected and src/server.js's upgrade handler.
   body += counter('janus_ws_rejected_total', 'Total number of websocket upgrades rejected by the WS_MAX_SLOTS/WS_MAX_PER_IP caps.', num(m.wsRejected))
+  body += counter('janus_create_queue_rejected_total', 'Total number of cold creates rejected because the create queue was full (MAX_CREATE_QUEUE).', num(m.createQueueRejected))
+  body += counter('janus_ports_quarantined_total', 'Total number of tunnel ports quarantined after a connect timeout.', num(m.portsQuarantined))
+  // A nonzero janus_late_binds_absorbed_total is the load-bearing signal that
+  // the port quarantine is doing its job: each one is a late EADDRINUSE that
+  // would previously have reached the uncaughtException guard with no pending
+  // attempt to claim it and killed the process. Sustained growth means DHT
+  // connects are timing out -- check outbound UDP per DEPLOY.md.
+  body += counter('janus_late_binds_absorbed_total', 'Total number of late EADDRINUSE binds absorbed instead of crashing the process.', num(m.lateBindsAbsorbed))
 
   body += help('janus_ratelimit_hits_total', 'Total number of requests denied by the rate limiter, by dimension.')
   body += type('janus_ratelimit_hits_total', 'counter')

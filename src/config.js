@@ -102,6 +102,52 @@ const config = {
   // ENSURE_TUNNEL_TIMEOUT_MS below. Default 5.
   MAX_PORT_ATTEMPTS: readInt('MAX_PORT_ATTEMPTS', 5),
   MAX_TUNNELS,
+  // Scale review: cap on cold creates running CONCURRENTLY process-wide.
+  //
+  // MAX_TUNNELS bounds tunnels that have FINISHED connecting -- it is checked
+  // against `this.tunnels.size`, and a record only lands there after a
+  // successful connect. It therefore places no bound at all on how many cold
+  // creates are in flight simultaneously, and TunnelManager's `pending` map
+  // only dedupes concurrent creates for the SAME key. That left the only
+  // throttle on the expensive path as RATE_MAX_NEW_TUNNELS, which is per-IP:
+  // the effective ceiling was 10 x (number of distinct client IPs).
+  //
+  // Each in-flight create holds a HolesailClient -- a HyperDHT node with a UDP
+  // socket and routing state -- for up to ENSURE_TUNNEL_TIMEOUT_MS. Without
+  // this cap, a few dozen IPs requesting distinct new keys at once could spin
+  // up hundreds of concurrent DHT nodes and drive the process into its systemd
+  // MemoryMax, which restarts it and drops every live tenant. The cap converts
+  // that failure mode from an OOM restart loop into ordinary backpressure.
+  //
+  // 8 is deliberately well below MAX_TUNNELS: cold creates are the expensive,
+  // bursty operation, while steady-state serving of already-connected tunnels
+  // is cheap. Watch janus_creates_queued in /metrics -- sustained nonzero
+  // means this is your bottleneck. Raising MAX_TUNNELS while creates queue
+  // accomplishes nothing.
+  MAX_CONCURRENT_CREATES: readInt('MAX_CONCURRENT_CREATES', 8),
+  // How many cold creates may WAIT for a slot before new ones are rejected
+  // outright with 503 + Retry-After. An unbounded queue would only move the
+  // problem: visitors would each sit out the full ENSURE_TUNNEL_TIMEOUT_MS
+  // instead of being told quickly to come back. Default 64.
+  MAX_CREATE_QUEUE: readInt('MAX_CREATE_QUEUE', 64),
+  // Scale review: how long a local tunnel port abandoned by a TIMED-OUT
+  // connect is held out of the pool before it can be handed out again.
+  //
+  // holesail-client's internal net.Server may call listen() after our connect
+  // timeout has already fired (its server reference is only set following an
+  // internal DHT round trip). If that late listen() lands on a port we have
+  // since reissued, the resulting EADDRINUSE has no in-flight attempt to
+  // claim it -- and tunnel-manager.js's uncaughtException guard then treats
+  // it as a genuine unhandled bug and lets it kill the process. systemd
+  // restarts the gateway in ~2s, but every live tunnel dies with it.
+  //
+  // Holding the port out for a window makes the late bind land on a port
+  // nothing else wants; the guard separately absorbs a late EADDRINUSE for
+  // any still-quarantined port, so both halves have to fail before a crash is
+  // possible. 0 disables quarantining. Default 15s -- comfortably longer than
+  // a DHT connect that has already exceeded CONNECT_TIMEOUT_MS is likely to
+  // take to finish binding, and cheap against the default 1000-port range.
+  PORT_QUARANTINE_MS: readInt('PORT_QUARANTINE_MS', 15000),
   OPERATOR_NAME,
   OPERATOR_ADDRESS,
   OPERATOR_EMAIL,
@@ -270,6 +316,43 @@ if (!Number.isInteger(config.MAX_PORT_ATTEMPTS) || config.MAX_PORT_ATTEMPTS < 1)
   throw new Error(
     `Invalid config: MAX_PORT_ATTEMPTS (${config.MAX_PORT_ATTEMPTS}) must be a finite integer >= 1 -- ` +
     `a cold create must be allowed to try at least one port`
+  )
+}
+
+// Scale review: fail fast on nonsensical cold-create concurrency config, same
+// rationale as the checks above. Both must be >= 1: 0 (or negative) for
+// MAX_CONCURRENT_CREATES would mean no create could ever acquire a slot, so
+// every cold create would hang until its deadline and the gateway would serve
+// nothing but 502s.
+if (!Number.isInteger(config.MAX_CONCURRENT_CREATES) || config.MAX_CONCURRENT_CREATES < 1) {
+  throw new Error(
+    `Invalid config: MAX_CONCURRENT_CREATES (${config.MAX_CONCURRENT_CREATES}) must be a finite integer >= 1 -- ` +
+    `at least one cold create must be able to run at a time`
+  )
+}
+if (!Number.isInteger(config.MAX_CREATE_QUEUE) || config.MAX_CREATE_QUEUE < 0) {
+  throw new Error(
+    `Invalid config: MAX_CREATE_QUEUE (${config.MAX_CREATE_QUEUE}) must be a finite integer >= 0 ` +
+    `(0 disables queueing entirely -- creates past MAX_CONCURRENT_CREATES fast-fail with 503)`
+  )
+}
+
+if (!Number.isInteger(config.PORT_QUARANTINE_MS) || config.PORT_QUARANTINE_MS < 0) {
+  throw new Error(
+    `Invalid config: PORT_QUARANTINE_MS (${config.PORT_QUARANTINE_MS}) must be a finite integer >= 0 ` +
+    `(0 disables port quarantining after a connect timeout)`
+  )
+}
+// A quarantine window shorter than the connect timeout that produced it
+// cannot do its job: the port would be back in circulation while the connect
+// that abandoned it is still plausibly about to bind. Warn rather than throw
+// -- an operator may deliberately want quarantining off (0), and a short
+// window is still strictly better than none.
+if (config.PORT_QUARANTINE_MS > 0 && config.PORT_QUARANTINE_MS < config.CONNECT_TIMEOUT_MS) {
+  console.warn(
+    `PORT_QUARANTINE_MS (${config.PORT_QUARANTINE_MS}) is shorter than CONNECT_TIMEOUT_MS ` +
+    `(${config.CONNECT_TIMEOUT_MS}) -- a port may return to the pool while the connect that ` +
+    `abandoned it could still bind it. Prefer a value at least as large as CONNECT_TIMEOUT_MS.`
   )
 }
 
