@@ -11,7 +11,7 @@ const { TunnelManager, CapacityError, ConnectError, KeyError, BlockedError, Circ
 const { RateLimiter } = require('./rate-limit')
 const { apexPage, guidePage, llmsTxt, impressumPage, termsPage, errorPage, offlinePage, rateLimitPage, loginPage } = require('./pages')
 const { handleAdmin } = require('./admin')
-const { hashPassword, verifyPassword, signSession, verifySession, parseCookies, timingSafeEqualStr } = require('./auth')
+const { verifyPassword, signSession, verifySession, parseCookies, timingSafeEqualStr } = require('./auth')
 const { renderMetrics } = require('./metrics')
 const { createLogger } = require('./logger')
 
@@ -391,7 +391,7 @@ async function passwordGate(req, res, rawKey, keyHash) {
     const password = form.get('password') || ''
     const next = safeNextPath(form.get('next'))
 
-    if (verifyPassword(password, pw.salt, pw.hash)) {
+    if (await verifyPassword(password, pw.salt, pw.hash)) {
       const cookieVal = signSession(sessionSecret, { kh: keyHash, pv: pw.pwdVersion, iat: Date.now() })
       const secureAttr = config.COOKIE_SECURE ? '; Secure' : ''
       res.writeHead(302, {

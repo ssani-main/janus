@@ -10,25 +10,62 @@ const SCRYPT_KEYLEN = 64
 const SESSION_VERSION = 'v1'
 
 /**
+ * Promise wrapper over the ASYNC crypto.scrypt.
+ *
+ * These two functions used to call `crypto.scryptSync`, which is the one
+ * genuinely expensive thing this gateway does on a request path: measured at
+ * ~30ms per call. Node runs JavaScript on a single thread, so a *Sync* call
+ * here does not merely slow the login down -- it stalls the entire gateway,
+ * every tenant's proxied traffic included, for the whole 30ms. At the
+ * RATE_MAX_REQUESTS default of 120/min a single IP could buy ~3.7 seconds of
+ * total event-loop stall per minute just by POSTing wrong passwords at any
+ * password-protected key, and a handful of IPs could make the whole box
+ * unresponsive.
+ *
+ * The async form hands the work to libuv's threadpool instead, so it costs a
+ * worker thread rather than the event loop. Note the threadpool defaults to 4
+ * threads (UV_THREADPOOL_SIZE) and is shared with fs/dns work: concurrent
+ * logins queue against each other, which is correct backpressure -- they no
+ * longer block anything else.
+ *
+ * scrypt is deliberately expensive; that is the point of using it. Keep it
+ * async so the cost lands on the caller and not on every other tenant.
+ *
  * @param {string} plain
- * @param {?string} [salt] hex-encoded salt; generated if omitted
- * @returns {{ hash: string, salt: string }}
+ * @param {string} salt
+ * @returns {Promise<Buffer>}
  */
-function hashPassword(plain, salt) {
-  const useSalt = salt || crypto.randomBytes(16).toString('hex')
-  const hash = crypto.scryptSync(plain, useSalt, SCRYPT_KEYLEN).toString('hex')
-  return { hash, salt: useSalt }
+function scryptAsync(plain, salt) {
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(plain, salt, SCRYPT_KEYLEN, (err, derived) => {
+      if (err) reject(err)
+      else resolve(derived)
+    })
+  })
 }
 
 /**
  * @param {string} plain
+ * @param {?string} [salt] hex-encoded salt; generated if omitted
+ * @returns {Promise<{ hash: string, salt: string }>}
+ */
+async function hashPassword(plain, salt) {
+  const useSalt = salt || crypto.randomBytes(16).toString('hex')
+  const hash = (await scryptAsync(plain, useSalt)).toString('hex')
+  return { hash, salt: useSalt }
+}
+
+/**
+ * Never throws on malformed stored input -- a corrupt/short expectedHash
+ * returns false rather than rejecting, same as before the async conversion.
+ *
+ * @param {string} plain
  * @param {string} salt
  * @param {string} expectedHash
- * @returns {boolean}
+ * @returns {Promise<boolean>}
  */
-function verifyPassword(plain, salt, expectedHash) {
-  const actual = crypto.scryptSync(plain, salt, SCRYPT_KEYLEN).toString('hex')
-  const actualBuf = Buffer.from(actual, 'hex')
+async function verifyPassword(plain, salt, expectedHash) {
+  const actualBuf = await scryptAsync(plain, salt)
   const expectedBuf = Buffer.from(String(expectedHash), 'hex')
   if (actualBuf.length !== expectedBuf.length) return false
   return crypto.timingSafeEqual(actualBuf, expectedBuf)

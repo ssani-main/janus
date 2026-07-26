@@ -418,7 +418,7 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip
       if (action === 'set') {
         const password = form.get('password') || ''
         if (!password) throw new Error('password is required')
-        const { hash, salt } = hashPassword(password)
+        const { hash, salt } = await hashPassword(password)
         store.setPassword(keyHash, rawKey || null, hash, salt)
       } else if (action === 'clear') {
         store.clearPassword(keyHash)

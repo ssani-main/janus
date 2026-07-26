@@ -15,50 +15,62 @@ const {
 
 const HEX_RE = /^[0-9a-f]+$/
 
-test('hashPassword: returns a {hash, salt} pair of hex strings', () => {
-  const { hash, salt } = hashPassword('correct-horse')
+// hashPassword/verifyPassword are async (crypto.scrypt on the libuv
+// threadpool, NOT scryptSync on the event loop -- see src/auth.js). Every
+// test below must await them; a missing await makes assert.equal compare a
+// Promise object and silently pass on the truthiness of the wrapper.
+test('hashPassword: returns a {hash, salt} pair of hex strings', async () => {
+  const { hash, salt } = await hashPassword('correct-horse')
   assert.equal(typeof hash, 'string')
   assert.equal(typeof salt, 'string')
   assert.match(hash, HEX_RE)
   assert.match(salt, HEX_RE)
 })
 
-test('hashPassword: same password + same salt -> same hash', () => {
-  const first = hashPassword('correct-horse')
-  const second = hashPassword('correct-horse', first.salt)
+test('hashPassword: returns a promise, never a bare value (stays off the event loop)', () => {
+  const pending = hashPassword('correct-horse')
+  assert.ok(pending instanceof Promise, 'hashPassword must be async')
+  return pending
+})
+
+test('hashPassword: same password + same salt -> same hash', async () => {
+  const first = await hashPassword('correct-horse')
+  const second = await hashPassword('correct-horse', first.salt)
   assert.equal(second.salt, first.salt)
   assert.equal(second.hash, first.hash)
 })
 
-test('hashPassword: same password + different salt -> different hash', () => {
-  const first = hashPassword('correct-horse')
-  const second = hashPassword('correct-horse')
+test('hashPassword: same password + different salt -> different hash', async () => {
+  const first = await hashPassword('correct-horse')
+  const second = await hashPassword('correct-horse')
   assert.notEqual(first.salt, second.salt)
   assert.notEqual(first.hash, second.hash)
 })
 
-test('verifyPassword: correct password against its own hash/salt -> true', () => {
-  const { hash, salt } = hashPassword('correct-horse')
-  assert.equal(verifyPassword('correct-horse', salt, hash), true)
+test('verifyPassword: correct password against its own hash/salt -> true', async () => {
+  const { hash, salt } = await hashPassword('correct-horse')
+  assert.equal(await verifyPassword('correct-horse', salt, hash), true)
 })
 
-test('verifyPassword: wrong password -> false', () => {
-  const { hash, salt } = hashPassword('correct-horse')
-  assert.equal(verifyPassword('wrong-password', salt, hash), false)
+test('verifyPassword: wrong password -> false', async () => {
+  const { hash, salt } = await hashPassword('correct-horse')
+  assert.equal(await verifyPassword('wrong-password', salt, hash), false)
 })
 
-test('verifyPassword: wrong salt -> false', () => {
-  const { hash } = hashPassword('correct-horse')
-  const otherSalt = hashPassword('correct-horse').salt
-  assert.equal(verifyPassword('correct-horse', otherSalt, hash), false)
+test('verifyPassword: wrong salt -> false', async () => {
+  const { hash } = await hashPassword('correct-horse')
+  const { salt: otherSalt } = await hashPassword('correct-horse')
+  assert.equal(await verifyPassword('correct-horse', otherSalt, hash), false)
 })
 
-test('verifyPassword: does not throw on mismatched-length hash input', () => {
-  const { salt } = hashPassword('correct-horse')
-  assert.doesNotThrow(() => {
-    const result = verifyPassword('correct-horse', salt, 'ab')
-    assert.equal(result, false)
-  })
+test('verifyPassword: resolves false (never rejects) on mismatched-length hash input', async () => {
+  const { salt } = await hashPassword('correct-horse')
+  assert.equal(await verifyPassword('correct-horse', salt, 'ab'), false)
+})
+
+test('verifyPassword: resolves false (never rejects) on a non-hex stored hash', async () => {
+  const { salt } = await hashPassword('correct-horse')
+  assert.equal(await verifyPassword('correct-horse', salt, 'not-hex-at-all'), false)
 })
 
 test('signSession + verifySession: round-trips a payload and preserves fields', () => {
