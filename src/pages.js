@@ -188,6 +188,9 @@ function apexPage(config) {
     <p>Don't have a key? <a href="/guide">Publish a local app in three
       commands</a> &mdash; or hand <a href="/llms.txt">/llms.txt</a> to an AI
       assistant and let it walk you through it.</p>
+    <p>This gateway terminates TLS, so the operator can technically observe
+      traffic in transit &mdash; don't route anything through it you
+      wouldn't hand to a hosting provider. Details on the <a href="/guide">guide</a>.</p>
     ${footer(config)}
   </div>
   <script>
@@ -330,6 +333,28 @@ function guidePage(config) {
         start unless you pass a fixed seed.</li>
     </ul>
 
+    <h2>Trust model</h2>
+    <p>This gateway terminates your visitors' TLS connection and re-serves
+      the request over a separate, HyperDHT-encrypted tunnel to your
+      backend. That means the operator running this gateway can technically
+      observe traffic in transit &mdash; the same trust boundary as any
+      hosting provider or reverse proxy you don't run yourself. Don't route
+      anything through it you wouldn't hand to one.</p>
+    <ul>
+      <li>The gateway never logs or stores your raw key &mdash; only a
+        SHA-256 hash of it (<code>keyHash</code>), used solely to identify a
+        tunnel in logs and the admin dashboard.</li>
+      <li>It does not log request bodies or headers.</li>
+      <li>Your raw key is persisted to disk only if you (or the operator)
+        explicitly set up an alias or a password for it via the admin
+        dashboard &mdash; a plain <code>hs://0000&hellip;</code> link is
+        never stored anywhere.</li>
+      <li>The tunnel between the gateway and your backend is encrypted by
+        HyperDHT; it's the leg between the gateway and your visitor's
+        browser (i.e. the TLS termination above) that is the trust
+        boundary.</li>
+    </ul>
+
     <h2>When something breaks</h2>
     <ul>
       <li><code>400</code> &mdash; the key is malformed, or it's an
@@ -415,6 +440,16 @@ typically has no authentication at all.
 - Treat the URL as a bearer token; do not publish it.
 - Killing the local process revokes access. Restarting mints a new key
   unless a fixed seed is supplied.
+
+## Trust model
+
+The gateway terminates the visitor's TLS connection and re-serves the
+request over a separate HyperDHT-encrypted tunnel to the backend, so the
+operator running the gateway can technically observe traffic in transit --
+treat it like any hosting provider or reverse proxy you don't run yourself.
+The gateway does not log raw keys (only a SHA-256 keyHash), request bodies,
+or headers; a raw key is persisted only if you set up an alias or password
+for it.
 
 ## Status codes
 

@@ -15,6 +15,11 @@ const { verifyPassword, signSession, verifySession, parseCookies, timingSafeEqua
 const { renderMetrics } = require('./metrics')
 const { createLogger } = require('./logger')
 
+// Tier 0 (trust transparency): package.json's version, read once at boot for
+// /healthz. Cheap and dependency-free -- require() caches the parsed JSON,
+// so this costs nothing per request.
+const { version: PACKAGE_VERSION } = require('../package.json')
+
 const store = loadStore(config.STORE_PATH)
 const startedAt = Date.now()
 const logger = createLogger({ enabled: config.LOG_REQUESTS })
@@ -474,6 +479,11 @@ const server = http.createServer(async (req, res) => {
       // ONE endpoint fully exempt from rate limiting. activeCount() is O(1).
       tunnels: manager.activeCount(),
       uptime: process.uptime(),
+      version: PACKAGE_VERSION,
+      // Tier 0: null (not omitted) when the operator hasn't set JANUS_COMMIT
+      // -- an explicit null is easier for a monitor/script to branch on than
+      // a missing key.
+      commit: config.JANUS_COMMIT,
     }))
     return
   }

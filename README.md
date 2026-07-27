@@ -49,7 +49,7 @@ One small always-on VPS with a single wildcard domain becomes the front door for
  https://0000<key>.gw.tld/                                          │
                                                                     │  holesail-client per key
                                                                     ▼
-                                                        HyperDHT P2P tunnel (raw TCP, E2E)
+                                                        HyperDHT P2P tunnel (encrypted)
                                                                     ▼
                                                        your backend app (holesail-server)
                                                        no domain · no public IP
@@ -119,6 +119,7 @@ All via environment variables (see [`.env.example`](./.env.example)).
 | Variable | Default | Purpose |
 |---|---|---|
 | `BASE_DOMAIN` | *(required)* | wildcard base, e.g. `gw.yourdomain.com`; the tenant key is the leftmost subdomain label |
+| `JANUS_COMMIT` | *(unset)* | optional commit SHA of the running deploy, published on `/healthz` (trust transparency — lets anyone diff the running code against the public repo). If set, must be a 7-40 char hex string; the process fails fast otherwise. Typically `$(git rev-parse HEAD)` at deploy time. |
 | `PORT` | `3000` | port the Node gateway listens on (Caddy proxies here) |
 | `BIND_HOST` | `127.0.0.1` | interface to bind |
 | `MAX_TUNNELS` | `50` | max concurrent live tunnels; LRU-evicts idle ones at capacity. Bounds *finished* tunnels only — see `MAX_CONCURRENT_CREATES` for the in-flight bound |
@@ -206,6 +207,23 @@ filters outbound UDP, and DNS-provider API access that is off). In short:
 **Run exactly one instance** — the tunnel pool, port pool, rate limiter, and store are all per-process.
 
 ---
+
+## Trust model
+
+The gateway terminates visitor TLS at Caddy and re-serves the request over a
+plaintext HTTP hop into the tunnel — so the operator running this gateway can
+technically observe traffic in transit, the same boundary as any hosting
+provider or reverse proxy you don't run yourself. **Don't route anything
+through it you wouldn't hand to one.** The HyperDHT tunnel from gateway to
+backend is separately encrypted, but that leg was never the boundary in
+question — TLS termination is.
+
+What the gateway does *not* do: it never logs or persists a raw key, only a
+SHA-256 `keyHash` used to identify a tunnel; it never logs request bodies or
+headers (`LOG_REQUESTS` logs method/path/status/bytes/IP only); and a raw key
+touches disk only for a tenant who explicitly opts into a named alias or
+dashboard password via `STORE_PATH` — a plain `hs://0000…` link is never
+stored anywhere.
 
 ## Security
 

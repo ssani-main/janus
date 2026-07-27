@@ -65,6 +65,22 @@ if (ADMIN_TOKEN && ADMIN_TOKEN.length < 16) {
   )
 }
 
+// Tier 0 (trust transparency): optional commit SHA the operator publishes so
+// anyone can compare a running deploy against the public repo (e.g. `git
+// rev-parse HEAD` baked in at deploy time -- see DEPLOY.md). Entirely
+// optional -- unset must boot fine, same as TARGET_KEY above -- but once set
+// it must actually look like a commit SHA, or /healthz would publish
+// something misleading under a "commit" label. Accepts short or full SHAs
+// (7-40 hex chars); case is preserved as given (git itself is case-sensitive
+// on abbreviations in some contexts), not normalized.
+const JANUS_COMMIT = process.env.JANUS_COMMIT || null
+if (JANUS_COMMIT && !/^[0-9a-fA-F]{7,40}$/.test(JANUS_COMMIT)) {
+  throw new Error(
+    `Invalid config: JANUS_COMMIT="${JANUS_COMMIT}" must be a 7-40 character hex string ` +
+    `(a git commit SHA, e.g. from \`git rev-parse HEAD\`) -- leave it unset if you don't want to publish one`
+  )
+}
+
 // Whether to trust X-Forwarded-For for client IP (only correct when the
 // gateway sits behind a proxy we control, e.g. Caddy -- see TRUST_PROXY doc
 // in .env.example).
@@ -84,6 +100,7 @@ const config = {
   PORT: readInt('PORT', 3000),
   BIND_HOST: process.env.BIND_HOST || '127.0.0.1',
   TARGET_KEY,
+  JANUS_COMMIT,
   BASE_DOMAIN: BASE_DOMAIN.toLowerCase(),
   TUNNEL_PORT_MIN: readInt('TUNNEL_PORT_MIN', 20000),
   TUNNEL_PORT_MAX: readInt('TUNNEL_PORT_MAX', 20999),

@@ -17,8 +17,8 @@
     "node": ">=20"
   },
   "dependencies": {
-    "holesail-client": "^2.3.0",
-    "http-proxy": "^1.18.1"
+    "holesail-client": "2.3.0",
+    "http-proxy": "1.18.1"
   },
   "license": "GPL-3.0-or-later",
   "devDependencies": {

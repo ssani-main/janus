@@ -51,6 +51,29 @@ UMask=0077
 # has no business using.
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 
+# The process has no business creating new namespaces, touching the system
+# clock, changing the hostname, or leaving stray SysV/POSIX IPC objects
+# behind on exit -- none of that is part of proxying HTTP traffic.
+RestrictNamespaces=true
+ProtectClock=true
+ProtectHostname=true
+RemoveIPC=true
+
+# Restricts the process to the syscalls a normal userspace service needs.
+# EPERM (rather than the default SIGSYS kill) means a filtered call fails
+# like a permissions error instead of crashing the process outright.
+#
+# CAUTION: this is the one directive in this unit with real risk of breaking
+# startup -- if the filter is too narrow for what Node (or a native addon
+# like sodium-native/udx-native) actually calls, the service fails to start
+# rather than merely losing a feature. @system-service is deliberately broad
+# for that reason. VALIDATE ON A STAGING BOX before relying on this in
+# production: `sudo systemctl start janus && journalctl -u janus -n 50` and
+# confirm the gateway actually serves a request end to end, not just that the
+# process stays up.
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
 # --- resource limits -------------------------------------------------------
 # MAX_TUNNELS bounds how many tunnels exist, but nothing bounds how much
 # memory each one's DHT state and buffered proxy traffic consumes. Without a

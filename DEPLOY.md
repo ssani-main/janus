@@ -152,11 +152,38 @@ node -v      # must be >= v20
 sudo apt install -y git
 sudo git clone https://github.com/ssani-main/janus.git /opt/janus
 cd /opt/janus
-sudo npm ci --omit=dev
+sudo npm ci --omit=dev --ignore-scripts
 ```
 
-`--omit=dev` skips `holesail-server` and `ws`, which exist only for the e2e
-suite. Install them too if you intend to run `npm run test:e2e` on the box.
+Use `npm ci`, not `npm install`: it installs exactly what
+`package-lock.json` pins (which is committed) and refuses to proceed if the
+lockfile and `package.json` disagree, instead of silently resolving a
+different tree. `--omit=dev` skips `holesail-server` and `ws`, which exist
+only for the e2e suite. Install them too if you intend to run
+`npm run test:e2e` on the box.
+
+`--ignore-scripts` disables `preinstall`/`install`/`postinstall` lifecycle
+scripts. It is safe here: as of this writing, none of the ~73 packages in the
+full dependency tree (including `sodium-native` and the other HyperDHT native
+addons) define an install-time script — they ship prebuilt binaries under
+`prebuilds/` and load them at require time via `require-addon`, not via
+`node-gyp`/`node-gyp-build` at install time. Re-verify this (`grep -rl
+'"postinstall"\|"install"\|"preinstall"' node_modules/*/package.json`) before
+dropping the flag on an upgrade — if a future dependency bump adds a native
+module that *does* need a real build step, `--ignore-scripts` would silently
+break it rather than fail loudly.
+
+**Why the dependency count matters.** `package.json` deliberately holds only
+two runtime dependencies, `holesail-client` and `http-proxy`. That is a
+security control, not a style preference: the gateway proxies plaintext
+tenant traffic through `http-proxy`, and `holesail-client` (with its own
+HyperDHT/sodium-native dependency chain) runs inside the same process with no
+sandboxing between it and the gateway's key handling. Every extra transitive
+dependency is code that runs with the same privileges. Pin both to exact
+versions (no `^`/`~` — already the case in `package.json`) and diff-review any
+version bump to `holesail-client` before deploying it: it sits directly on the
+plaintext path for every tenant, and a compromised or careless release there
+is a compromise of the whole gateway.
 
 ### User, permissions, service
 
@@ -193,6 +220,11 @@ these. Full annotated reference in [`.env.example`](./.env.example).
 
 ```sh
 BASE_DOMAIN=janus.ssani.dev
+
+# Trust transparency: publishes the running commit on /healthz so anyone can
+# diff this deploy against the public repo. Optional -- capture it at deploy
+# time, right before (or as part of) `systemctl restart janus`:
+JANUS_COMMIT=$(git rev-parse HEAD)
 
 # Sessions won't survive a restart without this (a random per-process secret
 # is generated otherwise). >= 32 chars.
