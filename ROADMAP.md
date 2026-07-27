@@ -242,7 +242,7 @@ support lands.
 ## Security backlog (audit 2026-07-17)
 
 These findings came from a multi-dimension audit of the code as of commit
-c503e04; **S1 and S2 were fixed on 2026-07-18; S3 and S4-mitigation were fixed on 2026-07-19; S8, S9, S11, S12, S13 were fixed on 2026-07-19 — the entire security backlog (S1–S13, plus S4-as-mitigated) is now resolved; no findings remain open**, and all severities assume the Linux deploy
+c503e04; **S1 and S2 were fixed on 2026-07-18; S3 and S4-mitigation were fixed on 2026-07-19; S8, S9, S11, S12, S13 were fixed on 2026-07-19 — the entire original backlog (S1–S13, plus S4-as-mitigated) was resolved as of 2026-07-19. S14 (`/_admin/kill`/`/_admin/unblock` missing CSRF/Origin protection) was found and fixed separately on 2026-07-27** — no findings remain open, and all severities assume the Linux deploy
 target documented in [DEPLOY.md](./DEPLOY.md).
 
 ### CRITICAL
@@ -596,6 +596,46 @@ header comment at `admin.js` ~:11-16 claims all cookie-reachable endpoints are
 CSRF-protected, which is false for this one.
 
 **Fix:** add the same `verifyCsrf` gate the other form endpoints use.
+
+#### S14. ✅ FIXED (2026-07-27) — `/_admin/kill` and `/_admin/unblock` had no CSRF/Origin check at all, and SameSite=Strict does not actually stop it
+
+> **Resolved 2026-07-27:** unlike S13, this one is NOT inert under
+> SameSite=Strict. SameSite is scoped to the registrable domain (eTLD+1), not
+> the origin, and with `BASE_DOMAIN` in play the admin origin
+> (`https://<BASE_DOMAIN>`) and every tenant origin
+> (`https://0000<key>.<BASE_DOMAIN>`) are the SAME SITE. Tenants serve
+> attacker-controlled HTML on those subdomains, so a tenant page can
+> auto-submit a same-site cross-origin POST directly to `/_admin/kill` — both
+> endpoints take their params from `url.searchParams`, so no request body is
+> even needed — and the browser still attaches the `SameSite=Strict` cookie.
+> Fixed by adding `isOriginAllowed()` (`src/admin.js`) to every
+> cookie-authenticated mutating endpoint (kill, unblock, alias, password,
+> block, delete, logout), and additionally requiring a valid CSRF token
+> (bound to `session.sid`, passed as a query param) on the cookie path for
+> kill/unblock specifically. The Bearer path is untouched for all of the
+> above — bearer tokens are never auto-attached by a browser, so they cannot
+> be CSRF-driven, and requiring Origin/CSRF from bearer scripts would break
+> the documented API for no security benefit. Tests in
+> `test/unit/admin-origin-csrf.test.js`, including the regression case (a
+> same-site sibling-subdomain Origin must be rejected, not just a foreign
+> one).
+
+**Where:** `src/admin.js` — the `/_admin/kill` and `/_admin/unblock`
+handlers, which predate the dashboard (they're the original Bearer-only
+Phase 3 JSON API); `cookieValid` was later OR'd into their auth check without
+either endpoint ever gaining CSRF or Origin protection.
+
+**Issue:** a password-protected tenant, or any tenant whose operator embeds
+attacker-supplied content, could serve a page that POSTs to
+`https://<BASE_DOMAIN>/_admin/kill?keyHash=...&block=1` and have it succeed
+against any admin who is currently logged into the dashboard in the same
+browser — full tunnel takedown/block with zero interaction beyond visiting a
+tenant page.
+
+**Fix:** `isOriginAllowed()` (exact scheme+host+port match, no
+suffix/BASE_DOMAIN comparison — a suffix match would accept the exact
+attacker origin this exists to reject) plus a CSRF token requirement on the
+cookie path for kill/unblock.
 
 ### Cleared by the audit — do NOT re-litigate
 

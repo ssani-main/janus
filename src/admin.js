@@ -15,6 +15,11 @@
 //    alias, set/clear password, block/unblock, delete, logout), each
 //    CSRF-protected since they're reachable from a browser session (S13:
 //    logout included -- it mutates session state just like the others).
+//    S14: every cookie-authenticated mutating endpoint, INCLUDING kill and
+//    unblock (the original bearer-only JSON API, whose auth check was later
+//    OR'd with cookieValid without ever gaining CSRF/Origin protection),
+//    also passes through isOriginAllowed(). See that function for why
+//    SameSite=Strict alone does not cover this gateway.
 //
 // The admin cookie's payload is bound to a hash of the *current*
 // ADMIN_TOKEN (`th`), so rotating ADMIN_TOKEN invalidates every outstanding
@@ -132,6 +137,51 @@ async function readForm(req) {
  */
 function hashToken(adminToken) {
   return crypto.createHash('sha256').update(adminToken).digest('hex')
+}
+
+/**
+ * S14: validate the `Origin` header on cookie-authenticated mutating
+ * requests, as defense in depth against CSRF. SameSite=Strict on the
+ * `janus_admin` cookie is NOT sufficient by itself here, because SameSite
+ * is scoped to the registrable domain (eTLD+1), not the origin: with
+ * BASE_DOMAIN=janus.example.com, the admin origin
+ * (https://janus.example.com) and every tenant origin
+ * (https://0000<key>.janus.example.com) are the SAME SITE. Tenants serve
+ * attacker-controlled HTML on those subdomains, so a tenant page can
+ * auto-submit a same-site cross-origin POST to e.g. /_admin/kill and the
+ * browser still attaches the cookie.
+ *
+ * - Absent Origin -> ALLOW. Browsers always send Origin on state-changing
+ *   requests (POST); a missing Origin means a non-browser client (curl,
+ *   scripts, the e2e suite / `janus kill`), which cannot be CSRF-driven by a
+ *   browser session in the first place. Rejecting here would break
+ *   legitimate scripted/API use for no security benefit.
+ * - Present Origin -> must match the admin origin EXACTLY (scheme + host +
+ *   port). There is deliberately no BASE_DOMAIN/suffix comparison: a suffix
+ *   match would accept `https://0000<key>.BASE_DOMAIN`, which is precisely
+ *   the attacker origin this check exists to reject.
+ *
+ * Host+port are read straight off the request's own `Host` header, so the
+ * comparison is self-relative and needs no BASE_DOMAIN-specific logic --
+ * it works unmodified in prod (BASE_DOMAIN, real Host) and in dev/test
+ * (127.0.0.1/localhost, arbitrary port). The scheme is derived from
+ * `config.COOKIE_SECURE` -- the same signal admin.js already uses to decide
+ * whether the session cookie itself gets the `Secure` attribute (see the
+ * login handler below) -- because this process has no other reliable signal
+ * for its own TLS-ness: Caddy terminates TLS in front of it, so
+ * `req.socket.encrypted` is always false and there's no forwarded-proto
+ * header wired in for the admin surface.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {{ COOKIE_SECURE: boolean }} config
+ * @returns {boolean}
+ */
+function isOriginAllowed(req, config) {
+  const origin = req.headers['origin']
+  if (!origin) return true
+  const host = req.headers['host'] || ''
+  const expected = `${config.COOKIE_SECURE ? 'https' : 'http'}://${host}`
+  return origin === expected
 }
 
 /**
@@ -282,8 +332,9 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip
     // POSTs below -- SameSite=Strict already blocks the cross-site POST
     // today, but every other mutating form endpoint here is CSRF-protected
     // in depth on top of SameSite, and logout was the one gap.
+    // S14: also require the Origin check -- see isOriginAllowed above.
     const form = await readForm(req)
-    if (!cookieValid || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
+    if (!cookieValid || !isOriginAllowed(req, config) || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
       sendJson(res, 403, { error: 'forbidden' })
       return
     }
@@ -329,6 +380,28 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip
       sendJson(res, 401, { error: 'unauthorized' })
       return
     }
+    // S14: kill/unblock predate the dashboard -- they're the original
+    // Bearer-only Phase 3 JSON API, and `cookieValid` was later OR'd into
+    // their auth check without ever gaining the CSRF/Origin protection the
+    // dashboard's own form endpoints have (see the file-header comment).
+    // The dashboard renders no form for either endpoint, so there is no
+    // existing browser flow to preserve here -- the least invasive fix is
+    // to gate the COOKIE path only (Bearer callers are exempt: a bearer
+    // token is never auto-attached by a browser, so it can't be CSRF-driven,
+    // and requiring a CSRF token from a bearer script would break the
+    // documented API for no security benefit). A cookie-authenticated
+    // caller must pass the Origin check and present a valid CSRF token as a
+    // query parameter, mirroring how keyHash/block are already passed here.
+    if (!bearerValid) {
+      if (!isOriginAllowed(req, config)) {
+        sendJson(res, 403, { error: 'forbidden' })
+        return
+      }
+      if (!verifyCsrf(sessionSecret, session.sid, url.searchParams.get('csrf'))) {
+        sendJson(res, 403, { error: 'forbidden' })
+        return
+      }
+    }
     const keyHash = url.searchParams.get('keyHash')
     const block = url.searchParams.get('block') === '1'
     if (!keyHash) {
@@ -349,6 +422,17 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip
     if (!bearerValid && !cookieValid) {
       sendJson(res, 401, { error: 'unauthorized' })
       return
+    }
+    // S14: see the matching comment on /_admin/kill above -- same rationale.
+    if (!bearerValid) {
+      if (!isOriginAllowed(req, config)) {
+        sendJson(res, 403, { error: 'forbidden' })
+        return
+      }
+      if (!verifyCsrf(sessionSecret, session.sid, url.searchParams.get('csrf'))) {
+        sendJson(res, 403, { error: 'forbidden' })
+        return
+      }
     }
     const keyHash = url.searchParams.get('keyHash')
     if (!keyHash) {
@@ -371,7 +455,8 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip
     // S9: CSRF verified against the session's sid, not the static tokenHash
     // -- cookieValid ⇒ session is set (cookieValid checks session.adm/th),
     // so session.sid is always readable here.
-    if (!cookieValid || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
+    // S14: also require the Origin check -- see isOriginAllowed above.
+    if (!cookieValid || !isOriginAllowed(req, config) || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
       sendJson(res, 403, { error: 'forbidden' })
       return
     }
@@ -398,7 +483,8 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip
   if (pathname === '/_admin/password' && req.method === 'POST') {
     const form = await readForm(req)
     // S9: see /_admin/alias above -- CSRF is bound to session.sid.
-    if (!cookieValid || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
+    // S14: also require the Origin check -- see isOriginAllowed above.
+    if (!cookieValid || !isOriginAllowed(req, config) || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
       sendJson(res, 403, { error: 'forbidden' })
       return
     }
@@ -437,7 +523,8 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip
   if (pathname === '/_admin/block' && req.method === 'POST') {
     const form = await readForm(req)
     // S9: see /_admin/alias above -- CSRF is bound to session.sid.
-    if (!cookieValid || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
+    // S14: also require the Origin check -- see isOriginAllowed above.
+    if (!cookieValid || !isOriginAllowed(req, config) || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
       sendJson(res, 403, { error: 'forbidden' })
       return
     }
@@ -471,7 +558,8 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip
   if (pathname === '/_admin/delete' && req.method === 'POST') {
     const form = await readForm(req)
     // S9: see /_admin/alias above -- CSRF is bound to session.sid.
-    if (!cookieValid || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
+    // S14: also require the Origin check -- see isOriginAllowed above.
+    if (!cookieValid || !isOriginAllowed(req, config) || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
       sendJson(res, 403, { error: 'forbidden' })
       return
     }

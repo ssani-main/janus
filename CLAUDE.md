@@ -109,6 +109,23 @@ holepunch is flaky on hosted runners.
   measured cost is ~4MB RSS per live tunnel (`deploy/measure-tunnel-memory.js`),
   so unbounded creates walk the process into its systemd `MemoryMax` and
   restart it, dropping every tenant.
+- **Every cookie-authenticated `/_admin/*` mutation checks the `Origin`
+  header, not just SameSite.** `src/admin.js`'s `isOriginAllowed` rejects a
+  present-but-mismatched Origin even though the session cookie is
+  `SameSite=Strict`. That looks redundant and is not: SameSite is scoped to
+  the registrable domain (eTLD+1), not the origin, and with
+  `BASE_DOMAIN=janus.ssani.dev` the admin origin
+  (`https://janus.ssani.dev`) and every tenant origin
+  (`https://0000<key>.janus.ssani.dev`) are the SAME SITE. Tenants serve
+  attacker-controlled HTML on those subdomains, so a tenant page can
+  auto-submit a same-site cross-origin POST straight to `/_admin/kill` and
+  the browser still attaches the cookie. `/_admin/kill` and `/_admin/unblock`
+  predate the dashboard (they're the original Bearer-only Phase 3 API) and
+  had no CSRF/Origin protection at all until this was found -- `cookieValid`
+  had been OR'd into their auth check without either. An absent Origin is
+  still allowed on purpose (non-browser clients like curl or the CLI never
+  send one and aren't CSRF-exploitable); do not tighten that without
+  breaking the documented Bearer API.
 - **A timed-out connect's port is quarantined, not released.** holesail-client
   may `listen()` after our timeout fired; if that late bind hits a reissued
   port, the `EADDRINUSE` has no pending attempt to claim it and
