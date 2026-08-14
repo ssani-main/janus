@@ -158,7 +158,7 @@ Also check: `https://publicsuffix.org/list/` and search for `janus.ssani.dev`.
 The PSL ships with each browser release. You cannot force an earlier rollout, but you can track it:
 
 - **Chrome/Chromium:** Check `chrome://net-internals/#preload_hsts` once it's released. Look for `janus.ssani.dev` in the public suffix list (separate tab).
-- **Firefox:** Check `about:preferences#privacy` → Site Permissions → view database (requires typing `about:config` in another tab to enable developer options).
+- **Firefox:** No built-in UI for checking the compiled PSL. The practical test below is the reliable way to verify.
 - **Safari:** Shipped with OS updates; no easy way to check. Check Safari release notes once it reaches an OS version you use.
 
 From the operator's perspective, you will know it worked when a test tenant can no longer set cookies on the parent domain. A simple test:
@@ -186,29 +186,48 @@ Until the PSL change ships in browsers, treat the apex admin dashboard as **reac
 - Avoid using the cookie-authenticated dashboard for critical work when adversarial tenants are present.
 - If you must use the dashboard, do so in a private/incognito window and clear all site data after, to minimize the window a clobbered cookie could exist.
 
-The bearer API is documented in the code (`src/admin.js` `handleAdminApi`). A reference:
+The easiest path is the CLI in `bin/janus.js`. Set `ADMIN_TOKEN` and `JANUS_URL` (optional, defaults to `http://127.0.0.1:3000`), then:
 
 ```bash
-# Block a tunnel
+# List all keys
+janus ls
+
+# Block a key (tears down its tunnel)
+janus block <keyHash>
+
+# Unblock a key
+janus unblock <keyHash>
+
+# Kill a key's tunnel (temporary, restart-recoverable; does not affect stored metadata)
+janus kill <keyHash>
+
+# Delete a key's stored record
+janus rm <keyHash>
+```
+
+If using curl directly, call the JSON API with `Authorization: Bearer` headers:
+
+```bash
+# Block a key
 curl -X POST https://janus.ssani.dev/_admin/api/block \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"keyHash":"<KEYHASH>"}'
+  -d '{"action":"block","keyHash":"<KEYHASH>"}'
 
-# Unblock a tunnel
-curl -X POST https://janus.ssani.dev/_admin/api/unblock \
+# Unblock a key
+curl -X POST https://janus.ssani.dev/_admin/api/block \
   -H "Authorization: Bearer $ADMIN_TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{"keyHash":"<KEYHASH>"}'
+  -d '{"action":"unblock","keyHash":"<KEYHASH>"}'
 
-# Kill a tunnel (temporary, restart-recoverable)
-curl -X POST https://janus.ssani.dev/_admin/api/kill \
-  -H "Authorization: Bearer $ADMIN_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"keyHash":"<KEYHASH>"}'
+# Kill a key's tunnel (query string, not JSON body)
+curl -X POST "https://janus.ssani.dev/_admin/kill?keyHash=<KEYHASH>" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
+
+# Delete a key's record
+curl -X DELETE "https://janus.ssani.dev/_admin/api/keys/<KEYHASH>" \
+  -H "Authorization: Bearer $ADMIN_TOKEN"
 ```
-
-(Exact endpoints and fields: check `src/admin.js` `handleAdminApi()` for the current signatures.)
 
 ---
 
