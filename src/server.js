@@ -660,7 +660,7 @@ const server = http.createServer(async (req, res) => {
         'Content-Type': 'text/plain; version=0.0.4',
         'Cache-Control': 'no-store',
       })
-      res.end(renderMetrics({ manager, limiter, startedAt }))
+      res.end(renderMetrics({ manager, limiter, startedAt, pwLockouts: { entries: pwFails.size } }))
       return
     }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })

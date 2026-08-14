@@ -176,3 +176,36 @@ test('renderMetrics: NEVER includes a live tunnel keyHash, even with real tunnel
     await manager.destroyTunnel(record.keyHash)
   }
 })
+
+// --- janus_pw_lockout_entries (F2 follow-up) -------------------------------
+//
+// The per-(IP, keyHash) password-lockout map in src/server.js has no hard size
+// cap -- it is bounded only by its prune rule. That is defensible (see
+// ROADMAP), but an operator previously had no way to see it grow at all. This
+// gauge is the observability half. It must be aggregate-only: an ip or keyHash
+// label here would reintroduce exactly the unbounded-cardinality leak the
+// module-level comment in src/metrics.js exists to prevent.
+
+test('janus_pw_lockout_entries renders the aggregate count when supplied', () => {
+  const body = renderMetrics({
+    manager: fakeManager(),
+    limiter: fakeLimiter(),
+    startedAt: Date.now(),
+    pwLockouts: { entries: 7 },
+  })
+  assert.match(body, /^janus_pw_lockout_entries 7$/m)
+  assert.match(body, /^# TYPE janus_pw_lockout_entries gauge$/m)
+})
+
+test('janus_pw_lockout_entries renders 0 when pwLockouts is absent (callers predating it)', () => {
+  // Several callers/tests predate the field; a missing stat must render 0,
+  // never `undefined`/`NaN`, which would be an invalid Prometheus sample line
+  // and make a scraper reject the WHOLE body -- not just this one metric.
+  const body = renderMetrics({
+    manager: fakeManager(),
+    limiter: fakeLimiter(),
+    startedAt: Date.now(),
+  })
+  assert.match(body, /^janus_pw_lockout_entries 0$/m)
+  assert.doesNotMatch(body, /janus_pw_lockout_entries (undefined|NaN)/)
+})

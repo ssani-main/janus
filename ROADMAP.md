@@ -99,7 +99,7 @@ dependencies (Node built-ins only).
 ## Scale review (2026-07-26) — DONE ✅
 
 Driven by the question "what happens if a lot of people use this, and is it
-safe for the VPS?". 271/271 unit tests pass. Zero new npm dependencies.
+safe for the VPS?". 273/273 unit tests pass. Zero new npm dependencies.
 
 | Finding | Fix | Key files |
 |---|---|---|
@@ -236,6 +236,70 @@ operator explicitly tries. **Directly relevant to M3's secure-mode-key work:**
 if M3 removes `assertPublic()`, these collisions become a real aliasing bug —
 the path forward is including the mode prefix in the keyHash when secure-mode
 support lands.
+
+#### Store persistence blocks the event loop, and its cost grows with the store
+
+`store.js#_persist` is synchronous end to end — `openSync` + `writeFileSync` +
+`fsyncSync` + `renameSync` + a directory fsync — and it re-serializes the
+**entire** store (`JSON.stringify(this.data, null, 2)`) on every mutation.
+
+The file header justifies this with "admin actions are rare," which is true
+today and why nothing here needs changing yet. The part worth tracking is that
+`data.keys` grows **monotonically**: `_ensureRecord` is called by `setBlocked`,
+and the only path that ever removes a record is the explicit `/_admin/delete`
+(`store.deleteKey`). So the write cost is a function of every tenant ever
+blocked or passworded, not of current activity. At a few thousand records each
+admin write becomes a multi-millisecond whole-file fsync **on the event loop**,
+stalling every proxied tenant for its duration.
+
+Deliberately not changed: the fsync is load-bearing for durability (S10 — an
+acknowledged block that silently vanishes on power loss fails OPEN), so this
+must not be "fixed" by weakening it. If it ever needs addressing, the shape is
+an append-only journal or a debounced async writer, not a dropped fsync.
+
+**Watch for:** admin dashboard actions feeling sluggish, or `janus_*` request
+latencies spiking in lockstep with admin writes.
+
+#### `http-proxy` is unmaintained, and the dependency surface is wider than "two"
+
+Two separate things that both read as more reassuring than they are:
+
+- **`http-proxy@1.18.1` is "latest" only because it is the final release.**
+  Published 2020; the newer registry timestamp is metadata, not a release. It
+  is clean today (`npm audit` → 0 vulnerabilities) and sits directly on every
+  request path. Under the deliberate no-new-dependencies constraint there is no
+  drop-in replacement, so this is a **standing, accepted risk to monitor**, not
+  a task — but "we're on the latest version" will keep being technically true
+  forever, which is exactly why it needs writing down.
+- **"Two dependencies" is true of *direct* dependencies only.** A fresh
+  `npm install` resolves **73 packages**; the tree under `holesail-client` is
+  deep (`hyperdht`, `dht-rpc`, `udx-native`, the whole `bare-*` family, native
+  addons via `require-addon`). The two-direct-dep rule is real and worth
+  keeping — but the *audited surface* is not two packages, and README/
+  THIRD_PARTY.md should not leave a reader believing otherwise.
+
+Upside: the Pear/Holepunch stack underneath is actively maintained — `hyperdht`
+last published 2026-08-12. Transitive DHT versions float within
+`holesail-client`'s `^` ranges, so `npm update` lifts them with no manifest
+change; do it deliberately and run `npm run test:e2e`, since that layer carries
+every tenant's traffic.
+
+#### Per-key password lockout map has no hard size cap (low)
+
+`server.js`'s `pwFails` map (F2) is bounded only by its prune rule, not by a
+size limit. Self-limiting in practice: a locked-out attempt returns 429
+**without** calling `pwNoteFailure`, so `lastAt` is not refreshed while locked
+— an attacker can only keep an entry alive by waiting out each
+exponentially-growing lockout and spending a fresh counted failure, which costs
+the same as simply attacking. Structurally identical to `admin.js`'s
+`loginFails` (S8) and `rate-limit.js`'s `buckets`, both already accepted.
+
+The more interesting half is **CPU, not memory**: the prune is an O(n) scan of
+the whole map on every password POST — a path whose frequency an attacker
+controls. `admin.js` has the same shape, so this is a pre-existing pattern
+rather than something F2 introduced. Now observable via
+`janus_pw_lockout_entries`; add a size cap with LRU eviction only if that gauge
+is ever seen climbing in production.
 
 ---
 

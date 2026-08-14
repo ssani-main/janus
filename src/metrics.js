@@ -37,10 +37,14 @@ function num(value) {
 }
 
 /**
- * @param {{ manager: { stats(): object }, limiter: { stats(): object }, startedAt: number }} deps
+ * @param {{ manager: { stats(): object }, limiter: { stats(): object }, startedAt: number, pwLockouts?: { entries: number } }} deps
+ *   `pwLockouts` is optional: it comes from a plain Map in src/server.js
+ *   rather than from a class with a stats() method, and several existing
+ *   callers/tests predate it. Absent renders as 0, same as any other
+ *   missing/non-finite stat (see num() above).
  * @returns {string}
  */
-function renderMetrics({ manager, limiter, startedAt }) {
+function renderMetrics({ manager, limiter, startedAt, pwLockouts }) {
   const m = manager.stats()
   const l = limiter.stats()
   const uptimeSeconds = num(Math.max(0, (Date.now() - startedAt) / 1000))
@@ -51,6 +55,19 @@ function renderMetrics({ manager, limiter, startedAt }) {
   body += gauge('janus_tunnels_max', 'Configured maximum number of concurrent tunnels.', num(m.maxTunnels))
   body += gauge('janus_uptime_seconds', 'Seconds since this process started.', uptimeSeconds)
   body += gauge('janus_ratelimit_buckets', 'Number of active per-IP rate-limit buckets.', num(l.buckets))
+  // F2 follow-up (guard finding): the per-(IP, keyHash) password-lockout map
+  // in src/server.js has no hard size cap -- it is bounded only by its prune
+  // rule. It is self-limiting in practice (a locked-out attempt returns 429
+  // WITHOUT refreshing lastAt, so an attacker can only keep an entry alive by
+  // waiting out each exponentially-growing lockout and spending a fresh
+  // counted failure), but an operator previously had no way to see it grow at
+  // all. Aggregate count only -- NEVER label this with an ip or keyHash, same
+  // rationale as the module-level comment.
+  //
+  // Worth watching for CPU as much as memory: the prune is an O(n) scan of
+  // this map on every password POST, a path whose frequency an attacker
+  // controls.
+  body += gauge('janus_pw_lockout_entries', 'Number of tracked (client IP, keyHash) pairs with recent failed per-key password attempts.', num(pwLockouts && pwLockouts.entries))
   // Milestone 2c: aggregate-only, process-wide gauge/counters -- see the
   // module-level comment: NEVER label any of these with a keyHash.
   body += gauge('janus_circuits_open', 'Number of keyHash circuits currently open (fast-failing cold creates).', num(m.circuitsOpen))
