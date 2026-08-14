@@ -186,7 +186,7 @@ Improvements deferred intentionally (low impact, addressed if reported in produc
 #### Public Suffix List submission for `BASE_DOMAIN` — ACTION REQUIRED, long lead time
 
 **Status: not started. Needs the operator (GitHub account + a DNS record on the
-domain); cannot be done from inside the codebase.**
+domain); cannot be done from inside the codebase.** See [`deploy/PSL_SUBMISSION.md`](./deploy/PSL_SUBMISSION.md) for the complete step-by-step runbook.
 
 Every tenant is a subdomain of one registrable domain. Browsers therefore treat
 them as *related* sites unless the PSL says otherwise, and the gateway cannot

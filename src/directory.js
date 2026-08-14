@@ -384,9 +384,20 @@ class Directory {
 
   /**
    * Eligibility rules that don't depend on the manifest content itself
-   * (blocked / password-protected). Re-checked at LIST time too -- see
-   * list() -- so this is only an early-out to avoid persisting a listing
-   * that could never render.
+   * (blocked / password-protected / operator-suppressed). Re-checked at LIST
+   * time too -- see list() -- so this is only an early-out to avoid
+   * persisting a listing that could never render.
+   *
+   * directorySuppressed lives on the KEY record (data.keys[keyHash]), not on
+   * the directory entry itself (data.directory[keyHash]) -- see
+   * store.js#setDirectorySuppressed and the matching CLAUDE.md entry for why:
+   * the directory entry is created/overwritten/deleted by this class's own
+   * passive manifest fetch, so a moderation decision stored there could be
+   * silently cleared by the tenant's own next visit. Checking it here means
+   * suppression takes effect immediately at render time (list()) with no
+   * refetch required, exactly like blocked/password, and re-checking it here
+   * before persisting also means maybeFetchManifest never (re)persists a
+   * listing for a suppressed key.
    *
    * @param {string} keyHash
    * @returns {boolean}
@@ -394,6 +405,7 @@ class Directory {
   _eligibleNow(keyHash) {
     if (this.store.isBlocked(keyHash)) return false
     if (this.store.getPassword(keyHash) !== undefined) return false
+    if (this.store.isDirectorySuppressed(keyHash)) return false
     return true
   }
 

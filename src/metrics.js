@@ -37,14 +37,16 @@ function num(value) {
 }
 
 /**
- * @param {{ manager: { stats(): object }, limiter: { stats(): object }, startedAt: number, pwLockouts?: { entries: number } }} deps
+ * @param {{ manager: { stats(): object }, limiter: { stats(): object }, startedAt: number, pwLockouts?: { entries: number }, directoryStats?: { total: number, online: number } }} deps
  *   `pwLockouts` is optional: it comes from a plain Map in src/server.js
  *   rather than from a class with a stats() method, and several existing
  *   callers/tests predate it. Absent renders as 0, same as any other
- *   missing/non-finite stat (see num() above).
+ *   missing/non-finite stat (see num() above). `directoryStats` follows the
+ *   same optional-plain-object convention -- see the gauges below for what
+ *   it counts.
  * @returns {string}
  */
-function renderMetrics({ manager, limiter, startedAt, pwLockouts }) {
+function renderMetrics({ manager, limiter, startedAt, pwLockouts, directoryStats }) {
   const m = manager.stats()
   const l = limiter.stats()
   const uptimeSeconds = num(Math.max(0, (Date.now() - startedAt) / 1000))
@@ -68,6 +70,23 @@ function renderMetrics({ manager, limiter, startedAt, pwLockouts }) {
   // this map on every password POST, a path whose frequency an attacker
   // controls.
   body += gauge('janus_pw_lockout_entries', 'Number of tracked (client IP, keyHash) pairs with recent failed per-key password attempts.', num(pwLockouts && pwLockouts.entries))
+  // Directory feature (opt-in, DIRECTORY_ENABLED, default false) had no
+  // observability at all -- the whole point of shipping it was to learn
+  // whether anyone uses it. Always emitted, even when the feature is
+  // disabled: reporting 0 is more useful to an operator than a series that
+  // vanishes and breaks a dashboard (same convention as pwLockouts above).
+  //
+  // Deliberately counts STORED directory entries (src/store.js's
+  // listDirectory()), NOT what /directory's list() would currently render.
+  // list() additionally hides blocked/password-protected keys and caps the
+  // result at DIRECTORY_MAX_ENTRIES -- re-deriving that here on every scrape
+  // would mean calling store.isBlocked()/getPassword() per entry, which is
+  // needless work on an operator-facing but still-hot-enough path. So this
+  // gauge can read slightly higher than the live page's entry count; the
+  // HELP text says so explicitly rather than silently meaning something
+  // narrower than its name implies.
+  body += gauge('janus_directory_entries', 'Total directory entries currently stored (may exceed what /directory renders: it excludes blocked/password-protected keys and caps at DIRECTORY_MAX_ENTRIES).', num(directoryStats && directoryStats.total))
+  body += gauge('janus_directory_online', 'Of the stored directory entries, how many are currently marked online.', num(directoryStats && directoryStats.online))
   // Milestone 2c: aggregate-only, process-wide gauge/counters -- see the
   // module-level comment: NEVER label any of these with a keyHash.
   body += gauge('janus_circuits_open', 'Number of keyHash circuits currently open (fast-failing cold creates).', num(m.circuitsOpen))

@@ -90,6 +90,7 @@ function fakeStore(overrides = {}) {
     setPassword: (keyHash, rawKey, hash, salt) => recorded.push(['setPassword', keyHash, rawKey, hash, salt]),
     clearPassword: (keyHash) => recorded.push(['clearPassword', keyHash]),
     deleteKey: (keyHash) => recorded.push(['deleteKey', keyHash]),
+    setDirectorySuppressed: (keyHash, suppressed) => recorded.push(['setDirectorySuppressed', keyHash, suppressed]),
     ...overrides,
   }
 }
@@ -319,4 +320,69 @@ test('S14: POST /_admin/block with cookie + valid csrf + absent Origin -> succee
   await run(req, res, baseDeps({ manager }))
   assert.equal(res.statusCode, 302)
   assert.deepEqual(manager.recorded, [['destroy', keyHash], ['block', keyHash]])
+})
+
+// --- /_admin/suppress: mirrors /_admin/block's Origin coverage above -------
+// Directory-only suppression must enforce Origin/CSRF exactly like block,
+// but must never call manager.destroyTunnel/block/unblock -- only
+// store.setDirectorySuppressed.
+
+test('S14: POST /_admin/suppress with cookie + valid csrf but sibling-subdomain Origin -> 403, no suppression performed', async () => {
+  const cookieVal = adminCookieValue()
+  const csrf = csrfToken(SESSION_SECRET, SID)
+  const manager = fakeManager()
+  const store = fakeStore()
+  const keyHash = 'c'.repeat(64)
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/suppress',
+    headers: {
+      cookie: `janus_admin=${cookieVal}`,
+      host: ADMIN_HOST,
+      origin: `http://0000${'z'.repeat(48)}.${ADMIN_HOST}`,
+    },
+    body: `action=suppress&keyHash=${keyHash}&csrf=${csrf}`,
+  })
+  const res = mockRes()
+  await run(req, res, baseDeps({ manager, store }))
+  assert.equal(res.statusCode, 403)
+  assert.deepEqual(store.recorded, [])
+  assert.deepEqual(manager.recorded, [])
+})
+
+test('S14: POST /_admin/suppress with cookie + valid csrf + exact-match Origin -> succeeds, tunnel untouched', async () => {
+  const cookieVal = adminCookieValue()
+  const csrf = csrfToken(SESSION_SECRET, SID)
+  const manager = fakeManager()
+  const store = fakeStore()
+  const keyHash = 'c'.repeat(64)
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/suppress',
+    headers: { cookie: `janus_admin=${cookieVal}`, host: ADMIN_HOST, origin: `http://${ADMIN_HOST}` },
+    body: `action=suppress&keyHash=${keyHash}&csrf=${csrf}`,
+  })
+  const res = mockRes()
+  await run(req, res, baseDeps({ manager, store }))
+  assert.equal(res.statusCode, 302)
+  assert.deepEqual(store.recorded, [['setDirectorySuppressed', keyHash, true]])
+  assert.deepEqual(manager.recorded, [], 'suppression must never touch the tunnel')
+})
+
+test('S14: POST /_admin/suppress with cookie + valid csrf + absent Origin -> succeeds (non-browser client)', async () => {
+  const cookieVal = adminCookieValue()
+  const csrf = csrfToken(SESSION_SECRET, SID)
+  const manager = fakeManager()
+  const store = fakeStore()
+  const keyHash = 'c'.repeat(64)
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/suppress',
+    headers: { cookie: `janus_admin=${cookieVal}`, host: ADMIN_HOST },
+    body: `action=suppress&keyHash=${keyHash}&csrf=${csrf}`,
+  })
+  const res = mockRes()
+  await run(req, res, baseDeps({ manager, store }))
+  assert.equal(res.statusCode, 302)
+  assert.deepEqual(store.recorded, [['setDirectorySuppressed', keyHash, true]])
 })

@@ -672,7 +672,16 @@ const server = http.createServer(async (req, res) => {
         'Content-Type': 'text/plain; version=0.0.4',
         'Cache-Control': 'no-store',
       })
-      res.end(renderMetrics({ manager, limiter, startedAt, pwLockouts: { entries: pwFails.size } }))
+      // Cheap: store.listDirectory() reads the in-memory directory map only
+      // -- no manifest fetch, no disk read. Bounded by however many entries
+      // are stored (see src/metrics.js's comment on what this counts vs.
+      // what /directory renders).
+      const directoryEntries = store.listDirectory()
+      const directoryStats = {
+        total: directoryEntries.length,
+        online: directoryEntries.filter((e) => e.online).length,
+      }
+      res.end(renderMetrics({ manager, limiter, startedAt, pwLockouts: { entries: pwFails.size }, directoryStats }))
       return
     }
     if (url.pathname === '/directory') {

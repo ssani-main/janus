@@ -186,12 +186,25 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 # lift the block
 curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
   "https://gw.yourdomain.com/_admin/unblock?keyHash=<hash>"
+
+# hide a key from the directory only -- its site keeps working normally
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"suppress","keyHash":"<hash>"}' \
+  "https://gw.yourdomain.com/_admin/api/directory"
+
+# restore that listing
+curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"action":"unsuppress","keyHash":"<hash>"}' \
+  "https://gw.yourdomain.com/_admin/api/directory"
 ```
 
 **HTML dashboard** — log in with `ADMIN_TOKEN` in your browser. View live tunnels and manage:
 - **Named aliases** — map friendly subdomains (e.g., `myblog.gw.yourdomain.com`) to keys. Raw key links always work; aliases are additive.
 - **Per-key passwords** — set optional password protection on any key. Visitors enter the password once and receive a signed HttpOnly session cookie (TTL: `SESSION_TTL_MS`, default 7 days). Keys without passwords stay fully open. Changing/clearing a password revokes all existing sessions for that key.
-- **Blocklist** — manage which keys are blocked.
+- **Blocklist** — manage which keys are blocked. Blocking a key tears down its live tunnel and refuses new ones — the site itself goes offline.
+- **Directory suppression** — hide a key's `/directory` listing only, without touching its tunnel or site. Use this instead of Block for a spammy or misleading title where the site itself is otherwise fine; use Block when the site itself needs to come down. The CLI equivalent is `janus directory suppress <keyHash>` / `janus directory unsuppress <keyHash>`.
 
 Dashboard sessions use CSRF protection and SameSite=Strict cookies (TTL: `ADMIN_SESSION_TTL_MS`, default 12 hours). Rotating `ADMIN_TOKEN` immediately invalidates all outstanding admin sessions.
 
@@ -223,6 +236,8 @@ An optional, operator-enabled `/directory` endpoint lists projects whose owners 
 **Important:** listing publishes the raw Holesail key, which is the **bearer credential for your backend**. Listed means permanently public. Assume crawlers and archives will capture it. **The only revocation is rotating your key, which changes your URL.** Do not list unless you accept public discovery and understand you cannot "un-list" by asking an operator — deletion is only under your control, via your own backend.
 
 **Blocklist and passwords:** keys with passwords set or blocked by the operator are structurally ineligible and are automatically filtered out of every directory render. Blocking a key or setting a password de-lists it immediately.
+
+**Directory suppression:** the operator can also hide a listing without blocking the key at all — `janus directory suppress <keyHash>` (or the dashboard's "Suppress listing" control) removes it from `/directory` and `/directory.json` immediately, with no effect whatsoever on the tunnel or the site itself, which keeps proxying exactly as before. This is the proportionate response to a spammy or misleading *title*; reach for Block only when the site itself needs to come down. `janus directory unsuppress <keyHash>` restores the listing. The suppression flag survives the tenant's own manifest re-fetches — it cannot be cleared by editing the manifest, only by an operator.
 
 **Liveness:** the directory marks entries online/offline lazily. When a visitor successfully reaches your project, it's marked online. When a request fails, it's marked offline. Offline entries stay listed with a last-seen timestamp rather than disappearing. An entry that nobody visits does not update its timestamp.
 

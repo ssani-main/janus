@@ -25,6 +25,20 @@ function escapeHtml(str) {
     .replace(/'/g, '&#39;')
 }
 
+// Defensive only: config.js always supplies DIRECTORY_RECHECK_MS (default or
+// a validated override) and fails fast on anything non-finite, so a
+// missing/non-finite value here "can't happen" in production. But
+// `Math.max(1, Math.round(NaN / 60000))` is `NaN`, not `1` -- Math.max does
+// not treat NaN as smaller than its other argument, it propagates -- so a
+// config object missing the field would render "NaN minutes" straight to
+// visitors. Number.isFinite (not truthiness) so a configured `0` -- a
+// legitimate "always recheck" setting -- isn't mistaken for "unset"; it still
+// floors to 1 minute below, which is correct for human-readable text.
+function directoryRecheckMinutes(config) {
+  const ms = Number.isFinite(config.DIRECTORY_RECHECK_MS) ? config.DIRECTORY_RECHECK_MS : 0
+  return Math.max(1, Math.round(ms / 60000))
+}
+
 function configuredOrPlaceholder(value, fieldName) {
   if (value && String(value).trim() !== '') return escapeHtml(value)
   return `<span class="warn">&#9888; NOT CONFIGURED &mdash; operator must set ${escapeHtml(fieldName)}</span>`
@@ -302,7 +316,7 @@ function guidePage(config) {
   // Phase 1: only document the directory when the operator has opted the
   // gateway into it -- same gate as apexPage's directoryLink, so the guide
   // never describes a page that 404s.
-  const recheckMinutes = Math.max(1, Math.round(config.DIRECTORY_RECHECK_MS / 60000))
+  const recheckMinutes = directoryRecheckMinutes(config)
   const directorySection = config.DIRECTORY_ENABLED
     ? `
     <h2>Get listed in the directory</h2>
@@ -479,7 +493,7 @@ function guidePage(config) {
 // operator config rather than request-derived, and nothing else here is
 // dynamic.
 function llmsTxt(config) {
-  const recheckMinutes = Math.max(1, Math.round(config.DIRECTORY_RECHECK_MS / 60000))
+  const recheckMinutes = directoryRecheckMinutes(config)
   const directorySection = config.DIRECTORY_ENABLED
     ? `
 ## Directory (opt-in)
@@ -865,6 +879,12 @@ function adminDashboardPage({ rows, csrf, config, error }) {
     const statusBits = []
     statusBits.push(row.live ? 'live' : 'idle')
     if (row.blocked) statusBits.push('<span class="warn">blocked</span>')
+    // Directory-only suppression: deliberately a distinct badge from
+    // "blocked" -- suppression hides only the /directory listing, the
+    // tenant's site keeps working exactly as before. Conflating the two
+    // wordings here is the main misreading risk the feature has, so this
+    // stays visually and textually separate from the blocked badge above.
+    if (row.directorySuppressed) statusBits.push('<span class="warn">directory-suppressed</span>')
     const status = statusBits.join(' &middot; ')
     const password = row.hasPassword ? '&#128274;' : '&mdash;'
     const port = row.live ? escapeHtml(String(row.port)) : '&mdash;'
@@ -884,6 +904,17 @@ function adminDashboardPage({ rows, csrf, config, error }) {
       <input type="hidden" name="keyHash" value="${safeKeyHash}">
       <input type="hidden" name="action" value="${row.blocked ? 'unblock' : 'block'}">
       <button type="submit">${row.blocked ? 'Unblock' : 'Block'}</button>
+    </form>`
+
+    // Distinct from Block/Unblock above: this only hides the /directory
+    // listing (store.directorySuppressed) -- the tunnel/site keeps working
+    // and keeps proxying normally either way. Title text spells that out so
+    // an operator can't mistake it for taking the site offline.
+    const suppressForm = `<form method="POST" action="/_admin/suppress" style="display:inline-flex" title="${row.directorySuppressed ? 'Restore this key\'s /directory listing. Does not affect the site itself.' : 'Hide this key from /directory only. The site keeps working normally.'}">
+      <input type="hidden" name="csrf" value="${safeCsrf}">
+      <input type="hidden" name="keyHash" value="${safeKeyHash}">
+      <input type="hidden" name="action" value="${row.directorySuppressed ? 'unsuppress' : 'suppress'}">
+      <button type="submit">${row.directorySuppressed ? 'Unsuppress listing' : 'Suppress listing'}</button>
     </form>`
 
     const clearAliasForm = row.alias
@@ -929,7 +960,7 @@ function adminDashboardPage({ rows, csrf, config, error }) {
       <td>${health}</td>
       <td>${inFlight}</td>
       <td>${lastRequestAt}</td>
-      <td style="display:flex; gap:0.5rem; flex-wrap:wrap">${blockForm}${clearAliasForm}${clearPasswordForm}${deleteForm}</td>
+      <td style="display:flex; gap:0.5rem; flex-wrap:wrap">${blockForm}${suppressForm}${clearAliasForm}${clearPasswordForm}${deleteForm}</td>
     </tr>`
   }).join('\n')
 

@@ -221,7 +221,7 @@ class Store {
 
   /**
    * @param {string} keyHash
-   * @returns {{ rawKey: ?string, alias: ?string, password: ?object, blocked: boolean, createdAt: number, updatedAt: number } | undefined}
+   * @returns {{ rawKey: ?string, alias: ?string, password: ?object, blocked: boolean, directorySuppressed: boolean, createdAt: number, updatedAt: number } | undefined}
    */
   getKey(keyHash) {
     return this.data.keys[keyHash]
@@ -247,6 +247,37 @@ class Store {
   setBlocked(keyHash, blocked) {
     const record = this._ensureRecord(keyHash)
     record.blocked = !!blocked
+    record.updatedAt = Date.now()
+    this._persist()
+  }
+
+  /**
+   * @param {string} keyHash
+   * @returns {boolean}
+   */
+  isDirectorySuppressed(keyHash) {
+    const record = this.data.keys[keyHash]
+    return !!(record && record.directorySuppressed)
+  }
+
+  /**
+   * Directory-only suppression: hides a key's listing from `/directory` and
+   * `/directory.json` without touching its tunnel, routing, or any other
+   * metadata. Deliberately lives on the KEY record (like `blocked`), not on
+   * `data.directory[keyHash]` -- see the module-level rationale in
+   * src/directory.js's `_eligibleNow` and CLAUDE.md for why storing it on the
+   * directory entry would let a tenant clear their own moderation state by
+   * simply re-serving their manifest.
+   *
+   * Mirrors setBlocked exactly: creates a bare record if none exists, so an
+   * operator can suppress a keyHash they've never seen an alias/password for.
+   *
+   * @param {string} keyHash
+   * @param {boolean} suppressed
+   */
+  setDirectorySuppressed(keyHash, suppressed) {
+    const record = this._ensureRecord(keyHash)
+    record.directorySuppressed = !!suppressed
     record.updatedAt = Date.now()
     this._persist()
   }
@@ -463,7 +494,7 @@ class Store {
    * `rawKey` and `password.{hash,salt}` verbatim -- the boundary must be
    * enforced here, at the source, not left to every caller to remember.
    *
-   * @returns {Array<{ keyHash: string, alias: ?string, blocked: boolean, hasPassword: boolean, createdAt: number, updatedAt: number }>}
+   * @returns {Array<{ keyHash: string, alias: ?string, blocked: boolean, directorySuppressed: boolean, hasPassword: boolean, createdAt: number, updatedAt: number }>}
    */
   listMetadata() {
     return Object.keys(this.data.keys).map((keyHash) => {
@@ -472,6 +503,7 @@ class Store {
         keyHash,
         alias: r.alias,
         blocked: !!r.blocked,
+        directorySuppressed: !!r.directorySuppressed,
         hasPassword: !!r.password, // boolean only -- never the hash/salt
         createdAt: r.createdAt,
         updatedAt: r.updatedAt,
@@ -586,6 +618,7 @@ class Store {
         password: null,
         pwdVersion: 0,
         blocked: false,
+        directorySuppressed: false,
         createdAt: Date.now(),
         updatedAt: Date.now(),
       }

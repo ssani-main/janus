@@ -152,6 +152,24 @@ holepunch is flaky on hosted runners.
   every timeout. Do not "simplify" this to a bare `shift()`. Regression test:
   `tunnel-manager-create-concurrency.test.js` ("a timed-out waiter must not
   consume the slot").
+- **Directory suppression lives on `data.keys[keyHash]`
+  (`store.directorySuppressed`), not on `data.directory[keyHash]`.** It looks
+  like it belongs on the directory entry -- that's the record the feature is
+  about -- and it deliberately does not. `data.directory[keyHash]` is created,
+  overwritten, and deleted entirely by the passive manifest fetch
+  (`directory.js#maybeFetchManifest`, driven by `store.setDirectoryEntry`/
+  `clearDirectoryEntry`): the tenant's own backend controls its existence and
+  contents just by answering `/.well-known/janus-index.json` differently on
+  its next visit. A moderation decision stored on that row would be silently
+  cleared the moment the owner's site is next visited (or de-listed and
+  wiped outright if their manifest ever fails validation) -- handing the
+  tenant the ability to clear their own suppression by editing their own
+  manifest, which defeats the entire point of an operator-only lever. Storing
+  it on the key record instead (same pattern as `blocked`) means it survives
+  every manifest churn, and `directory.js`'s `_eligibleNow` -- which `list()`
+  filters through on every call -- checks it live, so suppressing/
+  unsuppressing takes effect immediately with no refetch, exactly like block/
+  password. Do not "simplify" this by moving it onto the directory entry.
 - **The websocket upgrade path has no password lockout, on purpose.** It does
   its own inline cookie check rather than calling `passwordGate`, so the
   `KEY_LOGIN_*` lockout does not apply there. That asymmetry looks like an

@@ -100,6 +100,7 @@ function fakeStore(overrides = {}) {
     // S7 "fuller fix": POST /_admin/delete calls store.deleteKey(keyHash)
     // after tearing down any live tunnel.
     deleteKey: (keyHash) => recorded.push(['deleteKey', keyHash]),
+    setDirectorySuppressed: (keyHash, suppressed) => recorded.push(['setDirectorySuppressed', keyHash, suppressed]),
     ...overrides,
   }
 }
@@ -242,10 +243,41 @@ test('handleAdmin: GET /_admin with valid admin cookie -> 200 dashboard HTML', a
     headers: { cookie: `janus_admin=${cookieVal}` },
   })
   const res = mockRes()
-  await run(req, res, { manager: fakeManager(), config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET })
+  const store = fakeStore({
+    listMetadata: () => [
+      { keyHash: 'a'.repeat(64), alias: null, blocked: false, directorySuppressed: false, hasPassword: false, createdAt: 1, updatedAt: 2 },
+    ],
+  })
+  await run(req, res, { manager: fakeManager(), config: baseConfig(), store, sessionSecret: SESSION_SECRET })
   assert.equal(res.statusCode, 200)
   assert.match(res.body, /name="csrf" value="[0-9a-f]+"/)
   assert.match(res.body, /<table>/)
+  // Directory-only suppression: the dashboard renders a distinct control
+  // from Block/Unblock, and its wording must not imply the site goes down.
+  assert.match(res.body, /action="\/_admin\/suppress"/)
+  assert.match(res.body, /Suppress listing/)
+  assert.doesNotMatch(res.body, /directory-suppressed/, 'a not-yet-suppressed row must not show the suppressed badge')
+})
+
+test('handleAdmin: GET /_admin dashboard shows the "directory-suppressed" badge and Unsuppress control for a suppressed key', async () => {
+  const cookieVal = adminCookieValue()
+  const keyHash = 'a'.repeat(64)
+  const req = mockReq({
+    method: 'GET',
+    url: '/_admin',
+    headers: { cookie: `janus_admin=${cookieVal}` },
+  })
+  const res = mockRes()
+  const store = fakeStore({
+    listMetadata: () => [
+      { keyHash, alias: null, blocked: false, directorySuppressed: true, hasPassword: false, createdAt: 1, updatedAt: 2 },
+    ],
+  })
+  await run(req, res, { manager: fakeManager(), config: baseConfig(), store, sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 200)
+  assert.match(res.body, /directory-suppressed/)
+  assert.match(res.body, /Unsuppress listing/)
+  assert.match(res.body, /name="action" value="unsuppress"/)
 })
 
 // --- 6. CSRF enforcement on POST /_admin/block -------------------------------
@@ -313,6 +345,80 @@ test('handleAdmin: POST /_admin/block with bearer only (no cookie) -> rejected, 
   await run(req, res, { manager, config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET })
   assert.ok(res.statusCode === 403 || res.statusCode === 401, `expected 403/401, got ${res.statusCode}`)
   assert.deepEqual(manager.recorded, [])
+})
+
+// --- 7b. CSRF enforcement + behavior of POST /_admin/suppress ---------------
+//
+// Directory-only suppression: modeled exactly on /_admin/block's tests
+// above, but MUST call store.setDirectorySuppressed, never
+// manager.destroyTunnel/block/unblock -- the tenant's tunnel must be
+// completely untouched by this endpoint.
+
+test('handleAdmin: POST /_admin/suppress with valid cookie but missing csrf -> 403, no suppression performed', async () => {
+  const cookieVal = adminCookieValue()
+  const store = fakeStore()
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/suppress',
+    headers: { cookie: `janus_admin=${cookieVal}` },
+    body: 'action=suppress&keyHash=abc123',
+  })
+  const res = mockRes()
+  await run(req, res, { manager: fakeManager(), config: baseConfig(), store, sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 403)
+  assert.deepEqual(store.recorded, [])
+})
+
+test('handleAdmin: POST /_admin/suppress with valid cookie and correct csrf -> suppress succeeds, 302, tunnel untouched', async () => {
+  const cookieVal = adminCookieValue()
+  const csrf = csrfToken(SESSION_SECRET, SID)
+  const manager = fakeManager()
+  const store = fakeStore()
+  const keyHash = 'a'.repeat(64)
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/suppress',
+    headers: { cookie: `janus_admin=${cookieVal}` },
+    body: `action=suppress&keyHash=${keyHash}&csrf=${csrf}`,
+  })
+  const res = mockRes()
+  await run(req, res, { manager, config: baseConfig(), store, sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 302)
+  assert.equal(res.headers['Location'], '/_admin')
+  assert.deepEqual(store.recorded, [['setDirectorySuppressed', keyHash, true]])
+  assert.deepEqual(manager.recorded, [], 'suppression must never touch the tunnel/manager')
+})
+
+test('handleAdmin: POST /_admin/suppress unsuppress action -> calls setDirectorySuppressed(keyHash, false)', async () => {
+  const cookieVal = adminCookieValue()
+  const csrf = csrfToken(SESSION_SECRET, SID)
+  const store = fakeStore()
+  const keyHash = 'a'.repeat(64)
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/suppress',
+    headers: { cookie: `janus_admin=${cookieVal}` },
+    body: `action=unsuppress&keyHash=${keyHash}&csrf=${csrf}`,
+  })
+  const res = mockRes()
+  await run(req, res, { manager: fakeManager(), config: baseConfig(), store, sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 302)
+  assert.deepEqual(store.recorded, [['setDirectorySuppressed', keyHash, false]])
+})
+
+test('handleAdmin: POST /_admin/suppress with bearer only (no cookie) -> rejected, no action performed', async () => {
+  const csrf = csrfToken(SESSION_SECRET, SID)
+  const store = fakeStore()
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/suppress',
+    headers: { authorization: `Bearer ${ADMIN_TOKEN}` },
+    body: `action=suppress&keyHash=abc123&csrf=${csrf}`,
+  })
+  const res = mockRes()
+  await run(req, res, { manager: fakeManager(), config: baseConfig(), store, sessionSecret: SESSION_SECRET })
+  assert.ok(res.statusCode === 403 || res.statusCode === 401, `expected 403/401, got ${res.statusCode}`)
+  assert.deepEqual(store.recorded, [])
 })
 
 // --- 8. POST /_admin/alias ----------------------------------------------------

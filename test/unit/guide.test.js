@@ -79,6 +79,20 @@ test('apexPage: points a keyless visitor at both the guide and llms.txt', () => 
   assert.match(html, /href="\/llms\.txt"/)
 })
 
+// --- Defensive NaN fix: DIRECTORY_RECHECK_MS missing must not render "NaN" -
+
+test('guidePage: a missing DIRECTORY_RECHECK_MS degrades to a sane minute count, not NaN', () => {
+  const html = guidePage(fakeConfig({ DIRECTORY_ENABLED: true }))
+  assert.doesNotMatch(html, /NaN/)
+  assert.match(html, /minute/)
+})
+
+test('llmsTxt: a missing DIRECTORY_RECHECK_MS degrades to a sane minute count, not NaN', () => {
+  const txt = llmsTxt(fakeConfig({ DIRECTORY_ENABLED: true }))
+  assert.doesNotMatch(txt, /NaN/)
+  assert.match(txt, /minute/)
+})
+
 test('footer: links the guide absolutely, so it still resolves from a tenant error page', () => {
   // A 400 is rendered on <key>.BASE_DOMAIN, where a relative /guide would
   // 404 against the tenant's own backend instead of reaching the gateway.

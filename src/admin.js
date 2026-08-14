@@ -47,6 +47,11 @@ const { adminLoginPage, adminDashboardPage } = require('./pages')
 
 const COOKIE_NAME = 'janus_admin'
 const FORM_BODY_MAX_BYTES = 4096
+// F-API: JSON bodies for the bearer-only /_admin/api/* namespace. Same cap
+// as FORM_BODY_MAX_BYTES (kept as a separate constant since the two shapes
+// are unrelated and could reasonably diverge later) -- these bodies carry at
+// most an action + alias/keyHash/rawKey/password, never bulk data.
+const API_BODY_MAX_BYTES = 4096
 
 // keyHash is always a SHA-256 hex digest (64 lowercase hex chars). Any
 // operator-supplied keyHash (form field or query param) must be validated
@@ -132,6 +137,32 @@ async function readForm(req) {
 }
 
 /**
+ * Read + parse a JSON object body for the /_admin/api/* namespace, capped at
+ * `maxBytes` (reuses readBodyCapped above). Returns `undefined` -- a
+ * sentinel distinct from any valid JSON value, including `null` -- on any of:
+ * oversized/aborted/errored body, invalid JSON, or a JSON value that isn't a
+ * plain (non-array) object. Callers must check for `undefined` and respond
+ * 400, never let it flow into a plain-object key lookup.
+ *
+ * @param {import('node:http').IncomingMessage} req
+ * @param {number} maxBytes
+ * @returns {Promise<object | undefined>}
+ */
+async function readJsonCapped(req, maxBytes) {
+  const body = await readBodyCapped(req, maxBytes)
+  if (body === null) return undefined
+  if (body.trim() === '') return {}
+  let parsed
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    return undefined
+  }
+  if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return undefined
+  return parsed
+}
+
+/**
  * @param {string} adminToken
  * @returns {string}
  */
@@ -205,6 +236,8 @@ function buildRows(manager, store) {
       keyHash,
       alias: (m && m.alias) || null,
       blocked: !!(m && m.blocked),
+      // Directory-only suppression flag -- see store.js#setDirectorySuppressed.
+      directorySuppressed: !!(m && m.directorySuppressed),
       // S11: listMetadata() now returns hasPassword as a plain boolean (never
       // the password hash/salt/rawKey) -- m.password no longer exists.
       hasPassword: !!(m && m.hasPassword),
@@ -219,6 +252,226 @@ function buildRows(manager, store) {
   }
   rows.sort((a, b) => a.keyHash.localeCompare(b.keyHash))
   return rows
+}
+
+const API_KEYS_PREFIX = '/_admin/api/keys/'
+
+/**
+ * The bearer-only JSON API at /_admin/api/*.
+ *
+ * SECURITY: this namespace accepts ONLY `Authorization: Bearer <ADMIN_TOKEN>`
+ * -- callers must never fall back to (or even inspect) the `janus_admin`
+ * session cookie here. Because it never accepts an ambient credential a
+ * browser could be tricked into attaching, CSRF is structurally not
+ * applicable to these routes -- do NOT "helpfully" add cookie-session support
+ * to this namespace later without re-adding the Origin/CSRF protections that
+ * decision would then require (see the file-header comment and S14 below for
+ * why that matters on this same-site-with-tenants deployment).
+ *
+ * Caller (handleAdmin) has already verified `bearerValid` before invoking
+ * this function -- it does not re-check auth.
+ *
+ * @param {import('http').IncomingMessage} req
+ * @param {import('http').ServerResponse} res
+ * @param {string} pathname
+ * @param {{ manager: any, config: any, store: any, directory: any }} deps
+ */
+async function handleAdminApi(req, res, pathname, { manager, store, directory }) {
+  if (pathname === '/_admin/api/keys') {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    // store.listMetadata() already excludes rawKey/password hash+salt (S11)
+    // -- see store.js#listMetadata.
+    sendJson(res, 200, { keys: store.listMetadata() })
+    return
+  }
+
+  if (pathname.startsWith(API_KEYS_PREFIX)) {
+    const keyHash = pathname.slice(API_KEYS_PREFIX.length)
+    if (req.method !== 'DELETE') {
+      sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    if (!isValidKeyHash(keyHash)) {
+      sendJson(res, 400, { error: 'invalid keyHash' })
+      return
+    }
+    // Mirrors /_admin/delete: tear down any live tunnel first (deleteKey
+    // only removes stored metadata; the port stays held until the tunnel is
+    // destroyed), then forget it from the directory recheck-cache.
+    await manager.destroyTunnel(keyHash)
+    store.deleteKey(keyHash)
+    if (directory) directory.forget(keyHash)
+    sendJson(res, 200, { deleted: keyHash })
+    return
+  }
+
+  if (pathname === '/_admin/api/tunnels') {
+    if (req.method !== 'GET') {
+      sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    const tunnels = manager.list()
+    sendJson(res, 200, { tunnels, count: tunnels.length })
+    return
+  }
+
+  if (pathname === '/_admin/api/alias') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    const body = await readJsonCapped(req, API_BODY_MAX_BYTES)
+    if (body === undefined) {
+      sendJson(res, 400, { error: 'invalid or oversized JSON body' })
+      return
+    }
+    const { action, alias } = body
+    if (action === 'set') {
+      const rawKey = body.rawKey
+      if (typeof alias !== 'string' || typeof rawKey !== 'string' || !alias || !rawKey) {
+        sendJson(res, 400, { error: 'alias and rawKey are required strings' })
+        return
+      }
+      try {
+        store.setAlias(alias, rawKey)
+      } catch (err) {
+        sendJson(res, 400, { error: err.message })
+        return
+      }
+      sendJson(res, 200, { ok: true })
+      return
+    }
+    if (action === 'clear') {
+      if (typeof alias !== 'string' || !alias) {
+        sendJson(res, 400, { error: 'alias is required' })
+        return
+      }
+      store.clearAlias(alias)
+      sendJson(res, 200, { ok: true })
+      return
+    }
+    sendJson(res, 400, { error: 'action must be "set" or "clear"' })
+    return
+  }
+
+  if (pathname === '/_admin/api/password') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    const body = await readJsonCapped(req, API_BODY_MAX_BYTES)
+    if (body === undefined) {
+      sendJson(res, 400, { error: 'invalid or oversized JSON body' })
+      return
+    }
+    const { action } = body
+    const rawKey = typeof body.rawKey === 'string' ? body.rawKey : ''
+    let keyHash = typeof body.keyHash === 'string' ? body.keyHash : ''
+    if (rawKey) {
+      try {
+        keyHash = parseKey(rawKey).keyHash
+      } catch (err) {
+        sendJson(res, 400, { error: err.message })
+        return
+      }
+    }
+    if (!keyHash) {
+      sendJson(res, 400, { error: 'either rawKey or keyHash is required' })
+      return
+    }
+    if (!isValidKeyHash(keyHash)) {
+      sendJson(res, 400, { error: 'invalid keyHash' })
+      return
+    }
+    if (action === 'set') {
+      const password = body.password
+      if (typeof password !== 'string' || !password) {
+        sendJson(res, 400, { error: 'password is required' })
+        return
+      }
+      const { hash, salt } = await hashPassword(password)
+      store.setPassword(keyHash, rawKey || null, hash, salt)
+      sendJson(res, 200, { ok: true })
+      return
+    }
+    if (action === 'clear') {
+      store.clearPassword(keyHash)
+      sendJson(res, 200, { ok: true })
+      return
+    }
+    sendJson(res, 400, { error: 'action must be "set" or "clear"' })
+    return
+  }
+
+  if (pathname === '/_admin/api/block') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    const body = await readJsonCapped(req, API_BODY_MAX_BYTES)
+    if (body === undefined) {
+      sendJson(res, 400, { error: 'invalid or oversized JSON body' })
+      return
+    }
+    const { action, keyHash } = body
+    if (typeof keyHash !== 'string' || !isValidKeyHash(keyHash)) {
+      sendJson(res, 400, { error: 'invalid keyHash' })
+      return
+    }
+    if (action === 'block') {
+      // Mirrors /_admin/kill?block=1 / the dashboard's block action: tear
+      // down any live tunnel before marking the key blocked.
+      await manager.destroyTunnel(keyHash)
+      manager.block(keyHash)
+      sendJson(res, 200, { blocked: keyHash })
+      return
+    }
+    if (action === 'unblock') {
+      manager.unblock(keyHash)
+      sendJson(res, 200, { unblocked: keyHash })
+      return
+    }
+    sendJson(res, 400, { error: 'action must be "block" or "unblock"' })
+    return
+  }
+
+  if (pathname === '/_admin/api/directory') {
+    if (req.method !== 'POST') {
+      sendJson(res, 405, { error: 'method not allowed' })
+      return
+    }
+    const body = await readJsonCapped(req, API_BODY_MAX_BYTES)
+    if (body === undefined) {
+      sendJson(res, 400, { error: 'invalid or oversized JSON body' })
+      return
+    }
+    const { action, keyHash } = body
+    if (typeof keyHash !== 'string' || !isValidKeyHash(keyHash)) {
+      sendJson(res, 400, { error: 'invalid keyHash' })
+      return
+    }
+    // Directory-only suppression: unlike /_admin/api/block, this never
+    // touches the tunnel -- it only flips store.directorySuppressed (see
+    // store.js#setDirectorySuppressed). The tenant's site keeps proxying
+    // normally either way.
+    if (action === 'suppress') {
+      store.setDirectorySuppressed(keyHash, true)
+      sendJson(res, 200, { suppressed: keyHash })
+      return
+    }
+    if (action === 'unsuppress') {
+      store.setDirectorySuppressed(keyHash, false)
+      sendJson(res, 200, { unsuppressed: keyHash })
+      return
+    }
+    sendJson(res, 400, { error: 'action must be "suppress" or "unsuppress"' })
+    return
+  }
+
+  sendJson(res, 404, { error: 'not found' })
 }
 
 /**
@@ -261,6 +514,21 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip
 
   const url = new URL(req.url, 'http://internal')
   const pathname = url.pathname
+
+  // --- Bearer-only JSON API (/_admin/api/*) -------------------------------
+  //
+  // Deliberately checked before any cookie-session logic below, and checks
+  // ONLY bearerValid -- never cookieValid, never as an OR/fallback. See
+  // handleAdminApi's doc comment for why that also means CSRF does not
+  // apply here.
+  if (pathname === '/_admin/api' || pathname.startsWith('/_admin/api/')) {
+    if (!bearerValid) {
+      sendJson(res, 401, { error: 'unauthorized' })
+      return
+    }
+    await handleAdminApi(req, res, pathname, { manager, store, directory })
+    return
+  }
 
   // --- Login / logout (cookie-session bootstrap, no prior auth required) --
 
@@ -559,6 +827,41 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip
         manager.block(keyHash)
       } else if (action === 'unblock') {
         manager.unblock(keyHash)
+      }
+    }
+    res.writeHead(302, { 'Location': '/_admin' })
+    res.end()
+    return
+  }
+
+  // Directory-only suppression: modeled exactly on /_admin/block above
+  // (cookie session + CSRF via session.sid, isValidKeyHash guard, 302 on
+  // success), but calls store.setDirectorySuppressed directly instead of
+  // manager.block/unblock -- there is no tunnel to tear down or reinstate,
+  // since suppression must never affect routing/proxying at all. See
+  // store.js#setDirectorySuppressed and CLAUDE.md for why this is stored on
+  // the key record rather than the directory entry.
+  if (pathname === '/_admin/suppress' && req.method === 'POST') {
+    const form = await readForm(req)
+    // S9: see /_admin/alias above -- CSRF is bound to session.sid.
+    // S14: also require the Origin check -- see isOriginAllowed above.
+    if (!cookieValid || !isOriginAllowed(req, config) || !verifyCsrf(sessionSecret, session.sid, form.get('csrf'))) {
+      sendJson(res, 403, { error: 'forbidden' })
+      return
+    }
+    const action = form.get('action')
+    const keyHash = form.get('keyHash') || ''
+    if (keyHash) {
+      if (!isValidKeyHash(keyHash)) {
+        const csrf = csrfToken(sessionSecret, session.sid)
+        const rows = buildRows(manager, store)
+        sendHtml(res, 200, adminDashboardPage({ rows, csrf, config, error: 'invalid keyHash' }))
+        return
+      }
+      if (action === 'suppress') {
+        store.setDirectorySuppressed(keyHash, true)
+      } else if (action === 'unsuppress') {
+        store.setDirectorySuppressed(keyHash, false)
       }
     }
     res.writeHead(302, { 'Location': '/_admin' })

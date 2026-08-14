@@ -46,6 +46,8 @@ const EXPECTED_METRIC_NAMES = [
   'janus_connect_failures_total',
   'janus_port_retries_total',
   'janus_ratelimit_hits_total',
+  'janus_directory_entries',
+  'janus_directory_online',
 ]
 
 test('renderMetrics: every emitted metric name has both a # HELP and # TYPE line', () => {
@@ -208,4 +210,40 @@ test('janus_pw_lockout_entries renders 0 when pwLockouts is absent (callers pred
   })
   assert.match(body, /^janus_pw_lockout_entries 0$/m)
   assert.doesNotMatch(body, /janus_pw_lockout_entries (undefined|NaN)/)
+})
+
+// --- janus_directory_entries / janus_directory_online ----------------------
+//
+// The directory feature (DIRECTORY_ENABLED, default false) shipped with no
+// observability at all. These gauges count STORED entries (src/store.js's
+// listDirectory()), not what /directory's list() would currently render --
+// see the module comment in src/metrics.js for why (list() additionally
+// filters blocked/password-protected keys and caps at DIRECTORY_MAX_ENTRIES,
+// which would mean extra per-entry store lookups on every scrape).
+
+test('janus_directory_entries / janus_directory_online render the supplied aggregate counts', () => {
+  const body = renderMetrics({
+    manager: fakeManager(),
+    limiter: fakeLimiter(),
+    startedAt: Date.now(),
+    directoryStats: { total: 5, online: 3 },
+  })
+  assert.match(body, /^janus_directory_entries 5$/m)
+  assert.match(body, /^# TYPE janus_directory_entries gauge$/m)
+  assert.match(body, /^janus_directory_online 3$/m)
+  assert.match(body, /^# TYPE janus_directory_online gauge$/m)
+})
+
+test('janus_directory_entries / janus_directory_online render 0 when directoryStats is absent (feature disabled)', () => {
+  // DIRECTORY_ENABLED defaults to false -- the gauges must still appear
+  // (reporting 0 is more useful to an operator than a missing series that
+  // breaks a dashboard), never as `undefined`/`NaN`.
+  const body = renderMetrics({
+    manager: fakeManager(),
+    limiter: fakeLimiter(),
+    startedAt: Date.now(),
+  })
+  assert.match(body, /^janus_directory_entries 0$/m)
+  assert.match(body, /^janus_directory_online 0$/m)
+  assert.doesNotMatch(body, /janus_directory_(entries|online) (undefined|NaN)/)
 })
