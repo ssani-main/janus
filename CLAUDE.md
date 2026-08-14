@@ -41,7 +41,7 @@ fight over tunnel ports and interleave writes to the store.
 
 ```sh
 npm run check      # node --check every src module (no build step exists)
-npm test           # 239 unit tests, no network
+npm test           # 261 unit tests, no network (2 skip off Linux: POSIX mode bits)
 npm run test:e2e   # 7 tests against real Holesail tunnels; needs devDependencies
 ```
 

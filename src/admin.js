@@ -240,7 +240,24 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip
 
   const cookies = parseCookies(req.headers.cookie)
   const session = verifySession(sessionSecret, cookies[COOKIE_NAME], { maxAgeMs: config.ADMIN_SESSION_TTL_MS })
-  const cookieValid = !!(session && session.adm === 1 && session.th === tokenHash)
+  // `sid` is required, not merely expected. Every cookie-authenticated
+  // mutation below binds its CSRF token to `session.sid` (S9), and
+  // csrfToken()/verifyCsrf() stringify whatever they are handed -- so a
+  // session payload WITHOUT a sid would have its CSRF token computed over the
+  // literal string 'undefined', giving every such session one shared,
+  // permanently-valid token. Sessions minted before S9 have exactly that
+  // shape. They are unforgeable without sessionSecret and ADMIN_SESSION_TTL_MS
+  // (12h default) expired them long ago, so this is defense in depth rather
+  // than a live hole -- but the guard belongs here, at the single place
+  // `cookieValid` is decided, not replicated at each of the six call sites
+  // that trust it.
+  const cookieValid = !!(
+    session &&
+    session.adm === 1 &&
+    session.th === tokenHash &&
+    typeof session.sid === 'string' &&
+    session.sid !== ''
+  )
 
   const url = new URL(req.url, 'http://internal')
   const pathname = url.pathname

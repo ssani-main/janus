@@ -25,7 +25,7 @@ One small always-on VPS with a single wildcard domain becomes the front door for
 
 ### Status
 
-✅ **Production**, running at [janus.ssani.dev](https://janus.ssani.dev). **239 unit tests + 7 live-DHT e2e tests pass.**
+✅ **Production**, running at [janus.ssani.dev](https://janus.ssani.dev). **261 unit tests + 7 live-DHT e2e tests pass.**
 
 <details>
 <summary>What's shipped</summary>

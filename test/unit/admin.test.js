@@ -585,3 +585,67 @@ test('S7 delete: POST /_admin/delete with valid cookie+csrf but a malformed keyH
   assert.deepEqual(manager.recorded, [], 'manager.destroyTunnel must not be called for an invalid keyHash')
   assert.deepEqual(store.recorded, [], 'store.deleteKey must not be called for an invalid keyHash')
 })
+
+// --- F4: a session payload with no `sid` is not a valid cookie session ------
+//
+// Every cookie-authenticated mutation binds its CSRF token to `session.sid`
+// (S9). csrfToken()/verifyCsrf() stringify whatever they are handed, so a
+// session WITHOUT a sid would have its CSRF token computed over the literal
+// string 'undefined' -- one shared, permanently-valid token across every such
+// session. Sessions minted before S9 have exactly that shape. `cookieValid`
+// now requires a non-empty string sid, which closes the class at the single
+// place it is decided rather than at each of the six sites that trust it.
+
+function preS9CookieValue() {
+  // Deliberately omits `sid` -- the pre-S9 payload shape.
+  return signSession(SESSION_SECRET, { adm: 1, th: TOKEN_HASH, iat: Date.now() })
+}
+
+test('F4: a pre-S9 session cookie (no sid) is not cookieValid -> GET /_admin renders the login page, not the dashboard', async () => {
+  const req = mockReq({
+    method: 'GET',
+    url: '/_admin',
+    headers: { cookie: `janus_admin=${preS9CookieValue()}` },
+  })
+  const res = mockRes()
+  await run(req, res, { manager: fakeManager(), config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 200)
+  assert.match(res.body, /name="token"/, 'must render the login form')
+  assert.doesNotMatch(res.body, /<table>/, 'must NOT render the dashboard table')
+})
+
+test('F4: a pre-S9 session cookie cannot drive a mutation even with a CSRF token computed over the missing sid', async () => {
+  // The exact attack shape: derive the CSRF token the way the old code would
+  // have, from an undefined sid.
+  const forgedCsrf = csrfToken(SESSION_SECRET, undefined)
+  const keyHash = 'b'.repeat(64)
+  const manager = fakeManager()
+  const store = fakeStore()
+  const req = mockReq({
+    method: 'POST',
+    url: '/_admin/block',
+    headers: {
+      cookie: `janus_admin=${preS9CookieValue()}`,
+      origin: 'http://admin.example',
+      host: 'admin.example',
+    },
+    body: `keyHash=${keyHash}&action=block&csrf=${forgedCsrf}`,
+  })
+  const res = mockRes()
+  await run(req, res, { manager, config: baseConfig(), store, sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 403)
+  assert.deepEqual(manager.recorded, [], 'no block may be performed for a sid-less session')
+})
+
+test('F4: an empty-string sid is rejected too (not merely a missing one)', async () => {
+  const req = mockReq({
+    method: 'GET',
+    url: '/_admin',
+    headers: { cookie: `janus_admin=${adminCookieValue('')}` },
+  })
+  const res = mockRes()
+  await run(req, res, { manager: fakeManager(), config: baseConfig(), store: fakeStore(), sessionSecret: SESSION_SECRET })
+  assert.equal(res.statusCode, 200)
+  assert.match(res.body, /name="token"/, 'must render the login form')
+  assert.doesNotMatch(res.body, /<table>/, 'must NOT render the dashboard table')
+})
