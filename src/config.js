@@ -210,6 +210,17 @@ const config = {
   // base lockout.
   ADMIN_LOGIN_MAX_FAILS: readInt('ADMIN_LOGIN_MAX_FAILS', 5),
   ADMIN_LOGIN_LOCKOUT_MS: readInt('ADMIN_LOGIN_LOCKOUT_MS', 60000),
+  // F2: the same lockout, for the per-key password gate (src/server.js's
+  // passwordGate). The admin gate has had one since S8; the visitor-facing
+  // gate had nothing but the general RATE_MAX_REQUESTS limiter, which allows
+  // ~120 guesses/min/IP against a tenant password indefinitely and scales
+  // with the attacker's IP count. Tracked per (ip, keyHash) rather than per
+  // IP alone -- deliberately narrower than the admin gate: a brute-forcer
+  // must burn a separate lockout per key, and one attacker behind a shared
+  // NAT can't lock legitimate visitors out of every OTHER passworded key on
+  // the gateway. Same defaults as the admin knobs.
+  KEY_LOGIN_MAX_FAILS: readInt('KEY_LOGIN_MAX_FAILS', 5),
+  KEY_LOGIN_LOCKOUT_MS: readInt('KEY_LOGIN_LOCKOUT_MS', 60000),
   // Milestone 2a: whether to emit a JSON line per request to stdout. Off by
   // default -- per-request logging is high volume and an operator should opt
   // in explicitly, same rationale as ADMIN_TOKEN being unset by default.
@@ -473,6 +484,18 @@ if (!Number.isFinite(config.ADMIN_LOGIN_MAX_FAILS) || config.ADMIN_LOGIN_MAX_FAI
 if (!Number.isFinite(config.ADMIN_LOGIN_LOCKOUT_MS) || config.ADMIN_LOGIN_LOCKOUT_MS < 0) {
   throw new Error(
     `Invalid config: ADMIN_LOGIN_LOCKOUT_MS (${config.ADMIN_LOGIN_LOCKOUT_MS}) must be a finite integer >= 0`
+  )
+}
+
+// F2: same checks for the per-key password gate's lockout, same rationale.
+if (!Number.isFinite(config.KEY_LOGIN_MAX_FAILS) || config.KEY_LOGIN_MAX_FAILS < 1) {
+  throw new Error(
+    `Invalid config: KEY_LOGIN_MAX_FAILS (${config.KEY_LOGIN_MAX_FAILS}) must be a finite integer >= 1`
+  )
+}
+if (!Number.isFinite(config.KEY_LOGIN_LOCKOUT_MS) || config.KEY_LOGIN_LOCKOUT_MS < 0) {
+  throw new Error(
+    `Invalid config: KEY_LOGIN_LOCKOUT_MS (${config.KEY_LOGIN_LOCKOUT_MS}) must be a finite integer >= 0`
   )
 }
 

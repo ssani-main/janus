@@ -56,6 +56,89 @@ const LOGIN_BODY_MAX_BYTES = 4096
 // handler, however the upgrade attempt ends.
 const wsByIp = new Map()
 
+// F2: per-(IP, keyHash) failed-attempt tracking for the per-key password
+// gate, mirroring admin.js's `loginFails`. Module-level so it accumulates
+// across requests -- that is the whole point of a lockout.
+//
+// Before this, the ONLY throttle on guessing a tenant's password was the
+// general RATE_MAX_REQUESTS limiter (120/min/IP), i.e. ~120 guesses per
+// minute per IP, forever, scaling with the attacker's IP count. The admin
+// gate has had a lockout since S8; this closes the same gap on the
+// visitor-facing gate.
+//
+// Keyed by `${ip}|${keyHash}` rather than by IP alone, deliberately narrower
+// than the admin gate: a brute-forcer must burn a separate lockout per key,
+// and one attacker behind a shared NAT cannot lock legitimate visitors out of
+// every other passworded key on the gateway. Entries are pruned
+// opportunistically (see pwLockoutCheck) so a distributed attack can't grow
+// the Map without bound.
+const pwFails = new Map()
+
+/**
+ * @param {string} ip
+ * @param {string} keyHash
+ * @returns {string}
+ */
+function pwFailKey(ip, keyHash) {
+  return `${ip}|${keyHash}`
+}
+
+/**
+ * Prune stale records, then report whether this (ip, keyHash) is currently
+ * locked out. Pruning mirrors admin.js: an entry is only dropped once its
+ * lockout has expired AND it hasn't been touched in 10x the base lockout,
+ * comfortably longer than any legitimate retry gap.
+ *
+ * @param {string} ip
+ * @param {string} keyHash
+ * @returns {{ locked: boolean, retryAfterMs: number }}
+ */
+function pwLockoutCheck(ip, keyHash) {
+  const now = Date.now()
+  for (const [k, rec] of pwFails) {
+    if (rec.lockedUntil < now && now - rec.lastAt > 10 * config.KEY_LOGIN_LOCKOUT_MS) {
+      pwFails.delete(k)
+    }
+  }
+  const rec = pwFails.get(pwFailKey(ip, keyHash))
+  if (rec && rec.lockedUntil > now) {
+    return { locked: true, retryAfterMs: rec.lockedUntil - now }
+  }
+  return { locked: false, retryAfterMs: 0 }
+}
+
+/**
+ * Record one failed password attempt, arming an exponentially-growing lockout
+ * once KEY_LOGIN_MAX_FAILS is reached (capped at 2^6 multiples, same as the
+ * admin gate, so a persistent attacker doesn't earn an effectively infinite
+ * window either).
+ *
+ * @param {string} ip
+ * @param {string} keyHash
+ */
+function pwNoteFailure(ip, keyHash) {
+  const now = Date.now()
+  const k = pwFailKey(ip, keyHash)
+  const rec = pwFails.get(k) || { fails: 0, lockedUntil: 0, lastAt: 0 }
+  rec.fails += 1
+  rec.lastAt = now
+  if (rec.fails >= config.KEY_LOGIN_MAX_FAILS) {
+    const backoffExp = Math.min(rec.fails - config.KEY_LOGIN_MAX_FAILS, 6)
+    rec.lockedUntil = now + config.KEY_LOGIN_LOCKOUT_MS * 2 ** backoffExp
+  }
+  pwFails.set(k, rec)
+}
+
+/**
+ * A correct password clears the record, so a visitor who mistyped a few times
+ * doesn't stay partway toward a lockout indefinitely.
+ * @param {string} ip
+ * @param {string} keyHash
+ */
+function pwNoteSuccess(ip, keyHash) {
+  pwFails.delete(pwFailKey(ip, keyHash))
+}
+
 const manager = new TunnelManager(config, store)
 manager.startSweeper()
 manager.startHealthProbing()
@@ -369,7 +452,7 @@ function safeNextPath(next) {
  *   normal KeyError downstream.
  * @returns {Promise<'proceed' | 'handled'>}
  */
-async function passwordGate(req, res, rawKey, keyHash) {
+async function passwordGate(req, res, rawKey, keyHash, ip) {
   if (!keyHash) return 'proceed'
 
   const pw = store.getPassword(keyHash)
@@ -378,6 +461,22 @@ async function passwordGate(req, res, rawKey, keyHash) {
   const url = new URL(req.url, 'http://internal')
 
   if (req.method === 'POST' && url.pathname === LOGIN_PATH) {
+    // F2: refuse a locked-out (ip, keyHash) BEFORE reading the body or
+    // running scrypt. Checking first is what makes the lockout protect CPU as
+    // well as the password: scrypt is deliberately expensive, so a gate that
+    // hashed first would let a locked-out attacker keep burning a libuv
+    // threadpool worker on every attempt. A locked-out client also gets no
+    // signal about whether its guess was right, same as the admin gate.
+    const lock = pwLockoutCheck(ip, keyHash)
+    if (lock.locked) {
+      res.writeHead(429, {
+        'Content-Type': 'text/html; charset=utf-8',
+        'Retry-After': String(Math.ceil(lock.retryAfterMs / 1000)),
+      })
+      res.end(loginPage({ error: 'Too many attempts, try again later.', next: '/', config }))
+      return 'handled'
+    }
+
     const contentType = String(req.headers['content-type'] || '')
     if (!contentType.startsWith('application/x-www-form-urlencoded')) {
       res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
@@ -397,6 +496,7 @@ async function passwordGate(req, res, rawKey, keyHash) {
     const next = safeNextPath(form.get('next'))
 
     if (await verifyPassword(password, pw.salt, pw.hash)) {
+      pwNoteSuccess(ip, keyHash)
       const cookieVal = signSession(sessionSecret, { kh: keyHash, pv: pw.pwdVersion, iat: Date.now() })
       const secureAttr = config.COOKIE_SECURE ? '; Secure' : ''
       res.writeHead(302, {
@@ -407,6 +507,13 @@ async function passwordGate(req, res, rawKey, keyHash) {
       return 'handled'
     }
 
+    // F2: only a genuinely wrong password counts toward the lockout. The two
+    // malformed-request branches above (wrong Content-Type, oversized/aborted
+    // body) return the same generic page but deliberately do NOT call this --
+    // they never reached verifyPassword, so counting them would let a
+    // bystander's broken client lock a visitor out without a single guess
+    // being made.
+    pwNoteFailure(ip, keyHash)
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
     res.end(loginPage({ error: 'Incorrect password.', next, config }))
     return 'handled'
@@ -579,7 +686,7 @@ const server = http.createServer(async (req, res) => {
   }
   logCtx.keyHash = keyHash
 
-  const gate = await passwordGate(req, res, rawKey, keyHash)
+  const gate = await passwordGate(req, res, rawKey, keyHash, ip)
   if (gate === 'handled') return
 
   const cold = !manager.isCached(rawKey)

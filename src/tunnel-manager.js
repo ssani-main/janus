@@ -176,26 +176,84 @@ class Semaphore {
   }
 
   /**
-   * @returns {?Promise<void>} null if the queue is full (caller should
-   *   fast-fail rather than wait); otherwise a promise resolving once a slot
-   *   is held. Every resolved acquire() MUST be paired with exactly one
-   *   release().
+   * @param {number} [deadlineAt] epoch ms. A waiter still queued at this
+   *   moment gives up and resolves `false` instead of waiting indefinitely.
+   *   Omitted/non-finite waits forever, which is the pre-deadline behaviour
+   *   several hand-rolled test configs rely on.
+   * @returns {?Promise<boolean>} null if the queue is full (caller should
+   *   fast-fail rather than wait); otherwise a promise resolving `true` once a
+   *   slot is held, or `false` if the deadline passed while queued. ONLY a
+   *   `true` resolution may be paired with a release() -- releasing after a
+   *   `false` would hand out a slot this caller never held, permanently
+   *   inflating the gate.
    */
-  acquire() {
+  acquire(deadlineAt) {
     if (this.active < this.max) {
       this.active++
-      return Promise.resolve()
+      return Promise.resolve(true)
     }
     if (this.waiters.length >= this.maxQueue) return null
-    return new Promise((resolve) => this.waiters.push(resolve))
+
+    return new Promise((resolve) => {
+      // The waiter is an object, not a bare resolve function, so that a
+      // timeout can mark it settled and release() can skip it. A bare
+      // function gives release() no way to tell a live waiter from one that
+      // already gave up -- and handing the slot to a dead waiter loses it
+      // forever, shrinking the effective gate by one on every timeout.
+      const waiter = { settled: false, settle: null }
+      let timer = null
+      waiter.settle = (granted) => {
+        if (waiter.settled) return
+        waiter.settled = true
+        if (timer !== null) clearTimeout(timer)
+        resolve(granted)
+      }
+      this.waiters.push(waiter)
+
+      if (!Number.isFinite(deadlineAt)) return
+
+      const waitMs = deadlineAt - Date.now()
+      if (waitMs <= 0) {
+        // Already past the deadline before we even queued.
+        this._drop(waiter)
+        waiter.settle(false)
+        return
+      }
+      timer = setTimeout(() => {
+        this._drop(waiter)
+        waiter.settle(false)
+      }, waitMs)
+      // A queued waiter must never be the reason the process stays alive.
+      if (timer.unref) timer.unref()
+    })
+  }
+
+  /**
+   * Remove a waiter that gave up, so `queued` stays honest and release()
+   * never has to walk over it.
+   * @param {{ settled: boolean }} waiter
+   */
+  _drop(waiter) {
+    const i = this.waiters.indexOf(waiter)
+    if (i !== -1) this.waiters.splice(i, 1)
   }
 
   release() {
-    const next = this.waiters.shift()
-    // Hand the slot straight over: `active` deliberately stays put, since the
-    // waiter we just woke is taking the slot we were holding.
-    if (next) next()
-    else this.active--
+    // Hand the slot to the first waiter that hasn't already given up.
+    // `_drop` normally splices a timed-out waiter out on the spot, so the
+    // `settled` skip below is belt-and-braces against a timer and a release
+    // landing in the same tick -- if that ever happened and we handed the slot
+    // to a settled waiter, its settle() would be a no-op and the slot would
+    // vanish with `active` still counting it.
+    while (this.waiters.length > 0) {
+      const next = this.waiters.shift()
+      if (next.settled) continue
+      // `active` deliberately stays put: the waiter we just woke is taking
+      // the slot we were holding.
+      next.settle(true)
+      return
+    }
+    this.active--
   }
 }
 
@@ -583,6 +641,13 @@ class TunnelManager {
       // MAX_TUNNELS with nothing evictable -- this one means we were still
       // busy connecting, not that every slot was occupied).
       createQueueRejected: 0,
+      // Cold creates that gave up while WAITING for a slot (the deadline
+      // passed in the queue), as opposed to createQueueRejected's "the queue
+      // was already full so we never joined it". Sustained growth here means
+      // MAX_CONCURRENT_CREATES is too low for the offered load -- creates are
+      // completing, just not fast enough to drain the queue within
+      // ENSURE_TUNNEL_TIMEOUT_MS.
+      createQueueTimeouts: 0,
       // Cumulative count of ports held out of the pool after a connect
       // timeout -- see quarantinedPorts. A steady climb here means DHT
       // connects are timing out, which is the same signal DEPLOY.md's
@@ -726,7 +791,7 @@ class TunnelManager {
    * @param {number} deadlineAt epoch ms
    */
   async _createGated(parsed, deadlineAt) {
-    const gate = this._createSemaphore.acquire()
+    const gate = this._createSemaphore.acquire(deadlineAt)
     if (gate === null) {
       // Queue is full -- fast-fail rather than admit an unbounded backlog of
       // visitors who would each sit out the whole deadline before finding
@@ -736,7 +801,26 @@ class TunnelManager {
         'gateway is saturated with new-tunnel requests (create queue full); try again shortly'
       )
     }
-    await gate
+    const granted = await gate
+    if (!granted) {
+      // The deadline passed while this caller sat in the create queue.
+      //
+      // Before the semaphore honoured the deadline, acquire() only ever
+      // resolved on a free slot, so a queued visitor held its socket for the
+      // WHOLE wait and only then discovered it had failed -- `_createTunnel`
+      // fast-fails on entry, but nothing shortened the wait itself. With the
+      // shipped defaults (MAX_CONCURRENT_CREATES=8, MAX_CREATE_QUEUE=64,
+      // ENSURE_TUNNEL_TIMEOUT_MS=45000) the back of a full queue could wait
+      // ~45s x (64/8) ~= 6 minutes for a guaranteed failure.
+      //
+      // CapacityError (503 + Retry-After), not ConnectError (502), for the
+      // same reason as the queue-full branch above: we never reached the
+      // backend, so this is our saturation, not its failure.
+      this.counters.createQueueTimeouts++
+      throw new CapacityError(
+        'gateway is saturated with new-tunnel requests (waited for a create slot until the deadline); try again shortly'
+      )
+    }
     try {
       return await this._createTunnel(parsed, deadlineAt)
     } finally {

@@ -25,7 +25,7 @@ One small always-on VPS with a single wildcard domain becomes the front door for
 
 ### Status
 
-✅ **Production**, running at [janus.ssani.dev](https://janus.ssani.dev). **261 unit tests + 7 live-DHT e2e tests pass.**
+✅ **Production**, running at [janus.ssani.dev](https://janus.ssani.dev). **271 unit tests + 7 live-DHT e2e tests pass.**
 
 <details>
 <summary>What's shipped</summary>
@@ -145,6 +145,8 @@ All via environment variables (see [`.env.example`](./.env.example)).
 | `ADMIN_SESSION_TTL_MS` | `43200000` | how long an admin dashboard login session stays valid, in milliseconds (default 12 hours). Rotating `ADMIN_TOKEN` immediately invalidates all outstanding admin sessions. |
 | `ADMIN_LOGIN_MAX_FAILS` | `5` | consecutive failed `/_admin/login` attempts (per IP) before lockout begins (S8). |
 | `ADMIN_LOGIN_LOCKOUT_MS` | `60000` | base lockout duration once the failure threshold is hit, in milliseconds; each further failure doubles it (capped at 2⁶×) (S8). |
+| `KEY_LOGIN_MAX_FAILS` | `5` | consecutive failed attempts at a **per-key password** before lockout begins. Tracked per (client IP, keyHash), not per IP alone, so a brute-forcer burns a separate lockout per key and one attacker behind a shared NAT can't lock visitors out of every other passworded key. Previously the only throttle here was `RATE_MAX_REQUESTS` (~120 guesses/min/IP, indefinitely). |
+| `KEY_LOGIN_LOCKOUT_MS` | `60000` | base lockout duration for the per-key password gate, in milliseconds; doubles per further failure (capped at 2⁶×), same shape as the admin lockout. Checked *before* scrypt runs, so a locked-out client can't burn CPU either. |
 | `LOG_REQUESTS` | `false` | whether to emit a JSON line per request to stdout (Milestone 2a). High volume; opt in explicitly. Set to `true` or `"1"` to enable. |
 | `CIRCUIT_FAILURE_THRESHOLD` | `2` | consecutive **failed requests** before a keyHash's circuit opens (Milestone 2c). Once open, further cold creates fast-fail with 503 instead of attempting a DHT round trip. Counted per failed cold create, not per connect attempt — one request that exhausts its whole `RECONNECT_MAX_ATTEMPTS` chain still counts once, so the two knobs stay independent. |
 | `CIRCUIT_COOLDOWN_MS` | `30000` | how long a circuit stays open once it trips, in milliseconds (Milestone 2c). |

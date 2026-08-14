@@ -84,6 +84,11 @@ function renderMetrics({ manager, limiter, startedAt }) {
   // noteWsRejected and src/server.js's upgrade handler.
   body += counter('janus_ws_rejected_total', 'Total number of websocket upgrades rejected by the WS_MAX_SLOTS/WS_MAX_PER_IP caps.', num(m.wsRejected))
   body += counter('janus_create_queue_rejected_total', 'Total number of cold creates rejected because the create queue was full (MAX_CREATE_QUEUE).', num(m.createQueueRejected))
+  // Distinct from the counter above: rejected = never joined the queue (it was
+  // full); timeouts = joined it, then the ENSURE_TUNNEL_TIMEOUT_MS deadline
+  // passed before a slot freed. Sustained growth means MAX_CONCURRENT_CREATES
+  // is too low for the offered load rather than the queue being too short.
+  body += counter('janus_create_queue_timeouts_total', 'Total number of cold creates that gave up waiting for a concurrency slot before the ensureTunnel deadline.', num(m.createQueueTimeouts))
   body += counter('janus_ports_quarantined_total', 'Total number of tunnel ports quarantined after a connect timeout.', num(m.portsQuarantined))
   // A nonzero janus_late_binds_absorbed_total is the load-bearing signal that
   // the port quarantine is doing its job: each one is a late EADDRINUSE that

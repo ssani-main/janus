@@ -25,6 +25,8 @@ const { test } = require('node:test')
 const assert = require('node:assert/strict')
 const net = require('node:net')
 const { TunnelManager, CapacityError } = require('../../src/tunnel-manager')
+// F1's tests drive _createGated directly, which takes a PARSED key.
+const { parseKey } = require('../../src/key')
 
 // Must match the range registered for this file in fixtures/port-ranges.js.
 const TUNNEL_PORT_MIN = 21000
@@ -330,4 +332,149 @@ test('MAX_CONCURRENT_CREATES absent from config -> unbounded (pre-cap behavior p
 
   state.openGate()
   await Promise.allSettled(pending)
+})
+
+// --- F1: the create-queue wait must honour the ensureTunnel deadline -------
+//
+// Before this, Semaphore.acquire() resolved ONLY when a slot freed. A caller
+// queued behind a saturated gate therefore held its socket for the entire
+// wait and only then discovered it had failed -- `_createTunnel` fast-fails on
+// entry, but nothing shortened the wait itself. With the shipped defaults
+// (MAX_CONCURRENT_CREATES=8, MAX_CREATE_QUEUE=64, ENSURE_TUNNEL_TIMEOUT_MS=
+// 45000) the back of a full queue could wait ~45s x (64/8) ~= 6 minutes for a
+// guaranteed failure.
+//
+// These drive `_createGated` directly rather than going through
+// `ensureTunnel`, so each caller's deadline can be set independently -- via
+// ensureTunnel every caller derives the SAME deadline from config, which makes
+// "the holder is still working while the waiter's deadline expires" impossible
+// to express without racing the two expiries against each other.
+
+test('F1: a caller queued behind a full gate gives up at its deadline instead of waiting for a slot', async (t) => {
+  const { factory, state } = makeGatedFactory()
+  const manager = new TunnelManager(
+    baseConfig({ MAX_CONCURRENT_CREATES: 1, MAX_CREATE_QUEUE: 10 }),
+    undefined,
+    factory
+  )
+  t.after(async () => {
+    state.openGate()
+    await manager.shutdown().catch(() => {})
+    await state.closeAll()
+  })
+
+  // Occupy the single slot with a create that will not finish on its own.
+  const holder = manager._createGated(parseKey(keyFor(0)), Date.now() + 60000)
+  holder.catch(() => {})
+  await settle()
+  assert.equal(manager.stats().createsActive, 1, 'the holder must be occupying the only slot')
+
+  // Queue a second caller whose own deadline is very close.
+  const startedAt = Date.now()
+  const queued = manager._createGated(parseKey(keyFor(1)), Date.now() + 200)
+  await settle(80)
+  assert.equal(manager.stats().createsQueued, 1, 'the second caller must actually be queued, not running')
+
+  await assert.rejects(
+    queued,
+    (err) => err instanceof CapacityError,
+    'a caller that times out in the queue must surface CapacityError (503), not a ConnectError (502) -- we never reached the backend'
+  )
+
+  const waitedMs = Date.now() - startedAt
+  assert.ok(
+    waitedMs < 2000,
+    `the queued caller must give up at its own deadline (~200ms), not wait for the slot; waited ${waitedMs}ms`
+  )
+  assert.equal(manager.stats().createQueueTimeouts, 1, 'the timeout must be counted')
+  assert.equal(
+    manager.stats().createQueueRejected,
+    0,
+    'a queue TIMEOUT is a distinct condition from a queue-full REJECTION and must not be conflated'
+  )
+  assert.equal(manager.stats().createsQueued, 0, 'a timed-out waiter must be removed from the queue, not left in it')
+})
+
+test('F1: a timed-out waiter must not consume the slot when it is finally released', async (t) => {
+  // The failure this guards: release() hands the slot straight to the next
+  // waiter without decrementing `active`. If it handed it to a waiter that had
+  // already given up, that waiter's settle() would be a no-op and the slot
+  // would vanish while `active` still counted it -- shrinking the effective
+  // gate by one on every timeout until no create could ever run again.
+  const { factory, state } = makeGatedFactory()
+  const manager = new TunnelManager(
+    baseConfig({ MAX_CONCURRENT_CREATES: 1, MAX_CREATE_QUEUE: 10 }),
+    undefined,
+    factory
+  )
+  t.after(async () => {
+    state.openGate()
+    await manager.shutdown().catch(() => {})
+    await state.closeAll()
+  })
+
+  const holder = manager._createGated(parseKey(keyFor(2)), Date.now() + 60000)
+  holder.catch(() => {})
+  await settle()
+
+  const doomed = manager._createGated(parseKey(keyFor(3)), Date.now() + 150)
+  await assert.rejects(doomed, (err) => err instanceof CapacityError)
+
+  // Let the holder finish and release its slot.
+  state.openGate()
+  await holder.catch(() => {})
+  await settle()
+
+  assert.equal(manager.stats().createsActive, 0, 'the gate must be fully free again -- no slot may have been lost to the timed-out waiter')
+
+  // Prove it by actually using the gate again.
+  const after = await manager._createGated(parseKey(keyFor(4)), Date.now() + 60000)
+  assert.ok(after && after.port, 'a fresh create must still be admitted after a queue timeout')
+})
+
+test('F1: a config predating ENSURE_TUNNEL_TIMEOUT_MS still queues normally, with no spurious timeout', async (t) => {
+  // The backward-compat risk this closes. Several hand-rolled test configs
+  // predate ENSURE_TUNNEL_TIMEOUT_MS entirely; ensureTunnel falls back to
+  // DEFAULT_ENSURE_TUNNEL_TIMEOUT_MS (45s) for them. A queued create under
+  // such a config must keep WAITING for its slot, exactly as before -- the
+  // deadline-aware acquire() must not read a missing knob as "already
+  // expired" and start rejecting every queued create on sight.
+  //
+  // Note this goes through ensureTunnel, not _createGated: the fallback lives
+  // there, and passing a non-finite deadline into _createGated directly is not
+  // a reachable production state (it would also make the per-attempt connect
+  // timeout NaN, which fires immediately).
+  const cfg = baseConfig({ MAX_CONCURRENT_CREATES: 1, MAX_CREATE_QUEUE: 10 })
+  delete cfg.ENSURE_TUNNEL_TIMEOUT_MS
+
+  const { factory, state } = makeGatedFactory()
+  const manager = new TunnelManager(cfg, undefined, factory)
+  t.after(async () => {
+    state.openGate()
+    await manager.shutdown().catch(() => {})
+    await state.closeAll()
+  })
+
+  const holder = manager.ensureTunnel(keyFor(5))
+  holder.catch(() => {})
+  await settle()
+  assert.equal(manager.stats().createsActive, 1)
+
+  let settledEarly = false
+  const queued = manager.ensureTunnel(keyFor(6))
+  queued.then(() => { settledEarly = true }, () => { settledEarly = true })
+
+  await settle(250)
+  assert.equal(settledEarly, false, 'a queued create must keep waiting under the fallback deadline, not give up')
+  assert.equal(manager.stats().createsQueued, 1)
+  assert.equal(manager.stats().createQueueTimeouts, 0, 'nothing may be counted as a queue timeout here')
+
+  // Both must then complete normally once the gate opens.
+  state.openGate()
+  const results = await Promise.allSettled([holder, queued])
+  assert.deepEqual(
+    results.map((r) => r.status),
+    ['fulfilled', 'fulfilled'],
+    'both creates must succeed once a slot frees'
+  )
 })

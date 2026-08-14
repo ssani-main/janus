@@ -99,7 +99,7 @@ dependencies (Node built-ins only).
 ## Scale review (2026-07-26) — DONE ✅
 
 Driven by the question "what happens if a lot of people use this, and is it
-safe for the VPS?". 261/261 unit tests pass. Zero new npm dependencies.
+safe for the VPS?". 271/271 unit tests pass. Zero new npm dependencies.
 
 | Finding | Fix | Key files |
 |---|---|---|
