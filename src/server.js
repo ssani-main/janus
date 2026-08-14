@@ -9,8 +9,9 @@ const { parseKey } = require('./key')
 const { load: loadStore } = require('./store')
 const { TunnelManager, CapacityError, ConnectError, KeyError, BlockedError, CircuitOpenError } = require('./tunnel-manager')
 const { RateLimiter } = require('./rate-limit')
-const { apexPage, guidePage, llmsTxt, impressumPage, termsPage, errorPage, offlinePage, rateLimitPage, loginPage } = require('./pages')
+const { apexPage, guidePage, llmsTxt, impressumPage, termsPage, errorPage, offlinePage, rateLimitPage, loginPage, directoryPage } = require('./pages')
 const { handleAdmin } = require('./admin')
+const { Directory } = require('./directory')
 const { verifyPassword, signSession, verifySession, parseCookies, timingSafeEqualStr } = require('./auth')
 const { renderMetrics } = require('./metrics')
 const { createLogger } = require('./logger')
@@ -143,6 +144,11 @@ const manager = new TunnelManager(config, store)
 manager.startSweeper()
 manager.startHealthProbing()
 
+// Phase 1: opt-in project directory. Disabled by default (config.js), and
+// every Directory method swallows its own errors -- see directory.js's
+// module doc comment -- so wiring it in is safe even before it's enabled.
+const directory = new Directory({ config, store })
+
 const limiter = new RateLimiter({
   windowMs: config.RATE_WINDOW_MS,
   maxRequests: config.RATE_MAX_REQUESTS,
@@ -214,6 +220,12 @@ proxy.on('error', (err, req, res) => {
   console.error('proxy error:', err.message)
   if (req && req._janusTunnel) {
     manager.recordFailure(req._janusTunnel.keyHash)
+    // Phase 1: a proxy error against a known tenant tunnel means the
+    // backend is unreachable right now -- reflect that in the directory
+    // immediately rather than waiting for the next manifest recheck.
+    // Fire-and-forget: markOffline never throws (see directory.js), but the
+    // .catch is kept for defense in depth, matching every other call site.
+    directory.markOffline(req._janusTunnel.keyHash).catch(() => {})
   }
   if (res && !res.headersSent && typeof res.writeHead === 'function') {
     // Milestone 2d (revised): a proxy error against a known tenant tunnel
@@ -611,7 +623,7 @@ const server = http.createServer(async (req, res) => {
       // S8: admin.js's per-IP login lockout needs the client IP; `ip` is
       // already computed above (clientIp(req)) for the request logger/rate
       // limiter, so reuse it here instead of recomputing.
-      await handleAdmin(req, res, { manager, config, store, sessionSecret, ip })
+      await handleAdmin(req, res, { manager, config, store, sessionSecret, ip, directory })
       return
     }
     if (url.pathname === '/guide') {
@@ -663,6 +675,31 @@ const server = http.createServer(async (req, res) => {
       res.end(renderMetrics({ manager, limiter, startedAt, pwLockouts: { entries: pwFails.size } }))
       return
     }
+    if (url.pathname === '/directory') {
+      // Phase 1: invisible (404), not merely empty, when the operator hasn't
+      // opted in -- same "must not exist" pattern as /metrics with no
+      // ADMIN_TOKEN above.
+      if (!config.DIRECTORY_ENABLED) {
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(errorPage(404, 'Not Found', 'Unknown path.', config))
+        return
+      }
+      const q = url.searchParams.get('q') || ''
+      res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
+      res.end(directoryPage({ entries: directory.list({ q }), q, config }))
+      return
+    }
+    if (url.pathname === '/directory.json') {
+      if (!config.DIRECTORY_ENABLED) {
+        res.writeHead(404, { 'Content-Type': 'text/html; charset=utf-8' })
+        res.end(errorPage(404, 'Not Found', 'Unknown path.', config))
+        return
+      }
+      const q = url.searchParams.get('q') || ''
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8' })
+      res.end(JSON.stringify({ entries: directory.list({ q }) }))
+      return
+    }
     res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' })
     res.end(apexPage(config))
     return
@@ -710,6 +747,11 @@ const server = http.createServer(async (req, res) => {
     // Operator-only: full detail, including err.message (may contain an
     // internal port, MAX_TUNNELS, etc.) -- see FIX 1's doc comment above.
     console.error(`${err.name || 'Error'} handling ${req.method} ${req.url}: ${err.message}`)
+    // Phase 1: a connect/circuit failure for a tenant request means the
+    // backend is unreachable -- same rationale as the proxy error handler
+    // above. keyHash may be null (unparseable key -> KeyError), in which
+    // case markOffline is a no-op.
+    directory.markOffline(keyHash).catch(() => {})
     const headers = { 'Content-Type': 'text/html; charset=utf-8' }
     if (err instanceof CircuitOpenError) {
       headers['Retry-After'] = String(Math.max(1, Math.ceil((err.circuitOpenUntil - Date.now()) / 1000)))
@@ -719,6 +761,14 @@ const server = http.createServer(async (req, res) => {
     res.end(errorPage(code, titleForStatus(code), visitorMessageForError(err), config))
     return
   }
+
+  // Phase 1: fire-and-forget, off the request path -- maybeFetchManifest
+  // makes an HTTP request to the tenant's backend and markOnline touches the
+  // store; neither may block or fail the proxied response. Both swallow
+  // their own errors internally (see directory.js), but the .catch here is
+  // kept anyway as defense in depth against a future change there.
+  directory.maybeFetchManifest(tunnel).catch(() => {})
+  directory.markOnline(keyHash).catch(() => {})
 
   // Milestone 2c: stash the tunnel record on the request so proxy.on(
   // 'error'/'proxyRes') -- which http-proxy only invokes with (err, req,

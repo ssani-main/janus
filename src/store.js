@@ -48,13 +48,24 @@ function _sweepOrphanTmps(filePath) {
 }
 
 /**
- * @returns {{ version: number, keys: object, aliases: object }}
+ * @returns {{ version: number, keys: object, aliases: object, directory: object }}
  */
 function emptyShape() {
   // Null-prototype maps: even if a caller ever skips keyHash/alias
   // validation, a stray '__proto__'/'constructor' key can't touch
   // Object.prototype through these maps.
-  return { version: VERSION, keys: Object.create(null), aliases: Object.create(null) }
+  return {
+    version: VERSION,
+    keys: Object.create(null),
+    aliases: Object.create(null),
+    // Phase 1: opt-in project directory, keyed by keyHash. Separate
+    // top-level collection rather than a field on `keys[keyHash]` -- a
+    // directory listing is fetched consent (a manifest the tenant's own
+    // backend serves), not operator-set metadata like alias/password/block,
+    // and keeping it separate means deleteKey's existing blocked-preservation
+    // logic doesn't need to reason about it at all (see deleteKey below).
+    directory: Object.create(null),
+  }
 }
 
 /**
@@ -121,6 +132,9 @@ class Store {
     // even if it somehow ended up in the on-disk JSON.
     data.keys = Object.assign(Object.create(null), data.keys && typeof data.keys === 'object' ? data.keys : {})
     data.aliases = Object.assign(Object.create(null), data.aliases && typeof data.aliases === 'object' ? data.aliases : {})
+    // Phase 1: default to empty when loading a pre-directory store file --
+    // same normalize-to-null-prototype pattern as keys/aliases above.
+    data.directory = Object.assign(Object.create(null), data.directory && typeof data.directory === 'object' ? data.directory : {})
     if (!data.version) data.version = VERSION
 
     return new Store(filePath, data)
@@ -389,7 +403,23 @@ class Store {
    */
   deleteKey(keyHash) {
     const record = this.data.keys[keyHash]
-    if (!record) return
+    // Phase 1: a directory entry is fetched consent tied to the live key,
+    // not operator metadata worth preserving alongside a block -- always
+    // drop it here, even for a blocked record (which keeps everything
+    // else), and even if `keys[keyHash]` has no record at all.
+    //
+    // A directory-only entry (no `keys[]` record at all -- the normal case,
+    // since listings come purely from a passive manifest fetch) must still
+    // reach `_persist()` below, or the in-memory delete never hits disk and
+    // a fresh `load()` resurrects it. Track whether the directory map was
+    // actually mutated so a no-op delete (neither a directory entry nor a
+    // keys[] record existed) still skips the fsync.
+    const hadDirectoryEntry = Object.prototype.hasOwnProperty.call(this.data.directory, keyHash)
+    delete this.data.directory[keyHash]
+    if (!record) {
+      if (hadDirectoryEntry) this._persist()
+      return
+    }
     // Drop every alias entry that points at this key, so the aliases map
     // never keeps a dangling reference to a removed/cleared record.
     for (const [label, kh] of Object.entries(this.data.aliases)) {
@@ -447,6 +477,100 @@ class Store {
         updatedAt: r.updatedAt,
       }
     })
+  }
+
+  /**
+   * Phase 1: create or replace this key's directory listing. Called after a
+   * manifest fetch validates as `list: true` -- `fields` carries the
+   * already-validated/sanitized title/description/tags (src/directory.js's
+   * job, not this method's) plus liveness fields. `rawKey` is stored because
+   * the key IS the public URL for a listed project -- same precedent as
+   * setAlias/setPassword storing rawKey above.
+   *
+   * @param {string} keyHash
+   * @param {string} rawKey
+   * @param {{ title: string, description?: string, tags?: string[] }} fields
+   */
+  setDirectoryEntry(keyHash, rawKey, fields) {
+    const now = Date.now()
+    const existing = this.data.directory[keyHash]
+    this.data.directory[keyHash] = {
+      rawKey,
+      title: fields.title,
+      description: fields.description || '',
+      tags: Array.isArray(fields.tags) ? fields.tags : [],
+      listedAt: existing ? existing.listedAt : now,
+      lastSeenAt: existing ? existing.lastSeenAt : now,
+      lastCheckedAt: now,
+      online: existing ? existing.online : true,
+    }
+    this._persist()
+  }
+
+  /**
+   * Phase 1: remove a key's directory listing (manifest stopped saying
+   * `list: true`, stopped responding entirely, or got de-listed for any
+   * other reason). No-op if there is no entry.
+   *
+   * @param {string} keyHash
+   */
+  clearDirectoryEntry(keyHash) {
+    if (!this.data.directory[keyHash]) return
+    delete this.data.directory[keyHash]
+    this._persist()
+  }
+
+  /**
+   * @param {string} keyHash
+   * @returns {{ rawKey: string, title: string, description: string, tags: string[], listedAt: number, lastSeenAt: number, lastCheckedAt: number, online: boolean } | undefined}
+   */
+  getDirectoryEntry(keyHash) {
+    return this.data.directory[keyHash]
+  }
+
+  /**
+   * @returns {Array<{ keyHash: string, rawKey: string, title: string, description: string, tags: string[], listedAt: number, lastSeenAt: number, lastCheckedAt: number, online: boolean }>}
+   */
+  listDirectory() {
+    return Object.keys(this.data.directory).map((keyHash) => ({ keyHash, ...this.data.directory[keyHash] }))
+  }
+
+  /**
+   * Phase 1: update a directory entry's liveness on the HOT request path
+   * (called from server.js after every successfully-proxied tenant request,
+   * and from the proxy error handler on failure) -- see src/directory.js's
+   * markOnline/markOffline.
+   *
+   * The existing `_persist()` is a synchronous fsync+rename; calling it on
+   * every request would put a blocking disk write on the request path for
+   * every single tenant response. Instead this always updates the in-memory
+   * record immediately (so listDirectory()'s ordering/online-badge stay
+   * live and accurate within the process), but only calls `_persist()` when
+   * `online` actually FLIPS -- a request-volume tenant staying online then
+   * touches disk once (on its first request after startup) and never again
+   * until it actually goes offline, rather than once per request.
+   * `lastSeenAt` is bumped on every online touch regardless of persistence,
+   * so it drifts from the on-disk copy between flips -- acceptable, since it
+   * is only ever used for relative ("last seen") display and re-derives
+   * itself correctly the next time the online state flips (or at the next
+   * flip-triggered persist).
+   *
+   * No-op if the key has no directory entry -- liveness is meaningless for
+   * a key nobody opted into listing.
+   *
+   * @param {string} keyHash
+   * @param {boolean} online
+   */
+  touchDirectoryLiveness(keyHash, online) {
+    const record = this.data.directory[keyHash]
+    if (!record) return
+    const flipped = record.online !== !!online
+    record.online = !!online
+    if (online) record.lastSeenAt = Date.now()
+    if (flipped) {
+      record.lastCheckedAt = Date.now()
+      this._persist()
+    }
   }
 
   /**

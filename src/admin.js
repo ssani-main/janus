@@ -226,7 +226,7 @@ function buildRows(manager, store) {
  * @param {import('http').ServerResponse} res
  * @param {{ manager: any, config: any, store: any, sessionSecret: string, ip: string }} deps
  */
-async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip }) {
+async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip, directory }) {
   if (!config.ADMIN_TOKEN) {
     sendJson(res, 404, { error: 'not found' })
     return
@@ -592,6 +592,11 @@ async function handleAdmin(req, res, { manager, config, store, sessionSecret, ip
       // stored metadata; the port stays held until the tunnel is destroyed).
       await manager.destroyTunnel(keyHash)
       store.deleteKey(keyHash)
+      // Phase 1: the key is gone for good -- drop its directory recheck-cache
+      // entry too, so `_lastCheckedAt` doesn't keep a permanent entry for a
+      // keyHash that can never be looked up again. `directory` is optional
+      // here (not every caller/test wires one in) and forget() never throws.
+      if (directory) directory.forget(keyHash)
     }
     res.writeHead(302, { 'Location': '/_admin' })
     res.end()

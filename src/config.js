@@ -328,6 +328,33 @@ const config = {
   // reclaimed normally. Default 1 hour; 0 disables (operator opt-out for
   // legitimately silent long-lived websockets).
   WS_IDLE_TIMEOUT_MS: readInt('WS_IDLE_TIMEOUT_MS', 3600000),
+  // Phase 1: opt-in project directory. Off by default -- same rationale as
+  // ADMIN_TOKEN/LOG_REQUESTS being unset/false by default: an operator must
+  // explicitly opt in before the gateway starts fetching a manifest file
+  // from every tenant backend it proxies to.
+  DIRECTORY_ENABLED: readBool('DIRECTORY_ENABLED', false),
+  // How long src/directory.js waits for a manifest fetch (connect + full
+  // response) before giving up and destroying the socket. Default 5s -- a
+  // manifest is a tiny static JSON file served by the tenant's own backend
+  // over the already-established local tunnel port, so this should resolve
+  // almost instantly; 5s is generous headroom for a momentarily slow
+  // backend without blocking directory refresh indefinitely on a hung one.
+  DIRECTORY_MANIFEST_TIMEOUT_MS: readInt('DIRECTORY_MANIFEST_TIMEOUT_MS', 5000),
+  // Hard cap on manifest response body size, in bytes. The fetch is aborted
+  // and the body discarded once exceeded -- a manifest is a few hundred
+  // bytes of JSON, so this is generous, not a real constraint on a
+  // well-behaved backend. It exists purely so an oversized/hostile response
+  // can't be read into memory in full. Default 64KiB.
+  DIRECTORY_MANIFEST_MAX_BYTES: readInt('DIRECTORY_MANIFEST_MAX_BYTES', 65536),
+  // How long a keyHash's manifest fetch result is cached in-process before
+  // it is checked again. Manifest fetches happen on the tenant request path
+  // (fire-and-forget, see server.js), so this is what keeps a busy tunnel
+  // from re-fetching its own manifest on every single request. Default 1h.
+  DIRECTORY_RECHECK_MS: readInt('DIRECTORY_RECHECK_MS', 3600000),
+  // Cap on how many entries list() will ever return, regardless of how many
+  // keys have opted in -- bounds the /directory and /directory.json response
+  // size. Default 500.
+  DIRECTORY_MAX_ENTRIES: readInt('DIRECTORY_MAX_ENTRIES', 500),
 }
 
 if (config.TUNNEL_PORT_MIN >= config.TUNNEL_PORT_MAX) {
@@ -534,6 +561,31 @@ if (!Number.isInteger(config.WS_MAX_PER_IP) || config.WS_MAX_PER_IP < 1) {
 if (!Number.isInteger(config.WS_IDLE_TIMEOUT_MS) || config.WS_IDLE_TIMEOUT_MS < 0) {
   throw new Error(
     `Invalid config: WS_IDLE_TIMEOUT_MS (${config.WS_IDLE_TIMEOUT_MS}) must be a finite integer >= 0 (0 disables it)`
+  )
+}
+
+// Phase 1: fail fast on nonsensical directory config, same rationale as the
+// checks above. These are validated unconditionally, even when
+// DIRECTORY_ENABLED is false, so flipping the flag on later can't suddenly
+// surface a config error an operator set months ago and never noticed.
+if (!Number.isInteger(config.DIRECTORY_MANIFEST_TIMEOUT_MS) || config.DIRECTORY_MANIFEST_TIMEOUT_MS <= 0) {
+  throw new Error(
+    `Invalid config: DIRECTORY_MANIFEST_TIMEOUT_MS (${config.DIRECTORY_MANIFEST_TIMEOUT_MS}) must be a positive integer`
+  )
+}
+if (!Number.isInteger(config.DIRECTORY_MANIFEST_MAX_BYTES) || config.DIRECTORY_MANIFEST_MAX_BYTES <= 0) {
+  throw new Error(
+    `Invalid config: DIRECTORY_MANIFEST_MAX_BYTES (${config.DIRECTORY_MANIFEST_MAX_BYTES}) must be a positive integer`
+  )
+}
+if (!Number.isInteger(config.DIRECTORY_RECHECK_MS) || config.DIRECTORY_RECHECK_MS < 0) {
+  throw new Error(
+    `Invalid config: DIRECTORY_RECHECK_MS (${config.DIRECTORY_RECHECK_MS}) must be a finite integer >= 0`
+  )
+}
+if (!Number.isInteger(config.DIRECTORY_MAX_ENTRIES) || config.DIRECTORY_MAX_ENTRIES < 1) {
+  throw new Error(
+    `Invalid config: DIRECTORY_MAX_ENTRIES (${config.DIRECTORY_MAX_ENTRIES}) must be a finite integer >= 1`
   )
 }
 

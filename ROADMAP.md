@@ -118,6 +118,38 @@ safe for the VPS?". 273/273 unit tests pass. Zero new npm dependencies.
 
 ---
 
+## Phase 1 — Opt-in project directory — DONE ✅
+
+Shipped in commit: `feat(directory): Phase 1 opt-in listing with manifest opt-in`
+
+An optional directory endpoint (`/directory`, `/directory.json`) listing projects
+whose owners opt in via a manifest file on their own backend. Off by default —
+operator must set `DIRECTORY_ENABLED=true`. Zero new npm dependencies.
+
+| Feature | Summary | Key files |
+|---|---|---|
+| Manifest schema + validation | Tenant backends serve `/.well-known/janus-index.json` with `list: true`, title (1–80 chars), optional description (≤200 chars) and tags (max 8, matching `[a-z0-9][a-z0-9-]*`). All failures (timeout, oversized, bad JSON, non-200) de-list rather than error. | `src/directory.js` `validateManifest()` |
+| Fire-and-forget manifest fetch | `maybeFetchManifest()` called on every proxied request (with recheck cache so busy tunnels don't re-fetch every request). Fetches over the loopback tunnel port, never the public internet. Swallows all errors — runs off the request path. | `src/directory.js`, `src/server.js` (~:765-771) |
+| Liveness tracking | `markOnline`/`markOffline` called on request success/failure. Updates in-memory immediately; only persists when `online` actually flips, so `lastSeenAt` can drift between flips (display-only data, acceptable). | `src/directory.js`, `src/server.js` (~:228, 228, 754, 771), `src/store.js` `touchDirectoryLiveness` |
+| `/directory` endpoint | HTML listing, searchable by title/description/tags. Online entries sort first, then by last-seen recency. Offline entries stay listed with timestamps. Entries become visible lazily (first request). | `src/pages.js` `directoryPage()`, `src/server.js` (~:678-691) |
+| `/directory.json` | JSON API (same data as `/directory`, same filtering). Enabled/disabled with `DIRECTORY_ENABLED`. | `src/server.js` (~:692-705) |
+| Automatic filtering | Password-protected and blocked keys are structurally ineligible and filtered on every render, so blocking or passwording a key de-lists it immediately. | `src/directory.js` `_eligibleNow()`, `list()` |
+
+**New env vars** (see `.env.example`): `DIRECTORY_ENABLED`, `DIRECTORY_MANIFEST_TIMEOUT_MS`,
+`DIRECTORY_MANIFEST_MAX_BYTES`, `DIRECTORY_RECHECK_MS`, `DIRECTORY_MAX_ENTRIES`.
+
+**Design notes:** The directory publishes raw keys (unavoidable — the key IS the URL). Listing
+is permanent once public and uncrawlable (manifest is consent signal; no takedown path exists
+until Phase 2). The only revocation is key rotation, which changes the URL entirely. This is
+why listing requires explicit owner opt-in via their own backend file, not an operator form.
+
+**Phase 2 deferred intentionally:** a separate crawler process for full-text search would
+require a moderation queue and takedown path BEFORE any crawl begins, not after. That ordering
+(policy + human review → then crawl) is the point, and it's explicitly a hard prerequisite, not
+a nice-to-have. Phase 1 launches without Phase 2 so listing can work today.
+
+---
+
 ## Milestone 2 — Known gaps & follow-ups
 
 ### RESOLVED (post-M2 hardening pass)

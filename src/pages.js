@@ -2,6 +2,12 @@
 
 const { INSTRUMENT_SERIF_WOFF2, GEIST_MONO_WOFF2 } = require('./fonts')
 
+// Phase 1: directoryPage renders the tenant URL from the stored (bare,
+// normalized, no-prefix) key -- same "0000<key>.BASE_DOMAIN" composition
+// documented throughout this file (see apexPage/guidePage) -- so it needs
+// to validate the stored value looks like a real key before using it.
+const { parseKey } = require('./key')
+
 // Phase 3: legal pages (Impressum, ToS) + the apex landing page, all
 // sharing a small dark-theme style consistent with server.js's errorPage.
 // All dynamic values are escaped before being interpolated into HTML.
@@ -107,6 +113,7 @@ const BASE_STYLE = `
      stays visually consistent with the rest of the theme in both
      light/dark modes. */
   button.danger { background: var(--warn); }
+  pre { font-family: var(--font-mono); background: var(--surface); border: 1px solid var(--rule); border-radius: 4px; padding: 0.75rem 1rem; overflow-x: auto; color: var(--text); }
   .code { color: var(--muted); font-size: 0.85rem; margin-top: 1rem; font-variant-numeric: tabular-nums; }
   .warn { color: var(--warn); }
   .tagline { font-family: var(--font-mono); color: var(--muted); font-size: 0.85rem; letter-spacing: 0.02em; margin-top: -0.5rem; margin-bottom: 2rem; }
@@ -168,6 +175,13 @@ function footer(config) {
 // 404.
 function apexPage(config) {
   const safeDomain = escapeHtml(config.BASE_DOMAIN)
+  // Phase 1: only advertise /directory when the operator has opted the
+  // gateway into it -- DIRECTORY_ENABLED is false by default, same
+  // rationale as every other opt-in surface in this file.
+  const directoryLink = config.DIRECTORY_ENABLED
+    ? `<p>Browse the <a href="/directory">project directory</a> &mdash; projects
+      whose owners opted in to being listed.</p>`
+    : ''
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -191,6 +205,7 @@ function apexPage(config) {
     <p>This gateway terminates TLS, so the operator can technically observe
       traffic in transit &mdash; don't route anything through it you
       wouldn't hand to a hosting provider. Details on the <a href="/guide">guide</a>.</p>
+    ${directoryLink}
     ${footer(config)}
   </div>
   <script>
@@ -284,6 +299,69 @@ function termsPage(config) {
 // following the bare command lands on an error page with no clue why.
 function guidePage(config) {
   const safeDomain = escapeHtml(config.BASE_DOMAIN)
+  // Phase 1: only document the directory when the operator has opted the
+  // gateway into it -- same gate as apexPage's directoryLink, so the guide
+  // never describes a page that 404s.
+  const recheckMinutes = Math.max(1, Math.round(config.DIRECTORY_RECHECK_MS / 60000))
+  const directorySection = config.DIRECTORY_ENABLED
+    ? `
+    <h2>Get listed in the directory</h2>
+    <p>The <a href="/directory">project directory</a> is opt-in. Nothing
+      about your project is listed unless <em>your own backend</em> &mdash;
+      the thing behind your tunnel, not this gateway &mdash; serves a
+      manifest file:</p>
+    <p><code>GET /.well-known/janus-index.json</code></p>
+    <pre>{
+  "list": true,
+  "title": "My project",
+  "description": "One line about what it is.",
+  "tags": ["demo", "self-hosted"]
+}</pre>
+    <p>There is no submission form and no account. The gateway fetches that
+      URL from your backend itself; serving it back with <code>list: true</code>
+      is the entire consent signal.</p>
+    <ul>
+      <li><code>list</code> must be the literal boolean <code>true</code>.
+        Missing, <code>false</code>, the string <code>"true"</code>, and
+        <code>1</code> all mean <strong>not listed</strong>.</li>
+      <li><code>title</code> is required, 1&ndash;80 characters.</li>
+      <li><code>description</code> is optional, up to 200 characters.</li>
+      <li><code>tags</code> is optional, up to 8 entries, each up to 24
+        characters, lowercase letters/digits/hyphens only &mdash;
+        duplicates are dropped and casing is normalized.</li>
+      <li>The response must be <code>200</code> with a
+        <code>content-type</code> that contains <code>application/json</code>.
+        A static file server that serves <code>.json</code> as
+        <code>text/plain</code> will silently fail to list &mdash; that's a
+        MIME type problem, not a manifest problem, and nothing will tell you
+        it happened.</li>
+      <li>The manifest is only fetched when someone visits your site through
+        this gateway. A project with zero visitors will not appear in the
+        directory, even with a correct manifest, until it gets its first
+        one.</li>
+    </ul>
+    <p><strong>Listing publishes your raw key, in the open, permanently.</strong>
+      The directory links straight to <code>https://0000&lt;your-key&gt;.${safeDomain}/</code>
+      &mdash; the same key that is the bearer credential for your backend.
+      There is no separate, revocable directory token. Once listed, assume
+      search crawlers and web archives capture it; the only real revocation
+      is rotating the key (start a new tunnel, which mints a new one), which
+      also changes the URL everyone who found you through the directory was
+      using.</p>
+    <p>Password-protected keys cannot be listed at all &mdash; adding a
+      password de-lists the entry as soon as it's next checked. Edits
+      (a new manifest, a changed field, or removing it) take up to about
+      ${recheckMinutes} minute${recheckMinutes === 1 ? '' : 's'} to show up,
+      since the gateway caches the last check per key rather than fetching
+      on every visit &mdash; an edit that looks like it "didn't work" has
+      usually just not been rechecked yet.</p>
+    <p>To de-list, delete the manifest file or set <code>list: false</code>.
+      If your backend simply goes offline without either, the entry stays
+      listed with a last-seen time instead of disappearing &mdash;
+      liveness is only updated by an actual visit succeeding or failing,
+      not by polling.</p>
+`
+    : ''
   return `<!doctype html>
 <html lang="en">
 <head>
@@ -386,6 +464,7 @@ function guidePage(config) {
         hostname.</li>
     </ul>
 
+    ${directorySection}
     <p>Machine-readable version for an AI assistant:
       <a href="/llms.txt">/llms.txt</a></p>
 
@@ -400,6 +479,59 @@ function guidePage(config) {
 // operator config rather than request-derived, and nothing else here is
 // dynamic.
 function llmsTxt(config) {
+  const recheckMinutes = Math.max(1, Math.round(config.DIRECTORY_RECHECK_MS / 60000))
+  const directorySection = config.DIRECTORY_ENABLED
+    ? `
+## Directory (opt-in)
+
+There is a project directory at https://${config.BASE_DOMAIN}/directory. It
+is opt-in and there is no submission form or account. A project is listed
+only if ITS OWN backend (the thing behind the tunnel, not the gateway)
+serves a manifest at:
+
+    GET /.well-known/janus-index.json
+
+Example manifest body:
+
+    {
+      "list": true,
+      "title": "My project",
+      "description": "One line about what it is.",
+      "tags": ["demo", "self-hosted"]
+    }
+
+Rules:
+- "list" must be the literal JSON boolean true. Missing, false, the string
+  "true", and 1 all mean NOT listed. This is strict on purpose.
+- "title" is required, 1-80 characters.
+- "description" is optional, up to 200 characters.
+- "tags" is optional, up to 8 entries, each up to 24 characters, lowercase
+  letters/digits/hyphens only; duplicates are dropped and casing is
+  normalized.
+- The HTTP response must be 200 with a content-type that CONTAINS
+  "application/json". A static file server that serves .json as text/plain
+  will silently fail to list -- check the response header, not just the
+  file contents.
+- The manifest is only fetched when someone visits the site through the
+  gateway. A project with zero visitors will not appear in the directory,
+  even with a correct manifest, until it gets its first one.
+
+Consequence, stated plainly: listing publishes the raw key. The directory
+links straight to the tenant URL, which contains the same key that is the
+bearer credential for that backend -- there is no separate, revocable
+directory token. Once listed, assume it is permanently public and that
+crawlers and web archives capture it. The only real revocation is rotating
+the key (starting a new tunnel mints a new one), which also changes the URL.
+
+Password-protected keys cannot be listed; adding a password de-lists the
+entry as soon as it is next checked. Edits (new manifest, changed field, or
+removal) take up to about ${recheckMinutes} minute${recheckMinutes === 1 ? '' : 's'} to show up -- the gateway
+caches the last check per key rather than fetching on every visit. To
+de-list, delete the manifest file or set "list": false. If the backend goes
+offline without either, the entry stays listed with a last-seen time instead
+of disappearing.
+`
+    : ''
   return `# Janus
 
 Janus publishes an app running on your own machine as a public HTTPS site.
@@ -466,6 +598,7 @@ and symmetric NAT or CGNAT (mobile carriers, some ISPs, restrictive office
 networks) can prevent it. That is a network condition, not an application
 bug. Retry from a different network.
 
+${directorySection}
 ## Notes for frameworks
 
 - The Host header is 0000<key>.${config.BASE_DOMAIN}. Dev servers that
@@ -504,6 +637,95 @@ function loginPage({ error, next, config }) {
       <input type="hidden" name="next" value="${safeNext}">
       <button type="submit">Enter</button>
     </form>
+    ${footer(config)}
+  </div>
+</body>
+</html>`
+}
+
+// Phase 1: relative "last seen" string for a directory entry's timestamp.
+// Deliberately coarse (minutes/hours/days) -- an exact timestamp is not
+// useful to a browsing visitor and would just be more precision than the
+// underlying liveness signal (a periodic manifest recheck) actually has.
+function relativeTime(ms) {
+  if (!Number.isFinite(ms)) return 'unknown'
+  const deltaMs = Date.now() - ms
+  if (deltaMs < 0) return 'just now'
+  const mins = Math.floor(deltaMs / 60000)
+  if (mins < 1) return 'just now'
+  if (mins < 60) return `${mins}m ago`
+  const hours = Math.floor(mins / 60)
+  if (hours < 24) return `${hours}h ago`
+  const days = Math.floor(hours / 24)
+  return `${days}d ago`
+}
+
+// Phase 1: opt-in project directory. `entries` is the already-sanitized,
+// sorted, eligibility-filtered output of src/directory.js's Directory#list()
+// -- this function does not re-filter, but it DOES escape every field, since
+// title/description/tags all originate from an arbitrary tenant backend's
+// manifest, not from the operator.
+function directoryPage({ entries, q, config }) {
+  const safeQ = escapeHtml(q || '')
+  const safeDomain = escapeHtml(config.BASE_DOMAIN)
+
+  const rows = (entries || []).map((entry) => {
+    // Defense in depth: directory.js only ever stores an already-normalized
+    // key (record.client.seed, see its doc comment), but re-validate here
+    // before building an href out of it -- an href is exactly the kind of
+    // sink where a malformed value could do the most damage, and this is
+    // the one page rendering entirely attacker-supplied backend data.
+    let href = null
+    try {
+      const parsed = parseKey(entry.rawKey)
+      href = `https://0000${parsed.key}.${config.BASE_DOMAIN}/`
+    } catch {
+      return '' // unrenderable entry -- skip it rather than emit a broken link
+    }
+    const safeHref = escapeHtml(href)
+    const safeTitle = escapeHtml(entry.title)
+    const descHtml = entry.description
+      ? `<p>${escapeHtml(entry.description)}</p>`
+      : ''
+    const tagsHtml = (entry.tags && entry.tags.length)
+      ? `<p class="code">${entry.tags.map((t) => `#${escapeHtml(t)}`).join(' ')}</p>`
+      : ''
+    const offlineBadge = entry.online ? '' : ' <span class="warn">(offline)</span>'
+    const lastSeen = `<p class="code">Last seen: ${escapeHtml(relativeTime(entry.lastSeenAt))}</p>`
+
+    return `<li style="margin-bottom: 1.5rem; list-style: none;">
+      <h2 style="margin-bottom: 0.25rem;"><a href="${safeHref}">${safeTitle}</a>${offlineBadge}</h2>
+      ${descHtml}
+      ${tagsHtml}
+      ${lastSeen}
+    </li>`
+  }).join('\n')
+
+  const emptyState = q
+    ? `<p>No listed projects match &ldquo;${escapeHtml(q)}&rdquo;.</p>`
+    : `<p>No projects are listed yet. Projects opt in by serving a manifest
+      from their own backend &mdash; see <a href="/guide">the guide</a>.</p>`
+
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Directory - Janus</title>
+<style>${STYLE}</style>
+</head>
+<body>
+  <div class="card">
+    <h1>Directory</h1>
+    <p class="tagline">projects on ${safeDomain} whose owners opted in to being listed</p>
+    <p class="code">Want your project listed? See <a href="/guide">the guide</a>.</p>
+    <form method="GET" action="/directory">
+      <input type="text" name="q" placeholder="Search title, description, tags" value="${safeQ}">
+      <button type="submit">Search</button>
+    </form>
+    <ul style="padding-left: 0; margin-top: 1.5rem;">
+      ${rows || ''}
+    </ul>
+    ${rows ? '' : emptyState}
     ${footer(config)}
   </div>
 </body>
@@ -797,4 +1019,5 @@ module.exports = {
   loginPage,
   adminLoginPage,
   adminDashboardPage,
+  directoryPage,
 }

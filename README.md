@@ -161,6 +161,11 @@ All via environment variables (see [`.env.example`](./.env.example)).
 | `WS_MAX_SLOTS` | `30` (~60% of `MAX_TUNNELS`) | max distinct tunnel slots websockets may pin at once; must be `< MAX_TUNNELS` so HTTP always keeps headroom (S3). A new ws to an already-ws-pinned key is free. |
 | `WS_MAX_PER_IP` | `16` | max concurrent websocket connections a single client IP may hold (S3). |
 | `WS_IDLE_TIMEOUT_MS` | `3600000` | close a websocket after this long idle in BOTH directions, in milliseconds (default 1h); refreshes on read/write so heartbeating/server-push sockets survive; `0` disables (S3). |
+| `DIRECTORY_ENABLED` | `false` | whether to enable `/directory` and `/directory.json` (Phase 1 opt-in project listing). Off by default — operator must opt in explicitly. |
+| `DIRECTORY_MANIFEST_TIMEOUT_MS` | `5000` | how long the gateway waits for a manifest fetch (milliseconds). Fetches happen over loopback, so this is generous headroom for a momentarily slow backend. |
+| `DIRECTORY_MANIFEST_MAX_BYTES` | `65536` | hard cap on manifest response body size (bytes). Prevents an oversized/hostile response from being read into memory. |
+| `DIRECTORY_RECHECK_MS` | `3600000` | how long a keyHash's manifest fetch result is cached in-process before checking again (milliseconds, default 1h). Keeps a busy tunnel from re-fetching on every request. |
+| `DIRECTORY_MAX_ENTRIES` | `500` | cap on how many entries `/directory` and `/directory.json` will return, regardless of how many keys opted in — bounds response size. |
 
 ---
 
@@ -189,6 +194,39 @@ curl -X POST -H "Authorization: Bearer $ADMIN_TOKEN" \
 - **Blocklist** — manage which keys are blocked.
 
 Dashboard sessions use CSRF protection and SameSite=Strict cookies (TTL: `ADMIN_SESSION_TTL_MS`, default 12 hours). Rotating `ADMIN_TOKEN` immediately invalidates all outstanding admin sessions.
+
+---
+
+## Project directory (Phase 1 opt-in listing)
+
+An optional, operator-enabled `/directory` endpoint lists projects whose owners opt in. Turned off by default — set `DIRECTORY_ENABLED=true` to enable.
+
+**How an owner opts in:** serve a manifest file from their own backend at `/.well-known/janus-index.json`. The file itself IS the consent signal — there is no account signup, no operator moderation queue, and no registration form. Here's a minimal example:
+
+```json
+{
+  "list": true,
+  "title": "My Project",
+  "description": "A cool thing running on Holesail",
+  "tags": ["demo", "holesail"]
+}
+```
+
+**Manifest schema:**
+- `list` — **required**, must be strictly boolean `true`. Any other value de-lists the entry immediately.
+- `title` — **required**, string 1–80 characters. Identifies the project in the directory.
+- `description` — optional, string max 200 characters. Shows on the listing. Omitted or oversized entries are dropped, but the project stays listed if `title` is valid.
+- `tags` — optional array of strings, max 8 tags, each 1–24 characters. Must match `[a-z0-9][a-z0-9-]*` (lowercase letters, digits, hyphens; no leading/trailing hyphens). Automatically lowercased and deduped.
+
+**Delisting:** simply delete the `/.well-known/janus-index.json` file from your backend, or set `list` to `false` or remove it.
+
+**Important:** listing publishes the raw Holesail key, which is the **bearer credential for your backend**. Listed means permanently public. Assume crawlers and archives will capture it. **The only revocation is rotating your key, which changes your URL.** Do not list unless you accept public discovery and understand you cannot "un-list" by asking an operator — deletion is only under your control, via your own backend.
+
+**Blocklist and passwords:** keys with passwords set or blocked by the operator are structurally ineligible and are automatically filtered out of every directory render. Blocking a key or setting a password de-lists it immediately.
+
+**Liveness:** the directory marks entries online/offline lazily. When a visitor successfully reaches your project, it's marked online. When a request fails, it's marked offline. Offline entries stay listed with a last-seen timestamp rather than disappearing. An entry that nobody visits does not update its timestamp.
+
+**Technical:** the manifest is fetched only over the loopback tunnel port of an already-open tunnel, never from the public internet. Timeouts, malformed JSON, oversized bodies, and wrong HTTP status codes all converge on de-listing — if we can't read and validate the manifest, consent cannot be confirmed, so the safe default is "not listed."
 
 ---
 
