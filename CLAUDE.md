@@ -134,3 +134,27 @@ holepunch is flaky on hosted runners.
   it. The absorption is deliberately narrow — an `EADDRINUSE` on any
   non-quarantined port must still crash, or genuine bind bugs get hidden.
   Both halves have regression tests, including subprocess fixtures.
+- **A malformed POST to the password gate deliberately does NOT count toward
+  the lockout.** `passwordGate`'s wrong-Content-Type and oversized/aborted-body
+  branches return the same generic "Incorrect password." page as a real failure
+  but never call `pwNoteFailure`, because neither reached `verifyPassword`. It
+  looks like an inconsistency (three branches, same page, only one counts) and
+  is not: counting them would let anyone lock a visitor out of a key by
+  spraying malformed POSTs, without ever making a password guess. Regression
+  test: `server-password-lockout.test.js`.
+- **`Semaphore.release()` skipping a `settled` waiter is not dead code.**
+  `release()` hands its slot straight to the next waiter *without*
+  decrementing `active`. A waiter that already timed out normally splices
+  itself out via `_drop`, so the `settled` check should never fire — but if a
+  timer and a release ever land in the same tick and the slot went to a settled
+  waiter, its `settle()` would be a no-op and the slot would vanish while
+  `active` still counted it, permanently shrinking the create gate by one on
+  every timeout. Do not "simplify" this to a bare `shift()`. Regression test:
+  `tunnel-manager-create-concurrency.test.js` ("a timed-out waiter must not
+  consume the slot").
+- **The websocket upgrade path has no password lockout, on purpose.** It does
+  its own inline cookie check rather than calling `passwordGate`, so the
+  `KEY_LOGIN_*` lockout does not apply there. That asymmetry looks like an
+  oversight and is not: the upgrade path only *validates an already-issued*
+  session cookie and never accepts a password submission, so there is no
+  guessing surface to throttle.
