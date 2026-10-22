@@ -17,7 +17,7 @@
     "test:all": "npm test && npm run test:e2e"
   },
   "engines": {
-    "node": ">=20"
+    "node": ">=22"
   },
   "dependencies": {
     "holesail-client": "2.3.0",
